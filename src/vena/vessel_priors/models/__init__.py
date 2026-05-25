@@ -10,9 +10,11 @@ from __future__ import annotations
 from vena.vessel_priors.abc_model import AbstractVesselModel
 
 from .frangi import FrangiVesselModel
+from .oof import OOFVesselModel
 
 MODEL_REGISTRY: dict[str, type[AbstractVesselModel]] = {
     FrangiVesselModel.name: FrangiVesselModel,
+    OOFVesselModel.name: OOFVesselModel,
 }
 
-__all__ = ["MODEL_REGISTRY", "FrangiVesselModel"]
+__all__ = ["MODEL_REGISTRY", "FrangiVesselModel", "OOFVesselModel"]

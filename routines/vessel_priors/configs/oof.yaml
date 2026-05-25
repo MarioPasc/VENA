@@ -1,0 +1,45 @@
+# Optimally Oriented Flux (OOF; Law & Chung 2008) on 10 UCSF-PDGM patients.
+#
+# Image-domain run — no CLAHE, no histogram-domain manipulation. The OOF model
+# applies its own percentile normalisation (0.5 / 99.5) inside the brain mask
+# prior to the FFT-domain flux computation. Black-ridge convention is on, so
+# the response is built from the two largest-magnitude *negative* eigenvalues
+# of the OOF matrix (dark tubular structures on SWI / SWAN).
+#
+# The seed and n_patients match `default.yaml` so the patient list is identical
+# to the unpreprocessed Frangi baseline; figures and NIfTIs are directly
+# comparable. Outputs go to `niigz/oof/<PID>/` and `figures/oof/`.
+#
+# If denoising turns out to be necessary, enable the ITK-TubeTK
+# anisotropic-diffusion (VED) preprocessor by uncommenting the `preprocessing`
+# block — never reintroduce CLAHE.
+
+dataset_root: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
+metadata_csv: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/metadata/UCSF-PDGM-metadata_v5.csv
+output_root: /media/mpascual/Sandisk2TB/research/vena/results/vessel_priors
+
+n_patients: 10
+seed: 1337
+log_level: INFO
+n_slices: 5
+
+algorithms:
+  - name: oof
+    tag: oof
+    # preprocessing:
+    #   - name: anisotropic_diffusion
+    #     params:
+    #       n_iterations: 5
+    #       n_scales: 5
+    #       sigma_min: 0.5
+    #       sigma_max: 2.5
+    #       time_step: 0.01
+    #       percentile_clip: [0.5, 99.5]
+    params:
+      sigma_min_mm: 0.5
+      sigma_max_mm: 2.5
+      sigma_steps: 5
+      black_ridges: true
+      threshold: 0.15
+      normalize: percentile
+      percentile_clip: [0.5, 99.5]

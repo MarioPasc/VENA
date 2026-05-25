@@ -50,6 +50,12 @@ dependencies = [
     "pandas>=2.1",
     "monai[einops]>=1.4,<2.0",
     "PyYAML>=6.0",
+    # Optimally Oriented Flux (Law & Chung 2008) is consumed through ITK +
+    # ITK-TubeTK Python bindings. ITK ships the Hessian / oriented-flux
+    # primitives; ITK-TubeTK adds the curated vessel-enhancement filters
+    # validated on cerebrovascular data.
+    "itk>=5.4",
+    "itk-tubetk>=1.4",
 ]
 
 [project.optional-dependencies]
@@ -73,6 +79,7 @@ docs = []
 # ----------------------------------------------------------------------------
 [project.scripts]
 vena-vessel-priors = "routines.vessel_priors.cli:main"
+vena-preflight-vessel-mask = "routines.preflights.vessel_mask.cli:main"
 
 # ----------------------------------------------------------------------------
 # Setuptools layout — src/-layout for the library, flat-layout for routines/
@@ -157,6 +164,7 @@ markers = [
     "preflight_maisi: MAISI VAE audit components",
     "preflight_bsf: BrainSegFounder layer analysis components",
     "preflight_aug: augmentation pipeline components",
+    "preflight_vessel: vessel-mask preflight components",
     "fm: flow-matching training/inference components",
     "repa: REPA loss / projection-head components",
     "gpu: requires CUDA",
@@ -192,6 +200,8 @@ module = [
     "piq.*",
     "skimage.*",
     "einops.*",
+    "itk.*",
+    "itk_tubetk.*",
 ]
 ignore_missing_imports = true
 

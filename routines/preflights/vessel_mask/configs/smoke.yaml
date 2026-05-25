@@ -1,0 +1,16 @@
+# Smoke config — same paths as default but capped to 3 patients and a coarser
+# threshold grid. Used as a fast (~30 s) end-to-end check.
+
+vessel_priors_output_root: /media/mpascual/Sandisk2TB/research/vena/results/vessel_priors
+dataset_root: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
+metadata_csv: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/metadata/UCSF-PDGM-metadata_v5.csv
+
+output_root: /media/mpascual/Sandisk2TB/research/vena/results/artifacts/preflights/vessel_mask
+
+tags: [oof, frangi]
+threshold_sweep: [0.10, 0.20]
+target_binary_fraction_range: [0.02, 0.07]
+
+n_patients_max: 3
+log_level: INFO
+n_slices: 3

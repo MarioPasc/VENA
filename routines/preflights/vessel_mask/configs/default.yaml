@@ -1,0 +1,19 @@
+# Default config for the vessel-mask preflight (tentative).
+#
+# Consumes existing soft maps produced by the `routines/vessel_priors` runs
+# under `<vessel_priors_output_root>/niigz/<tag>/<PID>/vessel_soft.nii.gz` and
+# evaluates them against an anatomical-fraction prior + cross-method
+# agreement. No vesselness operator is re-run.
+
+vessel_priors_output_root: /media/mpascual/Sandisk2TB/research/vena/results/vessel_priors
+dataset_root: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
+metadata_csv: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/metadata/UCSF-PDGM-metadata_v5.csv
+
+output_root: /media/mpascual/Sandisk2TB/research/vena/results/artifacts/preflights/vessel_mask
+
+tags: [oof, frangi]
+threshold_sweep: [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+target_binary_fraction_range: [0.02, 0.07]   # Bériault 2015 §III.A
+
+log_level: INFO
+n_slices: 5

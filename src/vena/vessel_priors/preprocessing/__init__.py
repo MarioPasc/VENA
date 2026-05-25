@@ -9,15 +9,18 @@ Register a new preprocessor by importing the class here and adding it to
 from __future__ import annotations
 
 from .abc_preprocessor import AbstractPreprocessor, PreprocessingError
+from .anisotropic_diffusion import AnisotropicDiffusionPreprocessor
 from .clahe import CLAHEPreprocessor
 
 PREPROCESSOR_REGISTRY: dict[str, type[AbstractPreprocessor]] = {
     CLAHEPreprocessor.name: CLAHEPreprocessor,
+    AnisotropicDiffusionPreprocessor.name: AnisotropicDiffusionPreprocessor,
 }
 
 __all__ = [
     "PREPROCESSOR_REGISTRY",
     "AbstractPreprocessor",
+    "AnisotropicDiffusionPreprocessor",
     "CLAHEPreprocessor",
     "PreprocessingError",
 ]
