@@ -1,0 +1,199 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# ----------------------------------------------------------------------------
+# Project metadata
+# ----------------------------------------------------------------------------
+[project]
+name = "vena"
+version = "0.0.1"
+description = "VENA: Vessel Encoded Neural Augmentation for Gadolinium-free T1 post-contrast synthesis"
+readme = {text = "", content-type = "text/markdown"}
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+keywords = [
+]
+authors = [
+    {name = "Mario Pascual-González", email = "mpascual@uma.es"},
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Healthcare Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+# Runtime dependencies, declared per the libraries-first rule in
+# .claude/rules/coding-standards.md item 6: declare HERE and `pip install -e .`
+# in the `vena` env in the same commit. Torch is intentionally not pinned;
+# select the CUDA wheel at install time (see Hardware notes below).
+dependencies = [
+    "numpy>=1.26,<2.2",
+    "scipy>=1.11",
+    "scikit-image>=0.22",
+    "nibabel>=5.2",
+    "SimpleITK>=2.3",
+    "h5py>=3.10",
+    "einops>=0.7",
+    "omegaconf>=2.3",
+    "pydantic>=2.6",
+    "rich>=13.7",
+    "matplotlib>=3.8",
+    "pandas>=2.1",
+    "monai[einops]>=1.4,<2.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# Tooling only — install with:
+#   ~/.conda/envs/vena/bin/pip install -e ".[dev]"
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+]
+docs = []
+
+# [project.urls] intentionally omitted; the project is not yet published. Local
+# pointers live in CLAUDE.md (DECISIONS.md log, proposal at
+# /media/mpascual/Sandisk2TB/research/vena/docs/proposal.md).
+
+# ----------------------------------------------------------------------------
+# Console scripts — forward declarations.
+# Uncomment each line as the corresponding routine lands.
+# Naming convention: vena-<bucket>-<name>  (see .claude/rules/preflight-pattern.md item 5)
+# ----------------------------------------------------------------------------
+[project.scripts]
+vena-vessel-priors = "routines.vessel_priors.cli:main"
+
+# ----------------------------------------------------------------------------
+# Setuptools layout — src/-layout for the library, flat-layout for routines/
+# ----------------------------------------------------------------------------
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["vena*", "routines*"]
+exclude = ["tests*", "artifacts*", "docs*", ".claude*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+vena_fm = ["py.typed"]
+
+# ----------------------------------------------------------------------------
+# Hardware / install notes (NOT pyproject keys; kept as a reference comment)
+# ----------------------------------------------------------------------------
+# CUDA wheel matrix:
+#   Local RTX 4060 (driver 545+, CUDA 12.4):
+#     pip install -e . --extra-index-url https://download.pytorch.org/whl/cu124
+#   Local RTX 3060 (driver 535, CUDA 12.2):
+#     pip install -e . --extra-index-url https://download.pytorch.org/whl/cu121
+#   Picasso A100 inside NGC Singularity (torch already provided in image):
+#     pip install -e . --no-deps   # then `pip install` non-torch deps individually
+#   Picasso V100-DGXS (sm_70): pin `torch==2.4.1` from cu121; torch 2.5+ dropped
+#     sm_70 from cu12 wheels.
+# Do NOT hard-pin torch in [dependencies]; install-time wheel selection is the
+# right place to enforce CUDA/driver matching.
+
+# ----------------------------------------------------------------------------
+# Ruff
+# ----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "routines", "tests"]
+extend-exclude = ["src/external", "artifacts"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort (import order)
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "N",    # pep8-naming
+    "NPY",  # numpy-specific
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",  # line too long (formatter handles wrapping)
+    "B008",  # function call in default argument (common in dataclass defaults)
+    "RUF001",  # ambiguous unicode in string (we use σ, ×, → in scientific text)
+    "RUF002",  # ambiguous unicode in docstring (same)
+    "RUF003",  # ambiguous unicode in comment (same)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+"routines/**/cli.py" = ["T201"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+# ----------------------------------------------------------------------------
+# Pytest
+# ----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = ["-v", "--tb=short", "--strict-markers"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+markers = [
+    "unit: fast, no I/O, no GPU",
+    "preflight_maisi: MAISI VAE audit components",
+    "preflight_bsf: BrainSegFounder layer analysis components",
+    "preflight_aug: augmentation pipeline components",
+    "fm: flow-matching training/inference components",
+    "repa: REPA loss / projection-head components",
+    "gpu: requires CUDA",
+    "slow: wall-clock > 30 s",
+]
+
+# ----------------------------------------------------------------------------
+# Mypy
+# ----------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+no_implicit_optional = true
+check_untyped_defs = true
+disallow_untyped_defs = false
+follow_imports = "normal"
+ignore_missing_imports = true
+exclude = ["src/external/", "artifacts/"]
+
+# External pretrained models lack type stubs upstream.
+[[tool.mypy.overrides]]
+module = [
+    "torch.*",
+    "monai.*",
+    "nibabel.*",
+    "SimpleITK.*",
+    "h5py.*",
+    "lpips.*",
+    "piq.*",
+    "skimage.*",
+    "einops.*",
+]
+ignore_missing_imports = true
+
+[tool.pyright]
+extraPaths = ["src", "routines"]

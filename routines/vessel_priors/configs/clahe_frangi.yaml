@@ -1,0 +1,37 @@
+# CLAHE-preprocessed Frangi vesselness on 10 UCSF-PDGM patients.
+#
+# The seed and n_patients match `default.yaml` so the patient list is identical
+# and the CLAHE+Frangi outputs are directly comparable to the unpreprocessed
+# Frangi run (same patients, same disk layout).
+#
+# Output NIfTIs are written to `niigz/frangi-clahe/<PID>/` and the collages
+# to `figures/frangi-clahe/`. The algorithm "name" is reused as the model key
+# so we register two separate sub-namespaces by varying the YAML key — see the
+# `engine.py` directory-naming convention.
+
+dataset_root: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
+metadata_csv: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/metadata/UCSF-PDGM-metadata_v5.csv
+output_root: /media/mpascual/Sandisk2TB/research/vena/results/vessel_priors
+
+n_patients: 10
+seed: 1337
+log_level: INFO
+n_slices: 5
+
+algorithms:
+  - name: frangi
+    tag: frangi-clahe
+    preprocessing:
+      - name: clahe
+        params:
+          clip_limit: 0.01
+          nbins: 256
+          percentile_clip: [0.5, 99.5]
+    params:
+      sigma_min_mm: 0.5
+      sigma_max_mm: 2.5
+      sigma_steps: 5
+      black_ridges: true
+      threshold: 0.15
+      normalize: percentile
+      percentile_clip: [0.5, 99.5]

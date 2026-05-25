@@ -1,0 +1,22 @@
+# Default config for the vessel-priors routine.
+# Runs Frangi (proposal §3.2 default) on a 10-patient random subset of UCSF-PDGM.
+
+dataset_root: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
+metadata_csv: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/metadata/UCSF-PDGM-metadata_v5.csv
+output_root: /media/mpascual/Sandisk2TB/research/vena/results/vessel_priors
+
+n_patients: 10
+seed: 1337
+log_level: INFO
+n_slices: 5
+
+algorithms:
+  - name: frangi
+    params:
+      sigma_min_mm: 0.5
+      sigma_max_mm: 2.5
+      sigma_steps: 5
+      black_ridges: true
+      threshold: 0.15
+      normalize: percentile
+      percentile_clip: [0.5, 99.5]
