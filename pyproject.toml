@@ -56,6 +56,19 @@ dependencies = [
     # validated on cerebrovascular data.
     "itk>=5.4",
     "itk-tubetk>=1.4",
+    # Priors validation routine (priors_validation_protocol.md v0.1.2):
+    # ANTsPy for atlas registration; nilearn / templateflow for atlas IO;
+    # pingouin / statsmodels for ICC + multiple-comparisons; reportlab for
+    # per-subject + cohort PDF reports; pyarrow for cohort_results.parquet;
+    # joblib for per-subject parallelism.
+    "antspyx>=0.4",
+    "nilearn>=0.10",
+    "templateflow>=24.0",
+    "pingouin>=0.5",
+    "statsmodels>=0.14",
+    "reportlab>=4.0",
+    "pyarrow>=14.0",
+    "joblib>=1.3",
 ]
 
 [project.optional-dependencies]
@@ -79,7 +92,12 @@ docs = []
 # ----------------------------------------------------------------------------
 [project.scripts]
 vena-vessel-priors = "routines.vessel_priors.cli:main"
+vena-perfusion-priors = "routines.perfusion_priors.cli:main"
+vena-cellularity-priors = "routines.cellularity_priors.cli:main"
+vena-susceptibility-priors = "routines.susceptibility_priors.cli:main"
 vena-preflight-vessel-mask = "routines.preflights.vessel_mask.cli:main"
+vena-preflight-priors-validation = "routines.preflights.priors_validation.cli:main"
+vena-preflight-venous-atlas-build = "routines.preflights.venous_atlas_build.cli:main"
 
 # ----------------------------------------------------------------------------
 # Setuptools layout — src/-layout for the library, flat-layout for routines/

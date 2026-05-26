@@ -1,4 +1,4 @@
-"""Correctness tests for :class:`vena.vessel_priors.models.OOFVesselModel`.
+"""Correctness tests for :class:`vena.prior_maps.vessel_priors.models.OOFVesselModel`.
 
 These tests do not require ground-truth labels. They rely on analytical
 properties of the Law & Chung 2008 OOF response:
@@ -31,8 +31,8 @@ from vena.preflight.vessel_mask import (
     rotated_cylinder_volume,
     smooth_cylinder_volume,
 )
-from vena.vessel_priors.abc_model import VesselInput
-from vena.vessel_priors.models import OOFVesselModel
+from vena.prior_maps.vessel_priors.abc_model import VesselInput
+from vena.prior_maps.vessel_priors.models import OOFVesselModel
 
 
 def _run_oof(
@@ -65,9 +65,7 @@ def _run_oof(
         threshold=0.5,
         normalize=normalize,
     )
-    out = model.predict(
-        VesselInput(swi=vol, brain_mask=brain, patient_id="synth")
-    )
+    out = model.predict(VesselInput(swi=vol, brain_mask=brain, patient_id="synth"))
     return out.soft
 
 
@@ -127,9 +125,7 @@ def test_oof_peak_at_cylinder_radius(a_mm: float) -> None:
     nominal cylinder radius to within voxel quantisation.
     """
     size = 56
-    img = smooth_cylinder_volume(
-        size=size, radius_mm=a_mm, axis=2, transition_mm=0.5
-    )
+    img = smooth_cylinder_volume(size=size, radius_mm=a_mm, axis=2, transition_mm=0.5)
     centre = size // 2
     sweep = np.arange(0.5, 5.01, 0.25)
     responses = []
@@ -196,9 +192,7 @@ def test_oof_adjacency_separates_close_vessels() -> None:
     a = 1.0
     d = 4.0 * a
     size = 40
-    img = parallel_cylinders_volume(
-        size=size, radius_mm=a, separation_mm=d, axis=2, offset_axis=1
-    )
+    img = parallel_cylinders_volume(size=size, radius_mm=a, separation_mm=d, axis=2, offset_axis=1)
     soft = _run_oof(img, [0.5, 1.0, 1.5])
     cx = size // 2
     # Centres of the two cylinders on offset_axis=1, at cx ± d/2.
@@ -271,9 +265,7 @@ def test_oof_translation_equivariance() -> None:
     # boundary so we still check away from the edges to keep the assertion
     # interpretable.
     interior = (slice(8, size - 8),) * 3
-    np.testing.assert_allclose(
-        soft2[interior], soft1_shifted[interior], atol=2e-3, rtol=5e-2
-    )
+    np.testing.assert_allclose(soft2[interior], soft1_shifted[interior], atol=2e-3, rtol=5e-2)
 
 
 # ---------------------------------------------------------------- Smoke test guard

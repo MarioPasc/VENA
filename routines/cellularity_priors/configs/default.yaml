@@ -1,0 +1,20 @@
+# Default config for the cellularity-priors routine.
+# Runs the NAWM-normalised ADC + tumour-restricted cellularity channels on the
+# same 10-patient subset as routines/vessel_priors/configs/default.yaml
+# (seed=1337).
+
+dataset_root: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
+metadata_csv: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/metadata/UCSF-PDGM-metadata_v5.csv
+output_root: /media/mpascual/Sandisk2TB/research/vena/results/cellularity_priors
+
+n_patients: 10
+seed: 1337
+log_level: INFO
+n_slices: 5
+
+algorithms:
+  - name: nawm_normalized
+    params:
+      max_relative: 4.0
+      sigma_adc_fraction: 0.2
+      aggregator: median

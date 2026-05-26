@@ -218,3 +218,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Others
+# Local execution artefacts (timestamped, not part of source)
+artifacts/
+
+# Scheduled wakeup lockfile written by the /loop skill
+.claude/scheduled_tasks.lock

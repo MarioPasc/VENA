@@ -1,0 +1,34 @@
+# Default config for the priors-validation preflight — 10-subject smoke run.
+# Uses the same patient sample (seed=1337) as the prior_maps routines so the
+# per-patient artefacts line up across subsystems.
+
+dataset_root: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
+metadata_csv: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/metadata/UCSF-PDGM-metadata_v5.csv
+
+derived_priors_roots:
+  cbf: /media/mpascual/Sandisk2TB/research/vena/results/perfusion_priors/niigz/alsop2015
+  cbf_rel: /media/mpascual/Sandisk2TB/research/vena/results/perfusion_priors/niigz/alsop2015
+  cell: /media/mpascual/Sandisk2TB/research/vena/results/cellularity_priors/niigz/nawm_normalized
+  adc_rel: /media/mpascual/Sandisk2TB/research/vena/results/cellularity_priors/niigz/nawm_normalized
+  sus: /media/mpascual/Sandisk2TB/research/vena/results/susceptibility_priors/niigz/magnitude_swan
+  itss: /media/mpascual/Sandisk2TB/research/vena/results/susceptibility_priors/niigz/magnitude_swan
+
+atlases_root: /media/mpascual/Sandisk2TB/research/vena/atlases
+cache_root:   /media/mpascual/Sandisk2TB/research/vena/cache/priors_validation
+output_root:  /media/mpascual/Sandisk2TB/research/vena/results/priors_validation
+
+n_patients: 10
+seed: 1337
+n_workers: 1  # ANTsPy / ITK threading + joblib loky forks segfault; keep sequential for v0
+log_level: INFO
+
+training_clearance_threshold: 0.9
+bootstrap_resamples: 500
+fdr_q: 0.05
+registration_kind: affine  # affine | rigid | syn
+
+# In-house dural-sinus mask (output of routines/preflights/venous_atlas_build).
+# When the path doesn't exist, T3 R_sinus rows fall back to "not_applicable".
+venous_atlas_path: /media/mpascual/Sandisk2TB/research/vena/atlases/venous_inhouse/LATEST/venous_mask_MNI152.nii.gz
+
+write_per_subject_pdf: true

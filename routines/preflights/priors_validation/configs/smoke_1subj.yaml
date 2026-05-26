@@ -1,0 +1,29 @@
+# 1-subject smoke for plumbing verification.
+dataset_root: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
+metadata_csv: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/metadata/UCSF-PDGM-metadata_v5.csv
+
+derived_priors_roots:
+  cbf: /media/mpascual/Sandisk2TB/research/vena/results/perfusion_priors/niigz/alsop2015
+  cbf_rel: /media/mpascual/Sandisk2TB/research/vena/results/perfusion_priors/niigz/alsop2015
+  cell: /media/mpascual/Sandisk2TB/research/vena/results/cellularity_priors/niigz/nawm_normalized
+  adc_rel: /media/mpascual/Sandisk2TB/research/vena/results/cellularity_priors/niigz/nawm_normalized
+  sus: /media/mpascual/Sandisk2TB/research/vena/results/susceptibility_priors/niigz/magnitude_swan
+  itss: /media/mpascual/Sandisk2TB/research/vena/results/susceptibility_priors/niigz/magnitude_swan
+
+atlases_root: /media/mpascual/Sandisk2TB/research/vena/atlases
+cache_root:   /media/mpascual/Sandisk2TB/research/vena/cache/priors_validation
+output_root:  /media/mpascual/Sandisk2TB/research/vena/results/priors_validation
+
+n_patients: 1
+seed: 1337
+n_workers: 1
+log_level: INFO
+
+training_clearance_threshold: 0.9
+bootstrap_resamples: 200
+fdr_q: 0.05
+registration_kind: affine
+
+# No venous atlas in the 1-subject smoke; R_sinus rows are skipped.
+venous_atlas_path: /tmp/does_not_exist.nii.gz
+write_per_subject_pdf: true

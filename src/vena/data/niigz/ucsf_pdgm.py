@@ -10,6 +10,9 @@ Source layout (one directory per patient under ``source_root``):
         UCSF-PDGM-{NNNN}_T2.nii.gz            ...
         UCSF-PDGM-{NNNN}_FLAIR.nii.gz         ...
         UCSF-PDGM-{NNNN}_SWI.nii.gz           ...
+        UCSF-PDGM-{NNNN}_DWI.nii.gz           ...
+        UCSF-PDGM-{NNNN}_ADC.nii.gz   (mm^2/s, ~[0, 5e-3])
+        UCSF-PDGM-{NNNN}_ASL.nii.gz   (CBF, ~ml/100g/min, single-PLD pCASL)
         UCSF-PDGM-{NNNN}_brain_segmentation.nii.gz
         UCSF-PDGM-{NNNN}_brain_parenchyma_segmentation.nii.gz
         UCSF-PDGM-{NNNN}_tumor_segmentation.nii.gz
@@ -51,6 +54,7 @@ Modality = Literal[
     "DWI",
     "DWI_bias",
     "ADC",
+    "ASL",
 ]
 
 # File suffix attached after the patient ID for each modality, e.g.
@@ -69,6 +73,7 @@ _MODALITY_SUFFIX: dict[str, str] = {
     "DWI": "DWI",
     "DWI_bias": "DWI_bias",
     "ADC": "ADC",
+    "ASL": "ASL",
 }
 
 _BRAIN_MASK_SUFFIX = "brain_segmentation"
@@ -183,9 +188,7 @@ class UCSFPDGMDataset:
     def sample(self, n: int, *, seed: int) -> list[UCSFPDGMPatient]:
         """Deterministically draw ``n`` patients without replacement."""
         if n > len(self._patients):
-            raise ValueError(
-                f"Requested {n} patients but cohort has {len(self._patients)}"
-            )
+            raise ValueError(f"Requested {n} patients but cohort has {len(self._patients)}")
         rng = random.Random(seed)
         return rng.sample(self._patients, k=n)
 
@@ -206,9 +209,7 @@ class UCSFPDGMDataset:
             raise ModalityNotFoundError(f"Unknown modality: {name!r}")
         path = self._modality_path(p, _MODALITY_SUFFIX[name])
         if not path.exists():
-            raise ModalityNotFoundError(
-                f"Modality {name} missing for {p.patient_id}: {path}"
-            )
+            raise ModalityNotFoundError(f"Modality {name} missing for {p.patient_id}: {path}")
         return load_nii(path)
 
     def load_brain_mask(self, p: UCSFPDGMPatient) -> NiftiVolume:
@@ -221,16 +222,12 @@ class UCSFPDGMDataset:
     def load_brain_parenchyma_mask(self, p: UCSFPDGMPatient) -> NiftiVolume:
         path = self._modality_path(p, _BRAIN_PARENCHYMA_SUFFIX)
         if not path.exists():
-            raise ModalityNotFoundError(
-                f"Brain parenchyma mask missing for {p.patient_id}: {path}"
-            )
+            raise ModalityNotFoundError(f"Brain parenchyma mask missing for {p.patient_id}: {path}")
         return load_nii(path)
 
     def load_tumor_seg(self, p: UCSFPDGMPatient) -> NiftiVolume:
         """Load the BraTS-style tumour segmentation (labels {0, 1, 2, 4})."""
         path = self._modality_path(p, _TUMOR_SEG_SUFFIX)
         if not path.exists():
-            raise ModalityNotFoundError(
-                f"Tumor segmentation missing for {p.patient_id}: {path}"
-            )
+            raise ModalityNotFoundError(f"Tumor segmentation missing for {p.patient_id}: {path}")
         return load_nii(path)

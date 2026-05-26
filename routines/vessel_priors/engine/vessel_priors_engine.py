@@ -1,4 +1,4 @@
-"""Thin wrapper around :class:`vena.vessel_priors.VesselPriorsEngine`.
+"""Thin wrapper around :class:`vena.prior_maps.vessel_priors.VesselPriorsEngine`.
 
 The routine engine intentionally adds no behaviour. It exists so the
 ``routines/`` directory follows the layout fixed by
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vena.vessel_priors import VesselPriorsEngine, VesselPriorsRoutineConfig
+from vena.prior_maps.vessel_priors import VesselPriorsEngine, VesselPriorsRoutineConfig
 
 
 class VesselPriorsRoutineEngine:

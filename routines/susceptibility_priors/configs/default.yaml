@@ -1,0 +1,22 @@
+# Default config for the susceptibility-priors routine (sub-option A).
+# Runs magnitude-only susceptibility channels (sus, itss) on the same 10-
+# patient subset as routines/vessel_priors/configs/default.yaml (seed=1337).
+# Phase-data sub-options (B, QSM; C, χ-separation) are deferred until HRUM
+# exports phase alongside SWAN magnitude.
+
+dataset_root: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
+metadata_csv: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/metadata/UCSF-PDGM-metadata_v5.csv
+output_root: /media/mpascual/Sandisk2TB/research/vena/results/susceptibility_priors
+
+n_patients: 10
+seed: 1337
+log_level: INFO
+n_slices: 5
+
+algorithms:
+  - name: magnitude_swan
+    params:
+      sigma_mm: 1.0
+      percentile_clip: [0.5, 99.5]
+      itss_quantile: 0.10
+      contour_threshold: 0.5

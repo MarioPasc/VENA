@@ -1,0 +1,20 @@
+# Default config for the perfusion-priors routine.
+# Runs the Alsop-2015 NAWM-normalised CBF channels on the same 10-patient
+# subset as routines/vessel_priors/configs/default.yaml (seed=1337) so a
+# cross-module visual comparison is possible per-patient.
+
+dataset_root: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
+metadata_csv: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/metadata/UCSF-PDGM-metadata_v5.csv
+output_root: /media/mpascual/Sandisk2TB/research/vena/results/perfusion_priors
+
+n_patients: 10
+seed: 1337
+log_level: INFO
+n_slices: 5
+
+algorithms:
+  - name: alsop2015
+    params:
+      max_relative: 8.0
+      squash_const: 3.0
+      aggregator: median

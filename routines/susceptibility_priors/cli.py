@@ -1,9 +1,9 @@
-"""Entrypoint for the vessel-priors routine.
+"""Entrypoint for the susceptibility-priors routine.
 
 Usage
 -----
-    vena-vessel-priors <config.yaml>
-    python -m routines.vessel_priors.cli <config.yaml>
+    vena-susceptibility-priors <config.yaml>
+    python -m routines.susceptibility_priors.cli <config.yaml>
 """
 
 from __future__ import annotations
@@ -15,10 +15,12 @@ from pathlib import Path
 
 from rich.logging import RichHandler
 
-from routines.vessel_priors.engine.vessel_priors_engine import (
-    VesselPriorsRoutineEngine,
+from routines.susceptibility_priors.engine.susceptibility_priors_engine import (
+    SusceptibilityPriorsRoutineEngine,
 )
-from vena.prior_maps.vessel_priors import VesselPriorsRoutineConfig
+from vena.prior_maps.susceptibility_priors import (
+    SusceptibilityPriorsRoutineConfig,
+)
 
 
 def _configure_logging(level: str) -> None:
@@ -31,19 +33,19 @@ def _configure_logging(level: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="vena-vessel-priors")
+    parser = argparse.ArgumentParser(prog="vena-susceptibility-priors")
     parser.add_argument("config", type=Path, help="Path to YAML routine config")
     parser.add_argument(
         "--figures-only",
         action="store_true",
-        help="Skip prediction; re-render collages from existing soft/mask NIfTIs.",
+        help="Skip prediction; re-render collages from existing channel NIfTIs.",
     )
     args = parser.parse_args(argv)
 
-    cfg = VesselPriorsRoutineConfig.from_yaml(args.config)
+    cfg = SusceptibilityPriorsRoutineConfig.from_yaml(args.config)
     _configure_logging(cfg.log_level)
-    out = VesselPriorsRoutineEngine(cfg).run(figures_only=args.figures_only)
-    logging.getLogger(__name__).info("Vessel-priors routine artifact: %s", out)
+    out = SusceptibilityPriorsRoutineEngine(cfg).run(figures_only=args.figures_only)
+    logging.getLogger(__name__).info("Susceptibility-priors routine artifact: %s", out)
     return 0
 
 
