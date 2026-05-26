@@ -1,0 +1,78 @@
+# MAISI encode — Picasso A100 (full UCSF-PDGM cohort).
+#
+# Runs the detail-preserving recipe (full-volume fp32, foreground-only
+# 0–99.95 percentile normalisation, per-class avg-pool tumour mask) across
+# every patient in UCSFPDGM_image.h5 and writes the latent cache to the
+# Picasso datasets directory. Auxiliary QC artefacts (NIfTI dumps,
+# per-modality figures, stabilization sweep, PCA) land under the
+# corresponding run directory in execs/vena.
+#
+# Resource envelope (worker.sh): 1× A100 40 GB, 16 CPUs, 64 GB host RAM,
+# 0-12:00:00 wallclock. Per-patient encode at fp32 full-volume measured
+# ~10 s on the A100 (extrapolated from a 3060 measurement of ~10 s at
+# fp32 + autocast off); 495 patients × 4 modalities ≈ 5.5 h, plus ~30 min
+# stabilization decode and figure rendering.
+
+source_image_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSFPDGM_image.h5
+autoencoder_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+output_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/encode_maisi
+# Latent H5 path is required to land at the canonical Picasso location
+# so downstream FM training can find it via src/external/LINKS.md.
+output_h5_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSFPDGM_latent.h5
+
+modalities: [t1pre, t1c, t2, flair]
+device: cuda
+
+# Detail-preserving precision (proven 5.7× MAE drop on the 3060 smoke).
+precision_mode: fp32
+autoencoder_norm_float16: null
+
+inference_mode: auto
+depth_pad_base: 8
+
+sliding_window:
+  roi_size: [80, 80, 32]
+  overlap: 0.4
+  mode: gaussian
+
+percentile_lower: 0.0
+percentile_upper: 99.95
+percentile_foreground_only: true
+
+mask_downsampler:
+  name: per_class_avg_pool
+  params: {}
+
+# Full cohort.
+patient_ids: null
+limit: null
+overwrite: true
+log_level: INFO
+seed: 42
+
+# Roundtrip QC on one patient per WHO grade (no explicit list → engine
+# picks 1 per grade at random with this seed). NIfTI dumps for all rows.
+roundtrip:
+  enabled: true
+  per_modality_figures: true
+  save_nifti: true
+  modalities: [t1pre, t1c, t2, flair]
+  n_patients: null
+
+# Stabilization: 10 patients per WHO grade across all available grades,
+# with bootstrap CIs and 10 set-collage figures.
+stabilization:
+  enabled: true
+  n_per_grade: 10
+  grades: [1, 2, 3, 4]
+  seed: 11
+  n_bootstrap: 5000
+  ci_level: 0.95
+  set_figures: true
+  modalities: [t1pre, t1c, t2, flair]
+
+pca:
+  enabled: true
+  figure_filename: pca.png
+  pooling: global_avg
+  n_components: 2

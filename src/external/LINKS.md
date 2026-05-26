@@ -7,7 +7,7 @@ Local:
     - Flow Matching model: /media/mpascual/Sandisk2TB/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
 - UCSF_PDGM:
     - Source Data (.nii.gz format): /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
-    - H5 Data Folder: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_image.h5
+    - H5 Data Folder: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSFPDGM_image.h5
 - Documentation folder:
     - /media/mpascual/Sandisk2TB/research/vena/docs
 
