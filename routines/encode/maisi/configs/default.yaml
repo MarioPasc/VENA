@@ -1,0 +1,43 @@
+# MAISI latent-domain H5 build — full cohort, local-workstation defaults.
+#
+# Inference mode is "auto": full-volume first, sliding-window on CUDA OOM.
+# On the RTX 3060 / 12 GB this almost always lands on sliding-window; on
+# Picasso A100 / 40 GB it stays full-volume. Both paths produce identical
+# latents (sliding-window with overlap≥0.25 on a fully-convolutional VAE
+# is shape-exact up to the overlap blending).
+
+source_image_h5: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_image.h5
+autoencoder_checkpoint: /media/mpascual/Sandisk2TB/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+output_dir: artifacts/encode/maisi
+output_h5_path: null   # default: <run_dir>/UCSFPDGM_latent.h5
+
+modalities: [t1pre, t1c, t2, flair]
+device: cuda
+inference_mode: auto
+depth_pad_base: 8
+
+sliding_window:
+  roi_size: [80, 80, 32]
+  overlap: 0.4
+  mode: gaussian
+
+mask_downsampler:
+  name: per_class_avg_pool
+  params: {}
+
+limit: null
+overwrite: false
+log_level: INFO
+seed: 42
+
+roundtrip:
+  enabled: true
+  figure_filename: roundtrip.png
+  n_patients: null
+  modalities: [t1c]
+
+pca:
+  enabled: true
+  figure_filename: pca.png
+  pooling: global_avg
+  n_components: 2

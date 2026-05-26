@@ -103,6 +103,7 @@ vena-preflight-vessel-mask = "routines.preflights.vessel_mask.cli:main"
 vena-preflight-priors-validation = "routines.preflights.priors_validation.cli:main"
 vena-preflight-venous-atlas-build = "routines.preflights.venous_atlas_build.cli:main"
 vena-h5-ucsf-pdgm-image = "routines.h5_datasets.ucsf_pdgm.cli:main"
+vena-encode-maisi = "routines.encode.maisi.cli:main"
 
 # ----------------------------------------------------------------------------
 # Setuptools layout — src/-layout for the library, flat-layout for routines/
@@ -115,6 +116,7 @@ namespaces = false
 
 [tool.setuptools.package-data]
 vena_fm = ["py.typed"]
+"vena.model.autoencoder.maisi.configs" = ["*.json"]
 
 # ----------------------------------------------------------------------------
 # Hardware / install notes (NOT pyproject keys; kept as a reference comment)

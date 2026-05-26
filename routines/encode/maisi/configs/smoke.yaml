@@ -1,0 +1,41 @@
+# MAISI encode — smoke run.
+#
+# Encodes the first 4 patients of the image H5 with all four modalities,
+# forces sliding-window inference (so the run completes on a CPU-only box
+# during CI as well as on a 3060), and renders both QC figures.
+
+source_image_h5: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_image.h5
+autoencoder_checkpoint: /media/mpascual/Sandisk2TB/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+output_dir: /tmp/vena_smoke_encode_maisi
+output_h5_path: null
+
+modalities: [t1pre, t1c, t2, flair]
+device: cuda
+inference_mode: sliding
+depth_pad_base: 8
+
+sliding_window:
+  roi_size: [80, 80, 32]
+  overlap: 0.4
+  mode: gaussian
+
+mask_downsampler:
+  name: per_class_avg_pool
+  params: {}
+
+limit: 4
+overwrite: true
+log_level: INFO
+seed: 0
+
+roundtrip:
+  enabled: true
+  figure_filename: roundtrip.png
+  n_patients: null
+  modalities: [t1c]
+
+pca:
+  enabled: true
+  figure_filename: pca.png
+  pooling: global_avg
+  n_components: 2

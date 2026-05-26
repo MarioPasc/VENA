@@ -1,0 +1,68 @@
+# MAISI encode — detail-preserving smoke run.
+#
+# Three changes vs `smoke.yaml`, each grounded in the literature on
+# high-frequency preservation under VAE compression:
+#
+# 1. inference_mode: full     — eliminates Gaussian-blended sliding-window
+#    seams (well-known low-pass at tile boundaries; see Pati et al. 2021,
+#    MONAI inferer docs). Fits in fp16 autocast on the RTX 3060.
+# 2. percentile_foreground_only: true — skull-stripped MR has ~70% zero
+#    background; including it biases percentiles. Foreground-only stats
+#    are nnU-Net's default (Isensee et al. 2021, Nat. Methods) and
+#    Reinhold et al. 2019 (SPIE) for MR synthesis preprocessing.
+# 3. percentile_upper: 99.95 — bright vessels and enhancing rim in T1c
+#    sit in the top ~0.3% of foreground; clipping at 99.5 flattens them.
+#
+# Patient list: one per available WHO grade in UCSF-PDGM (2/3/4), plus a
+# second grade-4 (picked at seed=7 via numpy default_rng) for variety.
+
+source_image_h5: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_image.h5
+autoencoder_checkpoint: /media/mpascual/Sandisk2TB/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+output_dir: /media/mpascual/Sandisk2TB/research/vena/results/vena_smoke_encode_maisi
+output_h5_path: null
+
+modalities: [t1pre, t1c, t2, flair]
+device: cuda
+
+inference_mode: full
+depth_pad_base: 8
+
+# Sliding-window kept as a fallback only (auto mode would use these on OOM).
+sliding_window:
+  roi_size: [80, 80, 32]
+  overlap: 0.4
+  mode: gaussian
+
+# Detail-preserving normalisation.
+percentile_lower: 0.0
+percentile_upper: 99.95
+percentile_foreground_only: true
+
+mask_downsampler:
+  name: per_class_avg_pool
+  params: {}
+
+# Encode exactly these four patients (one per WHO grade + one extra
+# grade-4 for figure diversity, since UCSF-PDGM has only 3 grades).
+patient_ids:
+  - UCSF-PDGM-0232   # WHO 2
+  - UCSF-PDGM-0231   # WHO 3
+  - UCSF-PDGM-0004   # WHO 4
+  - UCSF-PDGM-0517   # WHO 4 (second example for in-grade variety)
+
+limit: null
+overwrite: true
+log_level: INFO
+seed: 7
+
+roundtrip:
+  enabled: true
+  figure_filename: roundtrip.png
+  n_patients: null
+  modalities: [t1c]
+
+pca:
+  enabled: true
+  figure_filename: pca.png
+  pooling: global_avg
+  n_components: 2
