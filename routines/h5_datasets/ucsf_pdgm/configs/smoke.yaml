@@ -1,0 +1,19 @@
+# UCSF-PDGM image-domain H5 cache — smoke run.
+#
+# 8 patients (still enough to fit 5-fold CV on 6 train + 2 held-out test)
+# at n_jobs=2. Useful for quickly sanity-checking the converter without
+# waiting on the full ~500-patient sweep.
+
+source_root: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
+metadata_csv: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/metadata/UCSF-PDGM-metadata_v5.csv
+output_path: /tmp/vena_smoke_h5/UCSFPDGM_image_smoke.h5
+
+n_jobs: 2
+n_test: 2
+n_folds: 3
+seed: 0
+stratify_by: null
+
+overwrite: true
+limit: 8
+log_level: INFO
