@@ -1,0 +1,81 @@
+# MAISI encode — detail-preserving v3.
+#
+# Cumulative improvements relative to the baseline smoke run:
+#   v1 (smoke.yaml):       sliding-window fp16 autocast, 99.5 percentile, all-voxel.
+#   v2 (smoke_detail.yaml): + full-volume, + 99.95 percentile, + foreground-only.
+#   v3 (this):              + fp32 inference (norm_float16=False, no autocast),
+#                           + per-modality black-bg figures, + NIfTI dump,
+#                           + 30-patient stabilization (10 / WHO grade) with
+#                             bootstrap-CI metrics and 10 set-collage figures.
+#
+# Why fp32:
+#   MAISI's MaisiGroupNorm3D reduces partial sums in fp16 when
+#   norm_float16=True. Variance estimates over voxels spanning ~0.3–0.95
+#   normalised intensity lose precision in the squared-deviation term —
+#   exactly where bright vessels live. Switching to fp32 (and skipping
+#   autocast) restores full mantissa precision through normalisation.
+#   See Micikevicius et al. 2018 (NVIDIA mixed-precision) and
+#   Sun et al. 2019 on fp16 reduction breakdown in LayerNorm/GroupNorm.
+
+source_image_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_image.h5
+autoencoder_checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+output_dir: /media/hddb/mario/results/vena/encode_ucsf_pdgm_maisi
+output_h5_path: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_latents.h5
+
+modalities: [t1pre, t1c, t2, flair]
+device: cuda
+
+# Precision.
+precision_mode: fp32
+autoencoder_norm_float16: null   # null → resolved from precision_mode (False here)
+
+# Inference / preprocessing.
+inference_mode: auto             # try full-volume first; sliding-window on OOM.
+depth_pad_base: 8
+
+sliding_window:
+  roi_size: [80, 80, 32]
+  overlap: 0.4
+  mode: gaussian
+
+percentile_lower: 0.0
+percentile_upper: 99.95
+percentile_foreground_only: true
+
+mask_downsampler:
+  name: per_class_avg_pool
+  params: {}
+
+# Named patients (the 4 from the previous run, all rendered + saved as NIfTI).
+patient_ids:
+  - UCSF-PDGM-0232   # WHO 2
+  - UCSF-PDGM-0231   # WHO 3
+  - UCSF-PDGM-0004   # WHO 4
+  - UCSF-PDGM-0517   # WHO 4
+
+limit: null
+overwrite: true
+log_level: INFO
+seed: 7
+
+roundtrip:
+  enabled: true
+  per_modality_figures: true     # one figure per modality
+  save_nifti: true               # dump original + reconstructed .nii.gz
+  modalities: [t1pre, t1c, t2, flair]
+
+stabilization:
+  enabled: true
+  n_per_grade: 10
+  grades: [1, 2, 3, 4]            # only present grades will yield rows
+  seed: 11
+  n_bootstrap: 5000
+  ci_level: 0.95
+  set_figures: true
+  modalities: [t1pre, t1c, t2, flair]
+
+pca:
+  enabled: true
+  figure_filename: pca.png
+  pooling: global_avg
+  n_components: 2
