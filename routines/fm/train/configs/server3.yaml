@@ -1,10 +1,13 @@
-# Full S1 config for server3 (icai-server) — 2× RTX 4090 24 GB.
-# Target: 50 000 steps on fold-0 train (356 patients), batch 2, two GPUs DDP.
-seed: 42
-site: server3
-stage: S1
-artifact_root: /media/hddb/mario/artifacts/vena/fm.train
-run_name: S1_full_fold0
+# Full S1 config for server3 (icai-server) — 1× RTX 4090 24 GB.
+# Target: 50 000 steps on fold-0 train (356 patients), batch 2.
+
+run:
+  stage: s1
+  resume_from: null
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
 
 data:
   latents_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_latents.h5
@@ -13,20 +16,24 @@ data:
   num_workers: 4
   pin_memory: true
   max_train_subjects: null
+  max_val_subjects: null
 
-trunk:
-  checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
-  class_token: 9
-  spacing_mm: [1.0, 1.0, 1.0]
-
-controlnet:
-  conditioning_inputs:
-    - latent:t1pre
-    - latent:t2
-    - latent:flair
-    - mask:wt:identity
-  arch_overrides: {}
-  perturb_keys: ["wt"]
+model:
+  trunk:
+    checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides: {}
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+  controlnet:
+    conditioning_inputs:
+      - latent:t1pre
+      - latent:t2
+      - latent:flair
+      - mask:wt:identity
+    arch_overrides: {}
+    perturb_keys: ["wt"]
+  vae_checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
 
 loss:
   cfm:
@@ -46,13 +53,49 @@ optim:
   warmup_steps: 1000
   scheduler: polynomial
 
-trainer:
-  max_steps: 50000
-  precision: bf16-mixed
-  devices: 2
-  accelerator: gpu
-  strategy: ddp_find_unused_parameters_true
-  log_every_n_steps: 25
+ema:
+  decay: 0.9999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 50000
+  batch_size: 2
+  grad_accum: 1
+  checkpoint_every_epochs: 5
+  log_train_every_steps: 25
+  best_metric_name: mse_latent
+  best_metric_region: bg
+  best_metric_nfe: 5
   gradient_clip_val: 1.0
-  accumulate_grad_batches: 1
-  deterministic: false
+
+validation:
+  every_epochs: 1
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 5     # doc default
+  sweep_nfes: [1, 2, 5, 10, 50]
+  qualitative_every_epochs: 10
+  image_metrics: true
+
+output:
+  experiments_root: /media/hddb/mario/experiments
+  retention_n_checkpoints: 3
+  tensorboard: false
+  wandb: false
+
+regions:
+  brain:
+    source: fallback_all_ones
+  wt:
+    source: derived_from_tumor_latent
+    threshold: 0.5
+  wt_dilated:
+    source: derived_via_scipy_binary_dilation
+    structure: ones_3x3x3
+  bg:
+    source: derived
+  vessel:
+    source: skipped

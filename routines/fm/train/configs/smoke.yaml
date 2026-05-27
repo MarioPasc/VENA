@@ -1,10 +1,17 @@
-# S1 smoke config — server3 paths, 50 steps, batch 1, 4 subjects.
-# Goal: prove the pipeline runs end-to-end, loss is finite and trends down.
-seed: 42
-site: server3
-stage: S1
-artifact_root: /media/hddb/mario/artifacts/vena/fm.train
-run_name: smoke
+# S1 smoke config — server3 paths, exercises every code path in one short run.
+#   • 50 steps, batch 1
+#   • 4 train + 4 val subjects
+#   • validation every epoch, sweep every epoch over NFE ∈ {2, 5}
+#   • qualitative every epoch
+#   • image-space metrics through the frozen MAISI VAE decoder
+
+run:
+  stage: s1
+  resume_from: null
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
 
 data:
   latents_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_latents.h5
@@ -13,20 +20,24 @@ data:
   num_workers: 2
   pin_memory: true
   max_train_subjects: 4
+  max_val_subjects: 4
 
-trunk:
-  checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
-  class_token: 9
-  spacing_mm: [1.0, 1.0, 1.0]
-
-controlnet:
-  conditioning_inputs:
-    - latent:t1pre
-    - latent:t2
-    - latent:flair
-    - mask:wt:identity
-  arch_overrides: {}
-  perturb_keys: ["wt"]
+model:
+  trunk:
+    checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides: {}
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+  controlnet:
+    conditioning_inputs:
+      - latent:t1pre
+      - latent:t2
+      - latent:flair
+      - mask:wt:identity
+    arch_overrides: {}
+    perturb_keys: ["wt"]
+  vae_checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
 
 loss:
   cfm:
@@ -46,13 +57,54 @@ optim:
   warmup_steps: 5
   scheduler: polynomial
 
-trainer:
-  max_steps: 50
-  precision: bf16-mixed
-  devices: 1
-  accelerator: auto
-  strategy: auto
-  log_every_n_steps: 1
+ema:
+  decay: 0.9999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 50
+  batch_size: 1
+  grad_accum: 1
+  checkpoint_every_epochs: 1
+  log_train_every_steps: 1
+  best_metric_name: mse_latent
+  best_metric_region: bg
+  best_metric_nfe: 5
   gradient_clip_val: 1.0
-  accumulate_grad_batches: 1
-  deterministic: false
+
+validation:
+  every_epochs: 1
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 1     # every epoch in the smoke; production uses 5
+  sweep_nfes: [2, 5]
+  qualitative_every_epochs: 1
+  image_metrics: true
+
+output:
+  experiments_root: /media/hddb/mario/experiments
+  retention_n_checkpoints: 3
+  tensorboard: false
+  wandb: false
+
+# Region-mask source declarations — see RegionResolver. The UCSF-PDGM latents
+# H5 schema 0.1.0 lacks brain/dilated-WT/vessel masks at the latent grid, so
+# we derive what we can on-the-fly and skip vessel-region metrics. Replace
+# these with `source: latents_h5` + an `h5_key` once a future schema upgrade
+# adds the missing masks.
+regions:
+  brain:
+    source: fallback_all_ones
+  wt:
+    source: derived_from_tumor_latent
+    threshold: 0.5
+  wt_dilated:
+    source: derived_via_scipy_binary_dilation
+    structure: ones_3x3x3
+  bg:
+    source: derived
+  vessel:
+    source: skipped

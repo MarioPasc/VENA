@@ -26,6 +26,7 @@ dataset will produce the matching keys (``z_<name>`` / ``prior_<name>``).
 from __future__ import annotations
 
 import logging
+import random
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -36,6 +37,19 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 logger = logging.getLogger(__name__)
+
+
+def _seed_worker(worker_id: int) -> None:
+    """Deterministic per-worker seeding (training_routine.md §9).
+
+    Lightning seeds the main process via ``seed_everything(workers=True)``,
+    but per-worker NumPy / Python ``random`` state still needs an explicit
+    re-seed because some libraries (e.g. h5py via swmr) call ``random``
+    during file-open. Mirrors PyTorch's ``DataLoader`` documentation example.
+    """
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 class LatentH5Dataset(Dataset):
@@ -94,6 +108,18 @@ class LatentH5Dataset(Dataset):
         return len(self.patient_ids)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
+        try:
+            return self._read_one(idx)
+        except (OSError, KeyError) as exc:
+            # training_routine.md §10: skip corrupt-H5 reads, try the next patient.
+            pid = self.patient_ids[idx]
+            logger.warning("H5 read failed for patient '%s' (%s); skipping.", pid, exc)
+            next_idx = (idx + 1) % len(self.patient_ids)
+            if next_idx == idx:
+                raise
+            return self._read_one(next_idx)
+
+    def _read_one(self, idx: int) -> dict[str, torch.Tensor | str]:
         h5 = self._ensure_open()
         assert self._idx_by_id is not None  # populated by _ensure_open
         pid = self.patient_ids[idx]
@@ -153,6 +179,7 @@ class LatentH5DataModule(pl.LightningDataModule):
         num_workers: int = 2,
         pin_memory: bool = True,
         max_train_subjects: int | None = None,
+        max_val_subjects: int | None = None,
         seed: int = 42,
     ) -> None:
         super().__init__()
@@ -162,6 +189,7 @@ class LatentH5DataModule(pl.LightningDataModule):
         self.num_workers = int(num_workers)
         self.pin_memory = bool(pin_memory)
         self.max_train_subjects = max_train_subjects
+        self.max_val_subjects = max_val_subjects
         self.seed = int(seed)
         self._train_ids: list[str] = []
         self._val_ids: list[str] = []
@@ -190,6 +218,17 @@ class LatentH5DataModule(pl.LightningDataModule):
                 len(self._train_ids),
                 self.seed,
             )
+        if self.max_val_subjects is not None and self.max_val_subjects < len(self._val_ids):
+            rng = np.random.default_rng(self.seed + 1)
+            chosen = rng.choice(
+                len(self._val_ids), size=self.max_val_subjects, replace=False
+            )
+            self._val_ids = [self._val_ids[int(i)] for i in sorted(chosen)]
+            logger.info(
+                "LatentH5DataModule: subsampled val to %d subjects (seed=%d)",
+                len(self._val_ids),
+                self.seed + 1,
+            )
         logger.info(
             "LatentH5DataModule.setup: fold=%d train=%d val=%d test=%d",
             self.fold,
@@ -211,6 +250,7 @@ class LatentH5DataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             drop_last=shuffle,
             persistent_workers=self.num_workers > 0,
+            worker_init_fn=_seed_worker if self.num_workers > 0 else None,
         )
 
     def train_dataloader(self) -> DataLoader:

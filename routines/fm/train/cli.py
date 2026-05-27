@@ -28,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     cfg = FMTrainRoutineConfig.from_yaml(args.config)
-    engine = FMTrainRoutineEngine(cfg)
+    engine = FMTrainRoutineEngine(cfg, config_yaml_path=args.config)
     artifact = engine.run()
     print(f"artifact: {artifact}")
     return 0

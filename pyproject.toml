@@ -78,6 +78,10 @@ dependencies = [
     # do not pin the minor version — only the APIs used (LightningModule,
     # LightningDataModule, Trainer.fit, CSVLogger) are stable across 2.x.
     "pytorch-lightning>=2.2,<3",
+    # EMA with Karras-style warmup (Karras et al. 2024, arXiv:2312.02696). Single-file
+    # implementation by lucidrains; supports inv_gamma/power scheduling natively. We
+    # install with --no-deps on CUDA-pinned hosts to avoid disturbing torch.
+    "ema-pytorch>=0.5",
 ]
 
 [project.optional-dependencies]
