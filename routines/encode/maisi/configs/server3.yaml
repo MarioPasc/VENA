@@ -62,32 +62,36 @@ seed: 7
 #
 # encode_full_cohort=true:
 #   ignore `patient_ids` for the encode pass; encode every patient in the
-#   source image H5 (501 patients). `patient_ids` is still consulted for
+#   source image H5 (~501 patients). `patient_ids` is still consulted for
 #   roundtrip QC selection (the four named patients below). Stabilization
 #   and PCA pick from the cohort by WHO-grade stratification as before.
 #
 # checkpoint_every=50:
-#   flush the latent H5 every 50 encoded patients. On 501 patients that is
-#   ~10 checkpoints. The cost is one h5py flush per checkpoint (~ms);
+#   flush the latent H5 every 50 encoded patients. On ~500 patients that
+#   is ~10 checkpoints. The cost is one h5py flush per checkpoint (~ms);
 #   the benefit is a crash loses at most ~50 patients of work.
 #
-# resume + resume_from_run_id:
-#   if the run is interrupted (OOM, SIGKILL, X11 error in QC, etc.), copy
-#   the timestamped run dir name (e.g. 2026-05-27T11-30-00Z) into
-#   `resume_from_run_id` and re-run. The engine will:
+# resume_from_run_id (default: null) — OPT-IN.
+#   On a fresh start, leave this null and make sure `output_h5_path` does
+#   not already exist (or set `overwrite: true` to wipe it). The
+#   converter has no implicit auto-resume: if the H5 exists and
+#   `overwrite` is False, it raises FileExistsError.
+#
+#   If a run is interrupted (OOM, SIGKILL, X11 error in QC, etc.), copy
+#   the timestamped run-dir name printed in the log (e.g.
+#   `2026-05-27T11-30-00Z`) into `resume_from_run_id` and re-run. The
+#   engine will:
 #     1. reuse that run dir for all artefacts (QC figures, tables,
 #        decision.json) — they accumulate in one place.
-#     2. recover the latent H5 path from that run's config.yaml.
+#     2. recover the latent H5 path from that run's `config.yaml`.
 #     3. enter the converter's resume path: open the existing H5 in r+,
 #        validate provenance (source SHA, autoencoder SHA, modalities,
 #        encoder runtime attrs, mask downsampler, ids order), and encode
 #        only rows where `progress/completed[i] == False`. The latent H5
-#        itself carries the "which patient ids are done" state via the
+#        carries the "which patient ids are done" state via the
 #        combination of `ids[i]` and `progress/completed[i]`.
-#   Leave `resume_from_run_id: null` on a fresh start.
 encode_full_cohort: true
 checkpoint_every: 50
-resume: true
 resume_from_run_id: null
 
 roundtrip:

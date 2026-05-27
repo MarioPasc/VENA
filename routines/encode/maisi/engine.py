@@ -166,24 +166,21 @@ class EncodeMaisiRoutineConfig(BaseModel):
         ge=1,
         description="Flush the latent H5 after every K encoded patients.",
     )
-    resume: bool = Field(
-        default=True,
-        description=(
-            "If the output latent H5 already exists and ``overwrite`` is "
-            "False, resume from ``progress/completed`` instead of failing."
-        ),
-    )
     resume_from_run_id: str | None = Field(
         default=None,
         description=(
-            "When set, treat the routine as a continuation of a prior run. "
-            "The engine looks up ``<output_dir>/<resume_from_run_id>/``, "
-            "reads its ``config.yaml`` to recover the latent H5 path, "
-            "reuses the prior run dir so all artefacts (figures, tables, "
-            "decision.json) accumulate in one place, and forces the "
-            "converter onto its resume path (``progress/completed`` "
-            "determines which patient ids still need encoding). When null, "
-            "the routine creates a fresh timestamped run dir as before."
+            "Opt-in resume pointer. When null, the routine creates a fresh "
+            "timestamped run dir and the converter takes the fresh path "
+            "(if the latent H5 already exists and ``overwrite`` is False, "
+            "the converter raises). When set to a prior run-dir name "
+            "(e.g. ``2026-05-27T07-59-22Z``), the engine: (1) looks up "
+            "``<output_dir>/<resume_from_run_id>/`` — must exist; "
+            "(2) reads its ``config.yaml`` to recover the latent H5 path; "
+            "(3) reuses that prior run dir so all artefacts (figures, "
+            "tables, decision.json) accumulate in one place; (4) drives "
+            "the converter onto its resume path. The latent H5 itself "
+            "carries the 'which patient ids are done' state via the "
+            "combination of ``ids[i]`` and ``progress/completed[i]``."
         ),
     )
 
@@ -297,6 +294,9 @@ class EncodeMaisiRoutineEngine:
             converter_patient_ids = None
         else:
             converter_patient_ids = all_ids if all_ids else None
+        # Resume is opt-in via ``resume_from_run_id``. On a fresh run, the
+        # converter takes its fresh path and respects ``overwrite``: an
+        # existing latent H5 with overwrite=False raises FileExistsError.
         conv_cfg = UCSFPDGMLatentH5Config(
             source_image_h5=cfg.source_image_h5,
             output_path=latent_h5,
@@ -304,7 +304,7 @@ class EncodeMaisiRoutineEngine:
             modalities=list(cfg.modalities),
             inference_mode=cfg.inference_mode,
             overwrite=cfg.overwrite,
-            resume=cfg.resume,
+            resume=cfg.resume_from_run_id is not None,
             checkpoint_every=cfg.checkpoint_every,
             limit=cfg.limit,
             patient_ids=converter_patient_ids,
