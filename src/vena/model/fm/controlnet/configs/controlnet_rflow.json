@@ -1,0 +1,17 @@
+{
+    "_comment_1": "Frozen kwargs for monai.apps.generation.maisi.networks.controlnet_maisi.ControlNetMaisi.",
+    "_comment_2": "'conditioning_embedding_in_channels' is overwritten at instantiation by ConditioningAssembler.total_channels.",
+    "_comment_3": "MONAI's ControlNetConditioningEmbedding inserts (len(channels) - 1) stride-2 conv blocks. The proposal's default [16, 32, 64] was inherited from MAISI's image-space CT pipeline (image conditioning -> 4x downsample to latent). VENA conditions in latent space already (mask/priors live in the 4x-compressed MAISI grid), so we use a single-block embedding [64] for zero spatial downsampling. Override with [16, 32, 64] in an ablation YAML that conditions on image-resolution inputs.",
+    "spatial_dims": 3,
+    "in_channels": 4,
+    "num_channels": [64, 128, 256, 512],
+    "attention_levels": [false, false, true, true],
+    "num_head_channels": [0, 0, 32, 32],
+    "num_res_blocks": 2,
+    "use_flash_attention": true,
+    "conditioning_embedding_in_channels": 1,
+    "conditioning_embedding_num_channels": [64],
+    "num_class_embeds": 128,
+    "resblock_updown": true,
+    "include_fc": true
+}

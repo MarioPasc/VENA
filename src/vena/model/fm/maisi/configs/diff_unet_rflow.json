@@ -1,0 +1,17 @@
+{
+    "_comment": "Frozen kwargs for monai.apps.generation.maisi.networks.diffusion_model_unet_maisi.DiffusionModelUNetMaisi as used by NV-Generate-MR's diff_unet_3d_rflow-mr.pt checkpoint. Mirrors proposal_contrastive_loss.md §4.2.",
+    "spatial_dims": 3,
+    "in_channels": 4,
+    "out_channels": 4,
+    "num_channels": [64, 128, 256, 512],
+    "attention_levels": [false, false, true, true],
+    "num_head_channels": [0, 0, 32, 32],
+    "num_res_blocks": 2,
+    "use_flash_attention": true,
+    "include_top_region_index_input": false,
+    "include_bottom_region_index_input": false,
+    "include_spacing_input": true,
+    "num_class_embeds": 128,
+    "resblock_updown": true,
+    "include_fc": true
+}

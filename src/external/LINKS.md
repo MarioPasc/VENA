@@ -9,6 +9,7 @@ Local:
 - UCSF_PDGM:
     - Source Data (.nii.gz format): /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
     - H5 Data Folder: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSFPDGM_image.h5
+    - H5 Latents: /media/mpascual/MeningD2/MAISI_VAEGAN_LATENTS/UCSF_PDGM
 - Documentation folder:
     - /media/mpascual/Sandisk2TB/research/vena/docs
 
@@ -27,3 +28,4 @@ Research Server 3:
     - Flow Matching model: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
 - UCSF_PDGM:
     - (Image domain, schema of 19/05/2026): /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_image.h5
+    - (Latent domain): /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_latents.h5

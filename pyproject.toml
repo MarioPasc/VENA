@@ -73,6 +73,11 @@ dependencies = [
     # in src/vena/data/h5/shared/splits.py — the standard implementation for
     # patient-level stratified cross-validation.
     "scikit-learn>=1.4",
+    # Flow-matching training loop: PyTorch Lightning 2.x for the trainer skeleton,
+    # callbacks (LR monitor, ModelCheckpoint), CSVLogger, and DDP. We deliberately
+    # do not pin the minor version — only the APIs used (LightningModule,
+    # LightningDataModule, Trainer.fit, CSVLogger) are stable across 2.x.
+    "pytorch-lightning>=2.2,<3",
 ]
 
 [project.optional-dependencies]
@@ -104,6 +109,7 @@ vena-preflight-priors-validation = "routines.preflights.priors_validation.cli:ma
 vena-preflight-venous-atlas-build = "routines.preflights.venous_atlas_build.cli:main"
 vena-h5-ucsf-pdgm-image = "routines.h5_datasets.ucsf_pdgm.cli:main"
 vena-encode-maisi = "routines.encode.maisi.cli:main"
+vena-fm-train = "routines.fm.train.cli:main"
 
 # ----------------------------------------------------------------------------
 # Setuptools layout — src/-layout for the library, flat-layout for routines/
@@ -117,6 +123,7 @@ namespaces = false
 [tool.setuptools.package-data]
 vena_fm = ["py.typed"]
 "vena.model.autoencoder.maisi.configs" = ["*.json"]
+"vena.model.fm.maisi.configs" = ["*.json"]
 
 # ----------------------------------------------------------------------------
 # Hardware / install notes (NOT pyproject keys; kept as a reference comment)
