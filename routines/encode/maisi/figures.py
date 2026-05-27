@@ -21,6 +21,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.figure import Figure
@@ -138,7 +141,7 @@ def render_roundtrip_figure(
     for r in rows:
         diff = r.reconstructed - r.original
         error_maps_mae.append(np.abs(diff))
-        error_maps_mse.append(diff ** 2)
+        error_maps_mse.append(diff**2)
         error_maps_lp3.append(np.abs(diff) ** 3)
 
     # Per-column normalisation.
@@ -147,6 +150,7 @@ def render_roundtrip_figure(
     vmax_lp3 = max(_p99(e) for e in error_maps_lp3)
 
     if row_label is None:
+
         def row_label(r: RoundtripRow) -> str:
             return f"{r.patient_id}\nWHO {r.who_grade}\n{r.modality}"
 
@@ -168,8 +172,12 @@ def render_roundtrip_figure(
             ]
             for ci, (vol, cmap, vmin, vmax) in enumerate(cells):
                 sub = GridSpecFromSubplotSpec(
-                    2, 2, subplot_spec=outer[ri, ci],
-                    height_ratios=[2, 1], hspace=0.02, wspace=0.02,
+                    2,
+                    2,
+                    subplot_spec=outer[ri, ci],
+                    height_ratios=[2, 1],
+                    hspace=0.02,
+                    wspace=0.02,
                 )
                 title_str = col_titles[ci] if ri == 0 else None
                 _draw_three_plane_cell(sub, fig, vol, r.tumor_centroid, cmap, vmin, vmax, title_str)
@@ -212,9 +220,7 @@ def render_per_modality_roundtrip_figures(
     out: dict[str, Path] = {}
     for modality, modrows in by_modality.items():
         path = output_dir / filename_template.format(modality=modality)
-        title = (
-            title_template.format(modality=modality) if title_template is not None else None
-        )
+        title = title_template.format(modality=modality) if title_template is not None else None
         render_roundtrip_figure(modrows, path, dpi=dpi, title=title)
         out[modality] = path
     return out
@@ -270,7 +276,9 @@ def render_pca_figure(
     fig, ax = plt.subplots(figsize=(7.5, 6.5), facecolor="black")
     markers = {"t1pre": "o", "t1c": "s", "t2": "^", "flair": "D", "adc": "P", "swi": "X"}
     # Hue: use viridis on the (clipped) tumour volume.
-    vmax = float(np.nanpercentile(tumor_volume_ml, 95)) if np.isfinite(tumor_volume_ml).any() else 1.0
+    vmax = (
+        float(np.nanpercentile(tumor_volume_ml, 95)) if np.isfinite(tumor_volume_ml).any() else 1.0
+    )
     vmax = max(vmax, 1e-3)
     cmap = plt.get_cmap("viridis")
     norm = plt.Normalize(vmin=0.0, vmax=vmax)

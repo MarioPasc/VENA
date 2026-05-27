@@ -31,7 +31,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from vena.data.h5.shared import now_iso_utc, resolve_git_sha
 from vena.data.h5.ucsf_pdgm.latent_domain import (
     UCSF_PDGM_IMAGE_NATIVE_SHAPE,
-    UCSF_PDGM_LATENT_SPATIAL,
     UCSFPDGMLatentH5Config,
     UCSFPDGMLatentH5Converter,
 )
@@ -157,6 +156,37 @@ class EncodeMaisiRoutineConfig(BaseModel):
     log_level: str = "INFO"
     seed: int = 42
 
+    # Full-cohort + checkpoint/resume controls (forwarded to the converter).
+    # When ``encode_full_cohort`` is True, the converter is invoked with
+    # ``patient_ids=None`` and every source patient is encoded; ``patient_ids``
+    # is still consulted by the QC selection (roundtrip / NIfTI dump).
+    encode_full_cohort: bool = False
+    checkpoint_every: int = Field(
+        default=50,
+        ge=1,
+        description="Flush the latent H5 after every K encoded patients.",
+    )
+    resume: bool = Field(
+        default=True,
+        description=(
+            "If the output latent H5 already exists and ``overwrite`` is "
+            "False, resume from ``progress/completed`` instead of failing."
+        ),
+    )
+    resume_from_run_id: str | None = Field(
+        default=None,
+        description=(
+            "When set, treat the routine as a continuation of a prior run. "
+            "The engine looks up ``<output_dir>/<resume_from_run_id>/``, "
+            "reads its ``config.yaml`` to recover the latent H5 path, "
+            "reuses the prior run dir so all artefacts (figures, tables, "
+            "decision.json) accumulate in one place, and forces the "
+            "converter onto its resume path (``progress/completed`` "
+            "determines which patient ids still need encoding). When null, "
+            "the routine creates a fresh timestamped run dir as before."
+        ),
+    )
+
     roundtrip: _RoundtripCfg = Field(default_factory=_RoundtripCfg)
     pca: _PcaCfg = Field(default_factory=_PcaCfg)
     stabilization: _StabilizationCfg = Field(default_factory=_StabilizationCfg)
@@ -188,7 +218,17 @@ class EncodeMaisiRoutineEngine:
         torch.manual_seed(cfg.seed)
         np.random.seed(cfg.seed)
 
-        self.run_dir = self._make_run_dir(cfg.output_dir)
+        resumed_h5_override: Path | None = None
+        if cfg.resume_from_run_id is not None:
+            self.run_dir, resumed_h5_override = self._resolve_resume_target(cfg)
+            logger.info(
+                "Resuming routine from run_id=%s (run_dir=%s, latent_h5=%s)",
+                cfg.resume_from_run_id,
+                self.run_dir,
+                resumed_h5_override,
+            )
+        else:
+            self.run_dir = self._make_run_dir(cfg.output_dir)
         figures_dir = self.run_dir / "figures"
         tables_dir = self.run_dir / "tables"
         figures_dir.mkdir(parents=True, exist_ok=True)
@@ -220,9 +260,7 @@ class EncodeMaisiRoutineEngine:
             precision_mode=cfg.precision_mode,
         )
         decoder = MaisiDecoder(handle=handle, precision_mode=cfg.precision_mode)
-        mask_ds = get_downsampler(
-            cfg.mask_downsampler.name, **cfg.mask_downsampler.params
-        )
+        mask_ds = get_downsampler(cfg.mask_downsampler.name, **cfg.mask_downsampler.params)
 
         # ---- resolve the patient list to encode -----------------------------
         # The encode pass is the expensive step; do it once for every
@@ -231,8 +269,9 @@ class EncodeMaisiRoutineEngine:
         stab_ids_by_grade: dict[int, list[str]] = {}
         if cfg.stabilization.enabled:
             stab_ids_by_grade = self._sample_stratified_ids(cfg)
-        all_stab_ids = [pid for grade in cfg.stabilization.grades
-                        for pid in stab_ids_by_grade.get(grade, [])]
+        all_stab_ids = [
+            pid for grade in cfg.stabilization.grades for pid in stab_ids_by_grade.get(grade, [])
+        ]
         # Union preserving order: named first, then stabilisation, dedup.
         seen: set[str] = set()
         all_ids: list[str] = []
@@ -243,7 +282,21 @@ class EncodeMaisiRoutineEngine:
             all_ids.append(pid)
 
         # ---- encode (delegate to library converter) -------------------------
-        latent_h5 = cfg.output_h5_path or (self.run_dir / "UCSFPDGM_latent.h5")
+        if resumed_h5_override is not None:
+            # When resuming, the latent H5 path is dictated by the prior
+            # run's persisted config — not the current YAML — so the
+            # converter writes back into the same on-disk file.
+            latent_h5 = resumed_h5_override
+        else:
+            latent_h5 = cfg.output_h5_path or (self.run_dir / "UCSFPDGM_latent.h5")
+        # Full-cohort mode: ignore the named/stabilisation union and encode
+        # every patient in the source H5. The QC passes still pick the named
+        # + stab IDs by string lookup, so the visual artefacts are identical.
+        converter_patient_ids: list[str] | None
+        if cfg.encode_full_cohort:
+            converter_patient_ids = None
+        else:
+            converter_patient_ids = all_ids if all_ids else None
         conv_cfg = UCSFPDGMLatentH5Config(
             source_image_h5=cfg.source_image_h5,
             output_path=latent_h5,
@@ -251,8 +304,10 @@ class EncodeMaisiRoutineEngine:
             modalities=list(cfg.modalities),
             inference_mode=cfg.inference_mode,
             overwrite=cfg.overwrite,
+            resume=cfg.resume,
+            checkpoint_every=cfg.checkpoint_every,
             limit=cfg.limit,
-            patient_ids=all_ids if all_ids else None,
+            patient_ids=converter_patient_ids,
         )
         converter = UCSFPDGMLatentH5Converter(
             cfg=conv_cfg, encoder=encoder, mask_downsampler=mask_ds
@@ -298,7 +353,7 @@ class EncodeMaisiRoutineEngine:
 
         # ---- artefacts -------------------------------------------------------
         (self.run_dir / "decision.json").write_text(json.dumps(decision, indent=2))
-        (self.run_dir / "git_sha.txt").write_text((decision["git_sha"] + "\n"))
+        (self.run_dir / "git_sha.txt").write_text(decision["git_sha"] + "\n")
         self._write_report(decision)
         logger.info("Routine artefacts at %s", self.run_dir)
         return latent_path
@@ -320,6 +375,58 @@ class EncodeMaisiRoutineEngine:
         except OSError as exc:
             logger.warning("could not update LATEST symlink: %s", exc)
         return run_dir
+
+    def _resolve_resume_target(self, cfg: EncodeMaisiRoutineConfig) -> tuple[Path, Path]:
+        """Locate the prior run dir and recover the latent H5 path.
+
+        Returns ``(prior_run_dir, latent_h5_path)``. Raises
+        :class:`FileNotFoundError` if the run dir is missing,
+        :class:`ValueError` if the persisted config is unreadable, and
+        :class:`FileNotFoundError` if the recovered latent H5 does not
+        exist on disk.
+        """
+        assert cfg.resume_from_run_id is not None
+        prior = Path(cfg.output_dir).resolve() / cfg.resume_from_run_id
+        if not prior.is_dir():
+            raise FileNotFoundError(
+                f"resume_from_run_id={cfg.resume_from_run_id!r} not found "
+                f"under {cfg.output_dir}: directory {prior} does not exist"
+            )
+        cfg_path = prior / "config.yaml"
+        if not cfg_path.is_file():
+            raise ValueError(
+                f"prior run dir {prior} lacks config.yaml — cannot recover the latent H5 path"
+            )
+        with cfg_path.open("r") as f:
+            prior_cfg_raw = yaml.safe_load(f) or {}
+        prior_h5_raw = prior_cfg_raw.get("output_h5_path")
+        if prior_h5_raw is None:
+            # Fallback to the prior run's default (latent under run_dir).
+            prior_h5 = prior / "UCSFPDGM_latent.h5"
+        else:
+            prior_h5 = Path(prior_h5_raw)
+        if not prior_h5.is_file():
+            raise FileNotFoundError(
+                f"latent H5 declared by prior run not found: {prior_h5}. Cannot resume."
+            )
+        # Sanity: surface any mismatch between this YAML and the prior's.
+        if cfg.output_h5_path is not None and Path(cfg.output_h5_path) != prior_h5:
+            logger.warning(
+                "resume: current YAML output_h5_path=%s differs from "
+                "prior run's %s; using the prior one.",
+                cfg.output_h5_path,
+                prior_h5,
+            )
+        # Update LATEST to point at the resumed dir so consumers (e.g. the
+        # report.md reader) find the live artefacts.
+        latest = Path(cfg.output_dir).resolve() / "LATEST"
+        try:
+            if latest.is_symlink() or latest.exists():
+                latest.unlink()
+            latest.symlink_to(prior.name)
+        except OSError as exc:
+            logger.warning("could not update LATEST symlink: %s", exc)
+        return prior, prior_h5
 
     def _persist_resolved_config(self, run_dir: Path) -> None:
         (run_dir / "config.yaml").write_text(
@@ -375,7 +482,7 @@ class EncodeMaisiRoutineEngine:
         for r in rows:
             diff = r.reconstructed - r.original
             mae = float(np.mean(np.abs(diff)))
-            mse = float(np.mean(diff ** 2))
+            mse = float(np.mean(diff**2))
             lp3 = float(np.mean(np.abs(diff) ** 3))
             metrics_lines.append(
                 f"{r.patient_id},{r.who_grade},{r.modality},{mae:.6f},{mse:.6f},{lp3:.6f}"
@@ -423,10 +530,7 @@ class EncodeMaisiRoutineEngine:
     ) -> list[tuple[str, int, int]]:
         cfg = self.cfg
         with h5py.File(latent_h5, "r") as f:
-            ids = [
-                v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
-                for v in f["ids"][:]
-            ]
+            ids = [v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in f["ids"][:]]
             grades = np.asarray(f["metadata/who_grade"][:], dtype=np.int8)
         if cfg.patient_ids is not None:
             id_to_row = {pid: i for i, pid in enumerate(ids)}
@@ -503,7 +607,7 @@ class EncodeMaisiRoutineEngine:
             diff = r.reconstructed - r.original
             d = per_mod.setdefault(r.modality, {"mae": [], "mse": [], "lp3": []})
             d["mae"].append(float(np.mean(np.abs(diff))))
-            d["mse"].append(float(np.mean(diff ** 2)))
+            d["mse"].append(float(np.mean(diff**2)))
             d["lp3"].append(float(np.mean(np.abs(diff) ** 3)))
         out: dict[str, dict[str, float]] = {}
         for mod, d in per_mod.items():
@@ -531,7 +635,9 @@ class EncodeMaisiRoutineEngine:
         """Percentile bootstrap CI for the mean of ``arr``."""
         n = arr.size
         if n < 2:
-            return float(arr.mean()) if n else float("nan"), float(arr.mean()) if n else float("nan")
+            return float(arr.mean()) if n else float("nan"), float(arr.mean()) if n else float(
+                "nan"
+            )
         rng = np.random.default_rng(seed)
         means = np.empty(n_resamples, dtype=np.float64)
         for i in range(n_resamples):
@@ -567,10 +673,7 @@ class EncodeMaisiRoutineEngine:
         the *source image H5*. Returns ``{grade: [ids...]}``; grades that
         are not present in the cohort yield an empty list."""
         with h5py.File(cfg.source_image_h5, "r") as f:
-            ids = [
-                v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
-                for v in f["ids"][:]
-            ]
+            ids = [v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in f["ids"][:]]
             grades = np.asarray(f["metadata/who_grade"][:], dtype=np.int8)
         rng = np.random.default_rng(cfg.stabilization.seed)
         out: dict[int, list[str]] = {}
@@ -602,8 +705,7 @@ class EncodeMaisiRoutineEngine:
         # Map patient -> latent row.
         with h5py.File(latent_path, "r") as f:
             latent_ids = [
-                v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
-                for v in f["ids"][:]
+                v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in f["ids"][:]
             ]
             grades_in_latent = np.asarray(f["metadata/who_grade"][:], dtype=np.int8)
         row_of = {pid: i for i, pid in enumerate(latent_ids)}
@@ -635,7 +737,7 @@ class EncodeMaisiRoutineEngine:
         for r in rows:
             diff = r.reconstructed - r.original
             mae = float(np.mean(np.abs(diff)))
-            mse = float(np.mean(diff ** 2))
+            mse = float(np.mean(diff**2))
             lp3 = float(np.mean(np.abs(diff) ** 3))
             metrics_lines.append(
                 f"{r.patient_id},{r.who_grade},{r.modality},{mae:.6f},{mse:.6f},{lp3:.6f}"
@@ -647,13 +749,9 @@ class EncodeMaisiRoutineEngine:
         agg_pooled = self._aggregate_metrics(rows)
         agg_by_grade: dict[str, dict[str, dict[str, float]]] = {}
         for g in sorted({r.who_grade for r in rows}):
-            agg_by_grade[str(g)] = self._aggregate_metrics(
-                [r for r in rows if r.who_grade == g]
-            )
+            agg_by_grade[str(g)] = self._aggregate_metrics([r for r in rows if r.who_grade == g])
         # Persist a tidy long-form aggregate CSV.
-        agg_lines = [
-            "scope,grade,modality,metric,mean,median,min,max,ci95_lo,ci95_hi,n"
-        ]
+        agg_lines = ["scope,grade,modality,metric,mean,median,min,max,ci95_lo,ci95_hi,n"]
         for mod, e in agg_pooled.items():
             for metric in ("mae", "mse", "lp3"):
                 agg_lines.append(
@@ -697,7 +795,7 @@ class EncodeMaisiRoutineEngine:
                     set_rows.extend(rows_for_pid)
                 if not set_rows:
                     continue
-                set_path = set_figures_dir / f"set_{k+1:02d}.png"
+                set_path = set_figures_dir / f"set_{k + 1:02d}.png"
 
                 def _label(r: RoundtripRow) -> str:
                     return f"{r.patient_id}\nWHO {r.who_grade}\n{r.modality}"
@@ -705,7 +803,7 @@ class EncodeMaisiRoutineEngine:
                 render_roundtrip_figure(
                     set_rows,
                     set_path,
-                    title=f"Stabilization set #{k+1:02d}",
+                    title=f"Stabilization set #{k + 1:02d}",
                     row_label=_label,
                 )
                 set_figure_paths.append(str(set_path))
@@ -751,9 +849,7 @@ class EncodeMaisiRoutineEngine:
         c = coords.mean(axis=0).astype(int)
         return (int(c[0]), int(c[1]), int(c[2]))
 
-    def _read_normalised_source(
-        self, latent_h5: Path, pid: str, modality: str
-    ) -> np.ndarray:
+    def _read_normalised_source(self, latent_h5: Path, pid: str, modality: str) -> np.ndarray:
         """Re-percentile-normalise the source image so it matches decoder
         output range. Uses the same normalisation knobs as the encoder so
         the reconstruction comparison is apples-to-apples."""
@@ -786,10 +882,7 @@ class EncodeMaisiRoutineEngine:
 
         with h5py.File(latent_path, "r") as f:
             n = int(f["ids"].shape[0])
-            ids = [
-                v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
-                for v in f["ids"][:]
-            ]
+            ids = [v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in f["ids"][:]]
             tumor_volumes_ml = self._tumor_volumes_ml(f, n)
 
             for slug in cfg.modalities:
@@ -851,8 +944,7 @@ class EncodeMaisiRoutineEngine:
         if not src_path.is_file():
             return np.zeros(n, dtype=np.float64)
         latent_ids = [
-            v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
-            for v in f["ids"][:]
+            v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in f["ids"][:]
         ]
         ml_per_voxel = 1e-3
         out = np.zeros(n, dtype=np.float64)
@@ -893,8 +985,12 @@ class EncodeMaisiRoutineEngine:
                     lines.append(f"  - {mod}: `{path}`")
                 lines.append("- per-modality stats (mean / median / 95% CI):")
                 lines.append("")
-                lines.append("| modality | MAE mean | MAE median | MAE 95% CI | MSE mean | Lp³ mean |")
-                lines.append("|----------|---------:|-----------:|:----------:|---------:|---------:|")
+                lines.append(
+                    "| modality | MAE mean | MAE median | MAE 95% CI | MSE mean | Lp³ mean |"
+                )
+                lines.append(
+                    "|----------|---------:|-----------:|:----------:|---------:|---------:|"
+                )
                 for mod, m in rt.get("per_modality_stats", {}).items():
                     lines.append(
                         f"| {mod} | {m['mae_mean']:.4f} | {m['mae_median']:.4f} | "

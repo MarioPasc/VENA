@@ -76,6 +76,24 @@ class UCSFPDGMLatentH5Config(BaseModel):
     modalities: list[str] = Field(default_factory=lambda: ["t1pre", "t1c", "t2", "flair"])
     inference_mode: str = "auto"  # auto|full|sliding
     overwrite: bool = False
+    resume: bool = Field(
+        default=True,
+        description=(
+            "When the output H5 already exists and ``overwrite`` is False, "
+            "attempt to resume from ``progress/completed``. Provenance "
+            "(source SHA, autoencoder SHA, modalities, encoder/downsampler "
+            "attrs, ids order) must match the existing file."
+        ),
+    )
+    checkpoint_every: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            "Flush the output H5 after every ``checkpoint_every`` encoded "
+            "patients. Higher values reduce I/O overhead; lower values "
+            "minimise the worst-case loss on crash/SIGKILL."
+        ),
+    )
     limit: int | None = Field(
         default=None,
         description="Optional: encode only the first ``limit`` patients (smoke runs).",
@@ -124,6 +142,19 @@ class UCSFPDGMLatentH5Converter:
             mask_output_channels=self.mask_downsampler.output_channels,
         )
 
+        if cfg.output_path.exists() and not cfg.overwrite:
+            if not cfg.resume:
+                raise FileExistsError(
+                    f"Output H5 already exists: {cfg.output_path}. "
+                    "Pass overwrite=True or resume=True."
+                )
+            return self._run_resume(manifest)
+        return self._run_fresh(manifest)
+
+    # ----- fresh run -------------------------------------------------------
+
+    def _run_fresh(self, manifest: Any) -> Path:
+        cfg = self.cfg
         with h5py.File(cfg.source_image_h5, "r") as src:
             self._assert_source_compatibility(src)
             all_ids = self._read_ids(src)
@@ -131,7 +162,7 @@ class UCSFPDGMLatentH5Converter:
             ids, src_indices = self._select_rows(cfg, all_ids)
             n = len(ids)
             logger.info(
-                "UCSF-PDGM latent-domain conversion: n_patients=%d (source has %d)",
+                "UCSF-PDGM latent-domain conversion (fresh): n_patients=%d (source has %d)",
                 n,
                 n_all,
             )
@@ -155,20 +186,98 @@ class UCSFPDGMLatentH5Converter:
 
                 latent_dsets = self._allocate_latents(w, manifest, n)
                 tumor_dset = self._allocate_tumor_mask(w, manifest, n)
+                completed_dset = self._allocate_progress(w, n)
 
-                self._encode_loop(src, n, ids, src_indices, latent_dsets, tumor_dset)
-
+                # Copy non-encoded payload (metadata, splits, priors) upfront
+                # so a partial file is structurally complete except for the
+                # rows ``progress/completed`` marks as pending.
                 self._copy_metadata(src, w, manifest, n, src_indices)
                 self._copy_splits(src, w)
                 self._create_priors_placeholder(w)
+                w.file.flush()
+
+                self._encode_loop(
+                    src=src,
+                    n=n,
+                    ids=ids,
+                    src_indices=src_indices,
+                    out_rows=list(range(n)),
+                    latent_dsets=latent_dsets,
+                    tumor_dset=tumor_dset,
+                    completed_dset=completed_dset,
+                    h5_file=w.file,
+                    checkpoint_every=cfg.checkpoint_every,
+                    prior_modes={"full": 0, "sliding": 0},
+                )
+
+                if not bool(np.all(completed_dset[:])):
+                    raise H5ConvertError("encode loop returned but some rows are still pending")
 
         try:
             assert_h5_valid(cfg.output_path, manifest)
         except Exception:
+            # Fresh run that fails validation is unsalvageable; remove it so
+            # a future resume does not pick up a structurally broken file.
             cfg.output_path.unlink(missing_ok=True)
             raise
 
         logger.info("Wrote latent H5 cache: %s", cfg.output_path)
+        return cfg.output_path
+
+    # ----- resume run ------------------------------------------------------
+
+    def _run_resume(self, manifest: Any) -> Path:
+        cfg = self.cfg
+        with h5py.File(cfg.source_image_h5, "r") as src:
+            self._assert_source_compatibility(src)
+            all_ids = self._read_ids(src)
+            ids, src_indices = self._select_rows(cfg, all_ids)
+            n = len(ids)
+            handle = self.encoder.handle
+
+            with h5py.File(cfg.output_path, "r+") as f:
+                self._assert_resume_compatible(f, src, ids, handle)
+                completed_dset = f["progress/completed"]
+                done_mask = np.asarray(completed_dset[:], dtype=bool)
+                pending_out_rows = [i for i, d in enumerate(done_mask) if not d]
+                n_done = int(done_mask.sum())
+                logger.info(
+                    "UCSF-PDGM latent-domain conversion (resume): n_patients=%d done=%d pending=%d",
+                    n,
+                    n_done,
+                    len(pending_out_rows),
+                )
+
+                if not pending_out_rows:
+                    logger.info("resume: nothing to do (all %d rows already encoded)", n)
+                else:
+                    latent_dsets = {slug: f[f"latents/{slug}"] for slug in cfg.modalities}
+                    tumor_dset = f["masks/tumor_latent"]
+                    prior_modes = self._load_inference_modes(f)
+                    f.attrs["resumed_at"] = now_iso_utc()
+                    f.attrs["resume_git_sha"] = resolve_git_sha() or "unknown"
+
+                    self._encode_loop(
+                        src=src,
+                        n=n,
+                        ids=ids,
+                        src_indices=src_indices,
+                        out_rows=pending_out_rows,
+                        latent_dsets=latent_dsets,
+                        tumor_dset=tumor_dset,
+                        completed_dset=completed_dset,
+                        h5_file=f,
+                        checkpoint_every=cfg.checkpoint_every,
+                        prior_modes=prior_modes,
+                    )
+
+                    if not bool(np.all(completed_dset[:])):
+                        raise H5ConvertError("resume loop returned but some rows are still pending")
+
+        # Validation runs on the now-complete file. If it fails, we leave the
+        # file on disk (unlike the fresh path) so the user can inspect it.
+        assert_h5_valid(cfg.output_path, manifest)
+        logger.info("Resumed and completed latent H5 cache: %s", cfg.output_path)
         return cfg.output_path
 
     # ------------------------------------------------------------------ helpers
@@ -209,9 +318,7 @@ class UCSFPDGMLatentH5Converter:
             index_of = {pid: i for i, pid in enumerate(all_ids)}
             missing = [p for p in cfg.patient_ids if p not in index_of]
             if missing:
-                raise H5ConvertError(
-                    f"patient_ids not found in source H5: {missing}"
-                )
+                raise H5ConvertError(f"patient_ids not found in source H5: {missing}")
             src_idx = [index_of[p] for p in cfg.patient_ids]
             return list(cfg.patient_ids), src_idx
         if cfg.limit is not None:
@@ -264,6 +371,109 @@ class UCSFPDGMLatentH5Converter:
             ds.attrs["maisi_modality_slug"] = UCSF_PDGM_LATENT_SEQUENCE_MAP[slug]
         return out
 
+    def _allocate_progress(self, w: H5Writer, n: int) -> h5py.Dataset:
+        """Allocate the ``progress/completed`` sidecar dataset.
+
+        Bool, shape ``(n,)``, initialised to False. Marked True per-row by
+        :meth:`_encode_loop` after both latents and the tumour mask have
+        been written for that row. Lives outside the manifest so the
+        structural validator ignores it.
+        """
+        f = w.file
+        if "progress" not in f:
+            f.create_group("progress")
+        dset = f.create_dataset(
+            "progress/completed",
+            shape=(n,),
+            dtype=np.bool_,
+            chunks=(min(n, 64),),
+        )
+        dset[:] = False
+        dset.attrs["units"] = "dimensionless"
+        dset.attrs["description"] = (
+            "Per-row completion flag for the encode loop. True iff the "
+            "row's latents and tumour mask are fully written. Used by "
+            "the resume path to skip already-done patients."
+        )
+        dset.attrs["dtype"] = "bool"
+        dset.attrs["leading_dim"] = "n_scans"
+        f["progress"].attrs["description"] = (
+            "Internal checkpoint metadata (not part of the manifest)."
+        )
+        return dset
+
+    def _assert_resume_compatible(
+        self,
+        f: h5py.File,
+        src: h5py.File,
+        ids: list[str],
+        handle: Any,
+    ) -> None:
+        """Validate that the existing output H5 was produced under a config
+        compatible with the current one. Raises :class:`H5ConvertError` with
+        every violation listed."""
+        cfg = self.cfg
+        violations: list[str] = []
+
+        def _check(attr: str, expected: Any) -> None:
+            got = f.attrs.get(attr)
+            if got is None:
+                violations.append(f"missing root attr {attr!r}")
+                return
+            if str(got) != str(expected):
+                violations.append(f"{attr}: existing={got!r} new={expected!r}")
+
+        _check("source_image_h5_sha256", sha256_file(cfg.source_image_h5))
+        _check("autoencoder_checkpoint_sha256", handle.checkpoint_sha256)
+        _check("modalities_encoded_json", json.dumps(list(cfg.modalities)))
+        _check("encode_runtime_attrs_json", json.dumps(self.encoder.to_attrs()))
+        _check("mask_downsampler_attrs_json", json.dumps(self.mask_downsampler.to_attrs()))
+
+        if "progress/completed" not in f:
+            violations.append(
+                "existing file lacks progress/completed; cannot resume "
+                "(was it produced by an older converter? re-run with overwrite=True)"
+            )
+
+        if "ids" not in f:
+            violations.append("existing file lacks ids dataset")
+        else:
+            existing_ids = [
+                v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in f["ids"][:]
+            ]
+            if existing_ids != ids:
+                # Show the first divergence for actionable diagnostics.
+                first_diff = next(
+                    (i for i, (a, b) in enumerate(zip(existing_ids, ids)) if a != b),
+                    min(len(existing_ids), len(ids)),
+                )
+                violations.append(
+                    f"ids dataset disagrees with the resolved patient selection "
+                    f"(existing n={len(existing_ids)}, new n={len(ids)}, "
+                    f"first divergence at row {first_diff})"
+                )
+
+        if violations:
+            joined = "\n  - ".join(violations)
+            raise H5ConvertError(
+                "Cannot resume — existing output H5 is incompatible with "
+                f"the current config:\n  - {joined}"
+            )
+
+    @staticmethod
+    def _load_inference_modes(f: h5py.File) -> dict[str, int]:
+        raw = f.attrs.get("inference_mode_counts_json")
+        if raw is None:
+            return {"full": 0, "sliding": 0}
+        try:
+            parsed = json.loads(str(raw))
+        except json.JSONDecodeError:
+            return {"full": 0, "sliding": 0}
+        return {
+            "full": int(parsed.get("full", 0)),
+            "sliding": int(parsed.get("sliding", 0)),
+        }
+
     def _allocate_tumor_mask(self, w: H5Writer, manifest: Any, n: int) -> h5py.Dataset:
         ds_shape = (self.mask_downsampler.output_channels, *UCSF_PDGM_LATENT_SPATIAL)
         spec = manifest.get("masks/tumor_latent")
@@ -279,20 +489,28 @@ class UCSFPDGMLatentH5Converter:
 
     def _encode_loop(
         self,
+        *,
         src: h5py.File,
         n: int,
         ids: list[str],
         src_indices: list[int],
+        out_rows: list[int],
         latent_dsets: dict[str, h5py.Dataset],
         tumor_dset: h5py.Dataset,
+        completed_dset: h5py.Dataset,
+        h5_file: h5py.File,
+        checkpoint_every: int,
+        prior_modes: dict[str, int],
     ) -> None:
         cfg = self.cfg
         device = self.encoder.handle.device
-        modes_seen: dict[str, int] = {"full": 0, "sliding": 0}
+        modes_seen = dict(prior_modes)
         t0 = time.monotonic()
-        log_every = max(1, n // 50)
+        n_pending = len(out_rows)
+        log_every = max(1, n_pending // 50)
 
-        for out_row, src_row in enumerate(src_indices):
+        for k, out_row in enumerate(out_rows):
+            src_row = src_indices[out_row]
             pid = ids[out_row]
             # ---- latents ---------------------------------------------------
             for slug in cfg.modalities:
@@ -301,7 +519,7 @@ class UCSFPDGMLatentH5Converter:
                 t = t.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W, D)
                 t = t.to(device, non_blocking=True)
                 res = self.encoder.encode(t, mode=cfg.inference_mode)
-                modes_seen[res.inference_mode] += 1
+                modes_seen[res.inference_mode] = modes_seen.get(res.inference_mode, 0) + 1
                 z = res.latent.detach().to("cpu", dtype=torch.float32).contiguous()
                 z_np = z[0].numpy()  # (C, h, w, d)
                 assign_row(latent_dsets[slug], out_row, z_np)
@@ -321,23 +539,42 @@ class UCSFPDGMLatentH5Converter:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-            if (out_row + 1) % log_every == 0 or (out_row + 1) == n:
-                elapsed = time.monotonic() - t0
-                rate = (out_row + 1) / elapsed if elapsed > 0 else 0.0
-                eta = (n - (out_row + 1)) / rate if rate > 0 else float("inf")
+            # Order matters: mark this row complete only after BOTH latents
+            # and the tumour mask have been written. The flush below makes
+            # the flag visible to a future resume.
+            completed_dset[out_row] = True
+
+            done_now = k + 1
+            if done_now % checkpoint_every == 0 or done_now == n_pending:
+                # Record running inference-mode tally so a resume sees the
+                # full historical count even if it never re-loops.
+                h5_file.attrs["inference_mode_counts_json"] = json.dumps(modes_seen)
+                h5_file.flush()
                 logger.info(
-                    "encode %s [%d/%d] (%.1f%%) rate=%.2f scans/s eta=%.0fs modes=%s",
-                    pid,
-                    out_row + 1,
+                    "checkpoint: flushed at %d/%d pending rows (cumulative %d/%d)",
+                    done_now,
+                    n_pending,
+                    int(np.asarray(completed_dset[:]).sum()),
                     n,
-                    100.0 * (out_row + 1) / n,
+                )
+
+            if done_now % log_every == 0 or done_now == n_pending:
+                elapsed = time.monotonic() - t0
+                rate = done_now / elapsed if elapsed > 0 else 0.0
+                eta = (n_pending - done_now) / rate if rate > 0 else float("inf")
+                logger.info(
+                    "encode %s [%d/%d pending] (%.1f%%) rate=%.2f scans/s eta=%.0fs modes=%s",
+                    pid,
+                    done_now,
+                    n_pending,
+                    100.0 * done_now / n_pending,
                     rate,
                     eta,
                     modes_seen,
                 )
 
-        # Record the mix of inference modes used over the full run.
-        tumor_dset.file.attrs["inference_mode_counts_json"] = json.dumps(modes_seen)
+        # Final stamp of the inference-mode counts.
+        h5_file.attrs["inference_mode_counts_json"] = json.dumps(modes_seen)
 
     # ----- metadata + splits + priors --------------------------------------
 
@@ -393,6 +630,7 @@ class UCSFPDGMLatentH5Converter:
         if "splits" not in src:
             logger.warning("source image H5 has no splits group; skipping copy")
             return
+
         # Walk every dataset under splits/ and copy as-is.
         def _visit(name: str, obj: h5py.HLObject) -> None:
             if isinstance(obj, h5py.Dataset):
