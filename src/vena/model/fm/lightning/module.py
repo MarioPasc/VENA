@@ -429,6 +429,7 @@ class FMLightningModule(pl.LightningModule):
         nfe: int,
         do_image: bool,
     ) -> None:
+        B = z_pred.shape[0]
         for region in REGION_NAMES:
             mask = masks.get(REGION_TO_RESOLVER_KEY[region])
             key = (int(nfe), region)
@@ -444,10 +445,24 @@ class FMLightningModule(pl.LightningModule):
             agg["cosine"].extend(cos.detach().cpu().tolist())
             agg["n_patients"] = len(agg["mse"])
 
+            # Log per-batch — Lightning aggregates across the validation set
+            # into ``trainer.callback_metrics`` which the ModelCheckpoint
+            # reads when picking the best epoch.
+            self.log(
+                f"val/mse_latent_{region}_nfe{nfe}", mse.mean(),
+                on_step=False, on_epoch=True, batch_size=B,
+            )
+            self.log(
+                f"val/l1_latent_{region}_nfe{nfe}", l1.mean(),
+                on_step=False, on_epoch=True, batch_size=B,
+            )
+            self.log(
+                f"val/cosine_latent_{region}_nfe{nfe}", cos.mean(),
+                on_step=False, on_epoch=True, batch_size=B,
+            )
+
             if do_image and self.vae_decoder is not None and self.image_metrics is not None:
-                # VAE decode (autocast-friendly via decoder's own precision_mode).
                 img_pred, img_target = self._decode_pair(z_pred, z_target)
-                # The image masks share spatial layout with the latent ones at 4×.
                 img_mask = F.interpolate(
                     mask.float(), size=img_pred.shape[-3:], mode="nearest"
                 ).bool()
@@ -455,6 +470,19 @@ class FMLightningModule(pl.LightningModule):
                 ssim = self.image_metrics.ssim(img_pred, img_target, img_mask)
                 agg["psnr"].extend(_safe_tolist(psnr))
                 agg["ssim"].extend(_safe_tolist(ssim))
+                # Replace NaN entries (empty region) with 0 weight when logging.
+                psnr_clean = psnr[torch.isfinite(psnr)] if psnr.numel() else psnr
+                ssim_clean = ssim[torch.isfinite(ssim)] if ssim.numel() else ssim
+                if psnr_clean.numel() > 0:
+                    self.log(
+                        f"val/psnr_image_{region}_nfe{nfe}", psnr_clean.mean(),
+                        on_step=False, on_epoch=True, batch_size=B,
+                    )
+                if ssim_clean.numel() > 0:
+                    self.log(
+                        f"val/ssim_image_{region}_nfe{nfe}", ssim_clean.mean(),
+                        on_step=False, on_epoch=True, batch_size=B,
+                    )
 
     def _decode_pair(
         self, z_pred: torch.Tensor, z_target: torch.Tensor
@@ -474,23 +502,13 @@ class FMLightningModule(pl.LightningModule):
         return out_pred.image, out_target.image
 
     def on_validation_epoch_end(self) -> None:
-        # Collapse list-based aggregators to mean/std, log canonical best-metric key.
-        epoch = int(self.current_epoch)
+        # Collapse list-based aggregators to mean/std. Per-batch ``self.log``
+        # calls in ``_update_val_accumulator`` already populated
+        # ``trainer.callback_metrics`` for ModelCheckpoint; here we only need
+        # to prepare the long-format dict the ValMetricsCSV callback consumes.
         collapsed: dict[tuple[int, str], dict[str, Any]] = {}
         for (nfe, region), agg in self._val_accumulator.items():
-            stats = _agg_to_stats(agg)
-            collapsed[(nfe, region)] = stats
-            for metric_name in ("mse_latent", "l1_latent", "cosine_latent",
-                                "psnr_image", "ssim_image"):
-                mean_key = f"{metric_name}_mean"
-                if mean_key in stats and stats[mean_key] is not None and not math.isnan(stats[mean_key]):
-                    self.log(
-                        f"val/{metric_name}_{region}_nfe{nfe}",
-                        float(stats[mean_key]),
-                        on_step=False, on_epoch=True,
-                    )
-        # Hand the collapsed view to the ValMetricsCSV callback by replacing the
-        # accumulator contents in-place.
+            collapsed[(nfe, region)] = _agg_to_stats(agg)
         self._val_accumulator.clear()
         self._val_accumulator.update(collapsed)
 
