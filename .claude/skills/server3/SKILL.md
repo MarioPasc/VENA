@@ -85,9 +85,17 @@ Then count timestamps with both indices > ~1 GB. For a definitive snapshot,
 
 ## Config conventions
 
-Smoke configs live in `routines/fm/train/configs/` (`smoke_short`, `smoke_full`,
-`smoke_polish`, `smoke_exhaustive`). 4 train subjects, batch 1 ⇒ 4 micro-batches
-per epoch; `max_steps` counts **optimiser** steps. Keep trials short but exercise
-every path (checkpoint rotation, NFE sweep, exhaustive cadence).
+Configs are split into two folders:
+- `routines/fm/train/configs/smoke/` — fast sanity configs (`smoke.yaml`,
+  `smoke_short`, `smoke_full`, `smoke_polish`, `smoke_exhaustive`,
+  `smoke_trunk_unfrozen[_resume]`). 4 train subjects, ⇒ a few micro-batches per
+  epoch; use for end-to-end / resume checks.
+- `routines/fm/train/configs/runs/` — serious full-cohort runs (`server3.yaml`,
+  `baseline_100ep.yaml`, `server3_trunk_{unfrozen,frozen}.yaml`,
+  `server3_4epoch_exhaustive[_frozen].yaml`).
+
+`max_steps`/`total_steps` count **optimiser** steps; `max_epochs` caps epochs
+(stops at whichever is reached first). Keep smokes short but exercise every path
+(checkpoint rotation, NFE sweep, exhaustive cadence, resume-in-place).
 
 $ARGUMENTS

@@ -12,8 +12,10 @@ These are the pure, unit-testable pieces of the exhaustive validation:
   volumes via :class:`vena.model.fm.metrics.ImageMetrics`.
 * :func:`select_content_slices` — choose the axial slice indices for the
   qualitative figure (content range, offset inward, equispaced).
-* :func:`render_comparison_figure` — the 4-row (real + 3 NFE levels) ×
-  N-slice comparison panel with per-NFE generation+decode time annotations.
+* :func:`render_comparison_figure` — the (1 + ``len(nfe_levels)``)-row
+  (real + one row per NFE level) × N-slice comparison panel with per-NFE
+  generation+decode time annotations. Row count adapts to the configured NFE
+  levels (e.g. 6 rows for ``{1, 2, 5, 10, 20}``).
 * :func:`write_latent_preds_h5` — schema-versioned latent-prediction cache.
 
 The orchestration (model build, sampling, decoding) lives in the routine
@@ -172,11 +174,12 @@ def render_comparison_figure(
     title_tag: str,
     out_path: Path | str,
 ) -> Path:
-    """Render the 4-row comparison panel and save it.
+    """Render the (1 + ``len(synth_by_nfe)``)-row comparison panel and save it.
 
     Row 0 is the real T1c; subsequent rows are the synthesised T1c at each NFE
     level in *descending* order (highest NFE first), each annotated with its
-    generation+decode wall-clock time. Columns are the chosen axial slices.
+    generation+decode wall-clock time. Columns are the chosen axial slices. The
+    row count adapts to however many NFE levels are provided.
 
     Parameters
     ----------

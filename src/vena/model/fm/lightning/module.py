@@ -1,8 +1,12 @@
 """LightningModule wrapping trunk + ControlNet + RFlow + composite loss.
 
-Trunk and (during validation) the VAE are frozen; only ControlNet parameters
-are trained. The optimiser is constructed over ``self.controlnet.parameters()``
-only.
+By default the trunk and the VAE are frozen and only ControlNet parameters are
+trained; the optimiser is then constructed over ``self.controlnet.parameters()``
+only. When ``trunk_config.trainable`` is set (the unfrozen-trunk ablation, cf.
+TumorFlow) the trunk is unfrozen and its parameters join the optimiser in the
+same group. The trunk is held as an unregistered property, so when fine-tuning
+it is **not** EMA-tracked and **not** written into checkpoints — this path is a
+diagnostic for whether unfreezing helps, not a production resume-safe loop.
 
 The training step follows MAISI-v2's ControlNet recipe:
 
@@ -69,7 +73,7 @@ from ..controlnet.conditioning import ConditioningAssembler, ConditioningSpec
 from ..controlnet.losses import CompositeLoss, LossInputs, build_loss
 from ..controlnet.maisi_controlnet import MaisiControlNet
 from ..ema import WarmupEMA
-from ..inference import EulerSampler, NFETimingProbe
+from ..inference import NFETimingProbe, get_sampler
 from ..maisi.config import TrunkConfig
 from ..maisi.trunk import TrunkHandle, load_trunk
 from ..metrics import ImageMetrics, LatentMetrics, RegionMasks, RegionResolver
@@ -115,6 +119,12 @@ class FMLightningModule(pl.LightningModule):
         self.perturb_keys: set[str] = set(perturb_keys or ()) if perturb_keys else {"wt"}
 
         self._trunk_handle: TrunkHandle | None = None
+        # Registered alias for the live trunk, set in setup() only when the trunk
+        # is trainable. Registration puts the fine-tuned trunk weights into the
+        # Lightning state_dict so they are saved and restored natively (PL 2.x
+        # restores model weights *after* setup()). Frozen trunk stays unregistered
+        # so frozen checkpoints are not bloated with 72 M immutable params.
+        self._trunk_module: torch.nn.Module | None = None
         self.conditioning = ConditioningAssembler(conditioning_specs)
         cond_in = self.conditioning.total_channels
         logger.info("FMLightningModule: conditioning_total_channels=%d", cond_in)
@@ -133,6 +143,10 @@ class FMLightningModule(pl.LightningModule):
         # Lightning's checkpoint load_state_dict runs (it loads *before*
         # setup()).
         self.ema: WarmupEMA = WarmupEMA(self.controlnet, **self.ema_cfg)
+        # Trunk EMA only exists in the unfrozen-trunk ablation; it is built in
+        # setup() once the trunk is loaded (the trunk does not exist in
+        # __init__). This path is single-shot (not resume-safe), by design.
+        self.trunk_ema: WarmupEMA | None = None
 
         # Validation/region wiring.
         self.region_resolver = region_resolver
@@ -171,6 +185,13 @@ class FMLightningModule(pl.LightningModule):
             self._setup_trunk_and_controlnet()
         # Move EMA shadow to the same device as the live model.
         self.ema = self.ema.to(self.device)
+        # Unfrozen-trunk ablation: a second EMA over the trunk so that sampling
+        # (validation + exhaustive job) uses EMA-smoothed trunk weights exactly
+        # as it uses the EMA ControlNet. Built here because the trunk does not
+        # exist until ``_setup_trunk_and_controlnet`` has run.
+        if self.trunk_config.trainable and self.trunk_ema is None:
+            self.trunk_ema = WarmupEMA(self.trunk, **self.ema_cfg).to(self.device)
+            logger.info("Trunk EMA shadow created (unfrozen-trunk ablation).")
         if self.image_metrics is None and self.vae_decoder is not None:
             self.image_metrics = ImageMetrics()
 
@@ -182,7 +203,14 @@ class FMLightningModule(pl.LightningModule):
             device=self.device,
             arch_config=arch_json,
             arch_overrides=self.trunk_config.arch_overrides or None,
+            trainable=self.trunk_config.trainable,
         )
+        if self.trunk_config.trainable:
+            # Register the trunk so its weights are checkpointed and restored
+            # natively. On resume, setup() reloads the *original* MAISI trunk here
+            # (harmless), then Lightning's post-setup state_dict restore overwrites
+            # it (and trunk_ema + optimiser state) with the fine-tuned values.
+            self._trunk_module = self._trunk_handle.model
         trunk_sd = self._trunk_handle.model.state_dict()
         self.controlnet.init_from_trunk(trunk_sd)
         self.controlnet.zero_init_output_projections()
@@ -233,7 +261,11 @@ class FMLightningModule(pl.LightningModule):
         class_labels: torch.Tensor,
         spacing: torch.Tensor,
         probe: NFETimingProbe | None = None,
+        trunk: torch.nn.Module | None = None,
     ) -> torch.Tensor:
+        # ``trunk`` defaults to the live trunk (training path). The EMA-call
+        # closure passes the EMA trunk shadow so sampling uses smoothed weights.
+        trunk_model = trunk if trunk is not None else self.trunk
         x_t_p, pad = self._pad_to_multiple(x_t, multiple=8)
         cond_p, _ = self._pad_to_multiple(cond, multiple=8)
         cn_ctx = probe.section("controlnet") if probe is not None else nullcontext()
@@ -246,7 +278,7 @@ class FMLightningModule(pl.LightningModule):
             )
         trunk_ctx = probe.section("trunk") if probe is not None else nullcontext()
         with trunk_ctx:
-            v_p = self.trunk(
+            v_p = trunk_model(
                 x=x_t_p,
                 timesteps=timesteps,
                 class_labels=class_labels,
@@ -377,6 +409,9 @@ class FMLightningModule(pl.LightningModule):
             return
         self._last_ema_step = step
         self.ema.update()
+        if self.trunk_ema is not None:
+            # Same once-per-optimiser-step gate as the ControlNet EMA above.
+            self.trunk_ema.update()
         self.log(
             "train/ema_decay",
             self.ema.get_current_decay(),
@@ -384,10 +419,18 @@ class FMLightningModule(pl.LightningModule):
             on_epoch=False,
         )
 
-    def _controlnet_grad_norm(self) -> torch.Tensor:
-        """Global L2 norm of the (only trainable) ControlNet gradients."""
+    def _trainable_grad_norm(self) -> torch.Tensor:
+        """Global L2 norm over all optimised parameters.
+
+        ControlNet always; plus the trunk when ``trunk_config.trainable`` (the
+        unfrozen-trunk ablation), so the logged norm matches the parameter set
+        the gradient clip actually acts on.
+        """
         sq_sum = torch.zeros((), device=self.device)
-        for p in self.controlnet.parameters():
+        params = list(self.controlnet.parameters())
+        if self.trunk_config.trainable:
+            params += list(self.trunk.parameters())
+        for p in params:
             if p.grad is not None:
                 sq_sum = sq_sum + p.grad.detach().float().pow(2).sum()
         return sq_sum.sqrt()
@@ -406,13 +449,13 @@ class FMLightningModule(pl.LightningModule):
         (stability signal) and the effective post-clip norm, plus whether the
         clip was active this step.
         """
-        pre = self._controlnet_grad_norm()
+        pre = self._trainable_grad_norm()
         self.clip_gradients(
             optimizer,
             gradient_clip_val=gradient_clip_val,
             gradient_clip_algorithm=gradient_clip_algorithm,
         )
-        post = self._controlnet_grad_norm()
+        post = self._trainable_grad_norm()
         self.log("train/grad_norm_cn_preclip", pre, on_step=True, on_epoch=False)
         self.log("train/grad_norm_cn_postclip", post, on_step=True, on_epoch=False)
         if gradient_clip_val:
@@ -436,6 +479,7 @@ class FMLightningModule(pl.LightningModule):
         """
         ema_cn = self.ema.ema_model if self.ema is not None else self.controlnet
         ema_cn.eval()
+        ema_trunk = self._ema_trunk()
 
         def model_call(x_t: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
             B = x_t.shape[0]
@@ -444,10 +488,22 @@ class FMLightningModule(pl.LightningModule):
             spacing = self.trunk_config.make_spacing_tensor(B, device)
             cond = self._val_cond  # set by validation_step before calling sampler
             return self._trunk_forward(
-                ema_cn, x_t, timesteps, cond, class_labels, spacing, probe=probe
+                ema_cn, x_t, timesteps, cond, class_labels, spacing, probe=probe, trunk=ema_trunk
             )
 
         return model_call
+
+    def _ema_trunk(self) -> torch.nn.Module:
+        """Trunk to sample with: EMA shadow when fine-tuning, else the live trunk.
+
+        In the frozen-trunk default this returns ``self.trunk`` unchanged, so the
+        frozen sampling path is identical to before.
+        """
+        if self.trunk_config.trainable and self.trunk_ema is not None:
+            shadow = self.trunk_ema.ema_model
+            shadow.eval()
+            return shadow
+        return self.trunk
 
     def _which_nfes(self, epoch: int) -> list[int]:
         vcfg = self.validation_cfg
@@ -490,7 +546,9 @@ class FMLightningModule(pl.LightningModule):
         do_qual = qual_every > 0 and (epoch % qual_every == 0)
         do_image_epoch = self._do_image_metrics(epoch)
 
-        sampler = EulerSampler(scheduler=self.rflow.scheduler)
+        sampler = get_sampler(self.validation_cfg.get("integrator", "euler"))(
+            scheduler=self.rflow.scheduler
+        )
         self._val_cond = self.conditioning(batch)
         B = int(z_target.shape[0])
 
@@ -766,6 +824,10 @@ class FMLightningModule(pl.LightningModule):
             "torch": torch.get_rng_state(),
             "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
         }
+        # When the trunk is trainable it is a registered submodule
+        # (``_trunk_module``) and its EMA (``trunk_ema``) is registered too, so
+        # both are already in ``checkpoint["state_dict"]`` and restored natively
+        # on resume — no custom payload needed.
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         rng = checkpoint.get("rng_state")
@@ -794,6 +856,16 @@ class FMLightningModule(pl.LightningModule):
         scheduler_kind = str(self.optim_cfg.get("scheduler", "polynomial")).lower()
 
         trainable = [p for p in self.controlnet.parameters() if p.requires_grad]
+        if self.trunk_config.trainable:
+            # Unfrozen-trunk ablation: fine-tune the trunk jointly with the
+            # ControlNet under a single param group (matches TumorFlow's recipe).
+            trunk_params = [p for p in self.trunk.parameters() if p.requires_grad]
+            trainable += trunk_params
+            logger.info(
+                "configure_optimizers: trunk UNFROZEN — optimising %d controlnet + %d trunk tensors",
+                len(trainable) - len(trunk_params),
+                len(trunk_params),
+            )
         opt = AdamW(trainable, lr=lr, betas=betas, weight_decay=weight_decay)
 
         def lr_lambda(step: int) -> float:

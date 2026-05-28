@@ -16,10 +16,25 @@ proposal wins.
    (rectified-flow noising), `eval/` (image-space exhaustive validation helpers),
    `lightning/` (the LightningModule, DataModule, callbacks).
 2. **`lightning/module.py` is the only `LightningModule`.** It wires trunk +
-   ControlNet + RFlow + composite loss + EMA. The trunk and VAE are frozen; the
-   optimiser is built over `self.controlnet.parameters()` only. Frozen trunk is
-   held via a property (`self.trunk`), **not** a registered submodule, so it is
-   never duplicated into checkpoints.
+   ControlNet + RFlow + composite loss + EMA. The VAE is always frozen. The
+   trunk is controlled by `trunk_config.trainable`:
+   - **`trainable=True` (project default).** The trunk is unfrozen and
+     fine-tuned jointly with the ControlNet (cf. TumorFlow). The optimiser is
+     built over `self.controlnet.parameters()` **plus** `self.trunk.parameters()`
+     in one group; a second `WarmupEMA` (`self.trunk_ema`) tracks the trunk and
+     sampling uses the EMA trunk shadow. The trunk is still held via a property
+     (not a registered submodule), so its fine-tuned weights are persisted via
+     explicit `on_save_checkpoint` keys (`trunk_finetuned_state`,
+     `trunk_ema_state`) and the exhaustive job reloads the trunk EMA snapshot.
+     This path is **single-shot — not resume-safe** (the trunk EMA is built in
+     `setup()`, after Lightning's checkpoint load): do not rely on `resume_from`
+     for unfrozen runs without first hardening trunk-EMA restore.
+   - **`trainable=False`.** Canonical frozen-backbone recipe: optimiser over
+     `self.controlnet.parameters()` only, no trunk EMA, trunk never written to
+     checkpoints. Byte-identical to the original frozen path.
+   MONAI's MAISI U-Net injects ControlNet residuals **in-place**, which breaks
+   autograd once the trunk carries gradients; `maisi/grad_safe.py` rebinds those
+   two adds out-of-place (numerics unchanged) and is applied only when trainable.
 3. **Routines are thin engines** (`routines/fm/<name>/engine.py`) that wire
    library code to a YAML config and write the artifact. Follow
    `preflight-pattern.md` invariants (one positional YAML arg, frozen Pydantic

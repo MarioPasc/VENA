@@ -1,0 +1,126 @@
+# BASELINE — 100-epoch joint trunk+ControlNet fine-tune (server3, DUAL RTX 4090).
+# The reference run for the current UCSF-PDGM fold-0 patient set; future
+# ablations are compared against this. Trunk fine-tuned jointly with the
+# ControlNet (project default). Exhaustive image-space validation every 10
+# epochs (NFE {1,2,5,10,20}, Euler), each pass joined before training resumes
+# so all 10 cadence epochs get a completed validation. Resume-safe: re-launch
+# with run.resume_from: latest to continue in place after a preemption.
+#
+# Launch with BOTH GPUs visible (train cuda:0, exhaustive cuda:1):
+#   nohup ~/.conda/envs/vena/bin/python -m routines.fm.train.cli \
+#     routines/fm/train/configs/runs/baseline_100ep.yaml > <log> 2>&1 &
+#
+# Sizing (fold-0: 356 train, batch 2 -> 178 optimiser steps/epoch):
+#   100 epochs = 17800 steps; warmup 1000 then polynomial decay to ~0 at step
+#   17800. ~24 min training + 10 blocking exhaustive passes.
+
+run:
+  stage: s1
+  resume_from: null            # set to "latest" to resume in place after a stop
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
+
+data:
+  latents_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_latents.h5
+  fold: 0
+  batch_size: 2
+  num_workers: 4
+  pin_memory: true
+  max_train_subjects: null
+  max_val_subjects: null
+
+model:
+  trunk:
+    checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides: {}
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+    trainable: true            # fine-tune trunk + ControlNet jointly
+  controlnet:
+    conditioning_inputs:
+      - latent:t1pre
+      - latent:t2
+      - latent:flair
+      - mask:wt:identity
+    arch_overrides: {}
+    perturb_keys: ["wt"]
+  vae_checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+
+loss:
+  cfm:
+    weight: 1.0
+    reduction: mean
+    norm: l2
+
+rflow:
+  num_train_timesteps: 1000
+  use_discrete_timesteps: true
+  sample_method: uniform
+
+optim:
+  lr: 5.0e-5
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  warmup_steps: 1000
+  scheduler: polynomial
+
+ema:
+  decay: 0.9999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 17800           # = 100 epochs x 178 steps; sets the LR-decay horizon
+  max_epochs: 100
+  batch_size: 2
+  grad_accum: 1
+  checkpoint_every_epochs: 10
+  log_train_every_steps: 50
+  best_metric_name: mse_latent
+  best_metric_region: bg
+  best_metric_nfe: 5
+  gradient_clip_val: 1.0
+
+validation:
+  every_epochs: 1
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 0
+  sweep_nfes: [1, 2, 5, 10, 20]
+  qualitative_every_epochs: 0
+  image_metrics: true
+
+exhaustive_val:
+  enabled: true
+  every_epochs: 10
+  n_patients: 50               # full fold-0 val set (clamped to available)
+  nfe_levels: [1, 2, 5, 10, 20]
+  integrator: euler
+  image_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_image.h5
+  device: cuda:1
+  block_until_complete: true   # one COMPLETED exhaustive pass per cadence epoch
+
+output:
+  experiments_root: /media/hddb/mario/experiments
+  retention_n_checkpoints: 10
+  tensorboard: false
+  wandb: false
+
+regions:
+  brain:
+    source: fallback_all_ones
+  wt:
+    source: derived_from_tumor_latent
+    threshold: 0.5
+  wt_dilated:
+    source: derived_via_scipy_binary_dilation
+    structure: ones_3x3x3
+  bg:
+    source: derived
+  vessel:
+    source: skipped

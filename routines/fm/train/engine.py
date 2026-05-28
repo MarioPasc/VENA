@@ -84,6 +84,9 @@ class _TrunkCfg(BaseModel):
     arch_overrides: dict[str, Any] = Field(default_factory=dict)
     class_token: int = 9
     spacing_mm: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    # Project default: fine-tune the trunk jointly with the ControlNet. Set
+    # ``false`` for the frozen-backbone baseline arm of the A/B.
+    trainable: bool = True
 
 
 class _ModelCfg(BaseModel):
@@ -122,6 +125,11 @@ class _EMACfg(BaseModel):
 class _TrainingCfg(BaseModel):
     model_config = ConfigDict(extra="forbid")
     total_steps: int = 50_000
+    # Optional epoch cap. When set, training stops at whichever of
+    # ``max_epochs`` / ``total_steps`` is reached first (Lightning semantics).
+    # Used by short diagnostic runs that want an exact epoch count regardless of
+    # dataset size; leave ``null`` for step-governed production runs.
+    max_epochs: int | None = None
     batch_size: int = 4
     grad_accum: int = 1
     checkpoint_every_epochs: int = 5
@@ -161,11 +169,15 @@ class _ExhaustiveValCfg(BaseModel):
     enabled: bool = False
     every_epochs: int = 20
     n_patients: int = 20
-    nfe_levels: list[int] = Field(default_factory=lambda: [1, 10, 50])
+    nfe_levels: list[int] = Field(default_factory=lambda: [1, 2, 5, 10, 20])
+    integrator: str = "euler"  # ODE integrator for sampling (registry: vena...inference.get_sampler)
     image_h5: Path | None = None
     device: str = "cuda:1"
     # Python used to launch the subprocess; defaults to the running interpreter.
     python_executable: str | None = None
+    # Join each validation before training continues (one completed exhaustive
+    # pass per cadence epoch). Default False = production async/skip-if-busy.
+    block_until_complete: bool = False
 
 
 class _OutputCfg(BaseModel):
@@ -231,6 +243,33 @@ class FMTrainRoutineEngine:
             (run_dir / sub).mkdir(parents=True, exist_ok=True)
         return run_id, run_dir
 
+    def _resolve_run_dir(self, resume_ckpt: str | None) -> tuple[str, Path, bool]:
+        """Choose the run directory, continuing in place when resuming.
+
+        If ``resume_ckpt`` points inside ``experiments_root`` (a prior run of
+        this project), reuse that run's directory so the resumed training appends
+        to the same metrics/checkpoints rather than forking a new empty run —
+        essential for long, preemptible Picasso runs to stay one contiguous
+        artifact, and it lets Lightning's ``ModelCheckpoint`` reload its full loop
+        state (same ``dirpath``). An explicit external checkpoint, or no resume,
+        creates a fresh timestamped directory.
+
+        Returns
+        -------
+        tuple[str, Path, bool]
+            ``(run_id, run_dir, resuming_in_place)``.
+        """
+        if resume_ckpt is not None:
+            p = Path(resume_ckpt).resolve()
+            root = Path(self.cfg.output.experiments_root).resolve()
+            if root in p.parents:
+                run_dir = p.parents[1]  # <root>/<run>/checkpoints/<file> -> <root>/<run>
+                for sub in ("checkpoints", "logs", "metrics"):
+                    (run_dir / sub).mkdir(parents=True, exist_ok=True)
+                return run_dir.name, run_dir, True
+        run_id, run_dir = self._make_run_dir()
+        return run_id, run_dir, False
+
     def _attach_file_log(self, run_dir: Path) -> logging.Handler:
         """Tee log records to ``logs/train.log`` so the run is self-contained.
 
@@ -244,8 +283,14 @@ class FMTrainRoutineEngine:
         logging.getLogger().addHandler(handler)
         return handler
 
-    def _write_static_provenance(self, run_dir: Path) -> None:
+    def _write_static_provenance(self, run_dir: Path, resuming_in_place: bool = False) -> None:
         merged = self.cfg.model_dump(mode="json")
+        if resuming_in_place:
+            # Preserve the original run's provenance; record the resume invocation
+            # under a timestamped name so the audit trail shows every restart.
+            ts = now_iso_utc().replace(":", "-")
+            (run_dir / f"config.resume_{ts}.yaml").write_text(yaml.safe_dump(merged, sort_keys=False))
+            return
         (run_dir / "config.yaml").write_text(yaml.safe_dump(merged, sort_keys=False))
         if self.config_yaml_path is not None:
             shutil.copy2(self.config_yaml_path, run_dir / "config.original.yaml")
@@ -272,6 +317,7 @@ class FMTrainRoutineEngine:
                 "arch_overrides": dict(cfg.model.trunk.arch_overrides),
                 "class_token": cfg.model.trunk.class_token,
                 "spacing_mm": list(cfg.model.trunk.spacing_mm),
+                "trainable": cfg.model.trunk.trainable,
             },
             "controlnet": {
                 "conditioning_inputs": list(cfg.model.controlnet.conditioning_inputs),
@@ -284,38 +330,48 @@ class FMTrainRoutineEngine:
             "image_h5": str(ev.image_h5),
             "fold": cfg.data.fold,
             "nfe_levels": list(ev.nfe_levels),
+            "integrator": ev.integrator,
             "n_patients": ev.n_patients,
         }
 
-    def _resolve_resume_ckpt(self) -> str | None:
+    def _resolve_resume_ckpt(self, exclude_dir: Path | None = None) -> str | None:
+        """Resolve ``run.resume_from`` to a checkpoint path.
+
+        ``latest``/``best`` scan ``experiments_root`` newest-first and return the
+        first run directory that actually contains the target checkpoint, skipping
+        ``exclude_dir`` (the run we just created, whose ``checkpoints/`` is still
+        empty). An explicit path is returned verbatim if it exists.
+        """
         rf = self.cfg.run.resume_from
         if not rf:
             return None
-        if rf == "latest":
+
+        if rf in ("latest", "best"):
             root = Path(self.cfg.output.experiments_root)
-            latest_dir = max(root.glob("*/"), default=None, key=lambda p: p.stat().st_mtime)
-            if latest_dir is None:
-                logger.warning("resume_from=latest but no run dir found under %s", root)
-                return None
-            cand = list((latest_dir / "checkpoints").glob("last.ckpt"))
-            if cand:
-                logger.info("Resuming from %s", cand[0])
-                return str(cand[0])
-            cand = sorted((latest_dir / "checkpoints").glob("ema_epoch_*.ckpt"))
-            if cand:
-                logger.info("Resuming from %s", cand[-1])
-                return str(cand[-1])
-        elif rf == "best":
-            root = Path(self.cfg.output.experiments_root)
-            latest_dir = max(root.glob("*/"), default=None, key=lambda p: p.stat().st_mtime)
-            if latest_dir is not None:
-                cand = list((latest_dir / "checkpoints").glob("ema_best.ckpt"))
-                if cand:
-                    return str(cand[0])
-        else:
-            p = Path(rf)
-            if p.is_file():
-                return str(p)
+            skip = exclude_dir.resolve() if exclude_dir is not None else None
+            dirs = sorted(
+                (d for d in root.glob("*/") if d.is_dir() and d.resolve() != skip),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            target = "last.ckpt" if rf == "latest" else "ema_best.ckpt"
+            for d in dirs:
+                cand = d / "checkpoints" / target
+                if cand.is_file():
+                    logger.info("Resuming (%s) from %s", rf, cand)
+                    return str(cand)
+                if rf == "latest":
+                    ema = sorted((d / "checkpoints").glob("ema_epoch_*.ckpt"))
+                    if ema:
+                        logger.info("Resuming (latest) from %s", ema[-1])
+                        return str(ema[-1])
+            logger.warning("resume_from=%r: no matching checkpoint under %s; starting fresh.", rf, root)
+            return None
+
+        p = Path(rf)
+        if p.is_file():
+            logger.info("Resuming from explicit path %s", p)
+            return str(p)
         logger.warning("resume_from=%r could not be resolved; starting fresh.", rf)
         return None
 
@@ -323,24 +379,35 @@ class FMTrainRoutineEngine:
         cfg = self.cfg
         pl.seed_everything(cfg.run.seed, workers=True)
 
-        run_id, run_dir = self._make_run_dir()
+        # Resolve the resume checkpoint *before* choosing the run dir so we can
+        # continue in place (same dir) instead of forking a new empty run.
+        resume_ckpt = self._resolve_resume_ckpt()
+        run_id, run_dir, resuming_in_place = self._resolve_run_dir(resume_ckpt)
         self._attach_file_log(run_dir)
-        self._write_static_provenance(run_dir)
-        logger.info("FM-train run_id=%s dir=%s", run_id, run_dir)
-
-        # Decision JSON for downstream consumers.
-        (run_dir / "decision.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": "0.2.0",
-                    "produced_at": now_iso_utc(),
-                    "producer": "routines.fm.train:0.2.0",
-                    "run_id": run_id,
-                    "stage": cfg.run.stage,
-                },
-                indent=2,
-            )
+        self._write_static_provenance(run_dir, resuming_in_place=resuming_in_place)
+        logger.info(
+            "FM-train run_id=%s dir=%s%s",
+            run_id,
+            run_dir,
+            " (RESUMING IN PLACE)" if resuming_in_place else "",
         )
+
+        # Decision JSON for downstream consumers — written once at run creation;
+        # left intact on in-place resume.
+        decision_path = run_dir / "decision.json"
+        if not decision_path.exists():
+            decision_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "0.2.0",
+                        "produced_at": now_iso_utc(),
+                        "producer": "routines.fm.train:0.2.0",
+                        "run_id": run_id,
+                        "stage": cfg.run.stage,
+                    },
+                    indent=2,
+                )
+            )
 
         # Data. In-process validation is offloaded to the async second-GPU job
         # (see ExhaustiveValLauncher), so the training process runs *only*
@@ -364,6 +431,7 @@ class FMTrainRoutineEngine:
             arch_overrides=cfg.model.trunk.arch_overrides,
             class_token=cfg.model.trunk.class_token,
             spacing_mm=cfg.model.trunk.spacing_mm,
+            trainable=cfg.model.trunk.trainable,
         )
         optim_cfg = {
             "lr": cfg.optim.lr,
@@ -418,6 +486,7 @@ class FMTrainRoutineEngine:
                     device=cfg.exhaustive_val.device,
                     cwd=Path(__file__).resolve().parents[3],
                     python_executable=cfg.exhaustive_val.python_executable,
+                    block_until_complete=cfg.exhaustive_val.block_until_complete,
                 )
             )
 
@@ -425,6 +494,7 @@ class FMTrainRoutineEngine:
         # disabled. Validation is fully offloaded -> ``limit_val_batches=0``.
         trainer = pl.Trainer(
             max_steps=cfg.training.total_steps,
+            max_epochs=cfg.training.max_epochs,
             precision=cfg.run.precision,
             devices=1 if cfg.run.device.startswith("cuda") else "auto",
             accelerator="gpu" if cfg.run.device.startswith("cuda") else "auto",
@@ -442,11 +512,12 @@ class FMTrainRoutineEngine:
             num_sanity_val_steps=0,
         )
 
-        ckpt_path = self._resolve_resume_ckpt()
-        trainer.fit(model=module, datamodule=dm, ckpt_path=ckpt_path)
+        trainer.fit(model=module, datamodule=dm, ckpt_path=resume_ckpt)
 
-        # Final EMA-state dump on graceful exit.
-        final_path = run_dir / "checkpoints" / "ema_final.ckpt"
-        trainer.save_checkpoint(str(final_path))
+        # No explicit final dump on graceful exit: ``last.ckpt`` (ModelCheckpoint
+        # ``save_last``) already holds the final weights + optimiser + loop state
+        # and is the resume anchor, so a separate ``ema_final.ckpt`` would be
+        # redundant. ``ema_final.ckpt`` is reserved for the SigtermHandler's
+        # preemption save (captures mid-epoch state at signal time).
         logger.info("FM-train completed; artifact dir: %s", run_dir)
         return run_dir

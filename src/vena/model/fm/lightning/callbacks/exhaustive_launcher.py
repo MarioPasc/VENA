@@ -47,6 +47,7 @@ class ExhaustiveValLauncher(pl.Callback):
         device: str,
         cwd: Path | str,
         python_executable: str | None = None,
+        block_until_complete: bool = False,
     ) -> None:
         super().__init__()
         self.run_dir = Path(run_dir)
@@ -54,6 +55,12 @@ class ExhaustiveValLauncher(pl.Callback):
         self.job_base = dict(job_base)
         self.every_epochs = int(every_epochs)
         self.device = device
+        # When True, join each launched validation before training continues, so
+        # every cadence epoch gets a completed exhaustive pass (used for short
+        # diagnostic runs where epochs are far faster than one validation, which
+        # would otherwise trip the skip-if-busy guard). Default False keeps the
+        # production async, non-blocking behaviour.
+        self.block_until_complete = bool(block_until_complete)
         self.cwd = Path(cwd)
         self.python = python_executable or sys.executable
         self.out_root = self.run_dir / "exhaustive_val"
@@ -79,6 +86,12 @@ class ExhaustiveValLauncher(pl.Callback):
             )
             return
         self._launch(trainer, pl_module, epoch)
+        if self.block_until_complete and self._proc is not None:
+            logger.info(
+                "ExhaustiveValLauncher: blocking until epoch %d validation completes...", epoch
+            )
+            rc = self._proc.wait()
+            logger.info("ExhaustiveValLauncher: epoch %d validation exit code %s.", epoch, rc)
 
     def on_fit_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if self._proc is not None and self._proc.poll() is None:
@@ -114,6 +127,15 @@ class ExhaustiveValLauncher(pl.Callback):
                 "device": self.device,
             }
         )
+
+        # Unfrozen-trunk ablation: also snapshot the trunk EMA shadow so the
+        # exhaustive job samples with the fine-tuned trunk rather than the
+        # original frozen checkpoint. Absent when the trunk is frozen.
+        trunk_ema = getattr(pl_module, "trunk_ema", None)
+        if trunk_ema is not None:
+            trunk_snapshot = epoch_dir / "trunk_ema_snapshot.pt"
+            torch.save(trunk_ema.ema_model.state_dict(), trunk_snapshot)
+            job["trunk_finetuned_snapshot"] = str(trunk_snapshot)
         job_yaml = epoch_dir / "job.yaml"
         with job_yaml.open("w") as f:
             yaml.safe_dump(job, f, sort_keys=False)

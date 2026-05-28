@@ -40,7 +40,7 @@ from vena.model.fm.eval import (
     select_content_slices,
     write_latent_preds_h5,
 )
-from vena.model.fm.inference import EulerSampler
+from vena.model.fm.inference import get_sampler
 from vena.model.fm.lightning import FMLightningModule, LatentH5Dataset
 from vena.model.fm.maisi.config import TrunkConfig
 from vena.model.fm.metrics import ImageMetrics, LatentMetrics
@@ -59,6 +59,7 @@ class _TrunkJobCfg(BaseModel):
     arch_overrides: dict[str, Any] = Field(default_factory=dict)
     class_token: int = 9
     spacing_mm: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    trainable: bool = True
 
 
 class _CNJobCfg(BaseModel):
@@ -88,7 +89,12 @@ class ExhaustiveValJobConfig(BaseModel):
     fold: int = 0
 
     ema_snapshot: Path
-    nfe_levels: list[int] = Field(default_factory=lambda: [1, 10, 50])
+    # Unfrozen-trunk ablation: EMA trunk shadow saved by the launcher. When set
+    # (and ``trunk.trainable``), sampling uses the fine-tuned trunk; otherwise
+    # the original frozen trunk checkpoint is used.
+    trunk_finetuned_snapshot: Path | None = None
+    nfe_levels: list[int] = Field(default_factory=lambda: [1, 2, 5, 10, 20])
+    integrator: str = "euler"
     n_patients: int = 20
     device: str = "cuda:1"
     output_dir: Path
@@ -134,6 +140,7 @@ class ExhaustiveValEngine:
             arch_overrides=cfg.trunk.arch_overrides,
             class_token=cfg.trunk.class_token,
             spacing_mm=cfg.trunk.spacing_mm,
+            trainable=cfg.trunk.trainable,
         )
         module = FMLightningModule(
             trunk_config=trunk_cfg,
@@ -148,6 +155,8 @@ class ExhaustiveValEngine:
         module = module.to(self.device)
         module.setup()
         self._load_ema_snapshot(module, cfg.ema_snapshot)
+        if cfg.trunk.trainable and cfg.trunk_finetuned_snapshot is not None:
+            self._load_trunk_ema_snapshot(module, cfg.trunk_finetuned_snapshot)
         module.eval()
         return module
 
@@ -156,6 +165,22 @@ class ExhaustiveValEngine:
         # The launcher saves the EMA *shadow* model state_dict directly.
         module.ema.ema_model.load_state_dict(state)
         logger.info("loaded EMA snapshot %s", snapshot)
+
+    def _load_trunk_ema_snapshot(self, module: FMLightningModule, snapshot: Path) -> None:
+        """Load the fine-tuned trunk EMA shadow (unfrozen-trunk ablation).
+
+        ``setup()`` builds ``module.trunk_ema`` from the *original* trunk
+        checkpoint; here we overwrite its shadow with the training-time EMA
+        snapshot so ``_make_ema_call`` samples with the fine-tuned trunk.
+        """
+        if module.trunk_ema is None:
+            raise ExhaustiveValConfigError(
+                "trunk_finetuned_snapshot was provided but the module has no trunk EMA "
+                "(trunk.trainable must be true)"
+            )
+        state = torch.load(snapshot, map_location=self.device, weights_only=True)
+        module.trunk_ema.ema_model.load_state_dict(state)
+        logger.info("loaded fine-tuned trunk EMA snapshot %s", snapshot)
 
     def _val_patient_ids(self) -> list[str]:
         import h5py
@@ -186,7 +211,7 @@ class ExhaustiveValEngine:
         vae = MaisiDecoder(handle=load_autoencoder(cfg.vae_checkpoint, device=str(self.device)))
         latent_metrics = LatentMetrics()
         image_metrics = ImageMetrics(data_range=1.0)
-        sampler = EulerSampler(scheduler=module.rflow.scheduler)
+        sampler = get_sampler(cfg.integrator)(scheduler=module.rflow.scheduler)
 
         patient_ids = self._val_patient_ids()
         dataset = LatentH5Dataset(cfg.latents_h5, patient_ids)
@@ -240,7 +265,7 @@ class ExhaustiveValEngine:
         pid: str,
         dataset: LatentH5Dataset,
         module: FMLightningModule,
-        sampler: EulerSampler,
+        sampler: Any,
         vae: MaisiDecoder,
         latent_metrics: LatentMetrics,
         image_metrics: ImageMetrics,
@@ -295,7 +320,7 @@ class ExhaustiveValEngine:
     def _sample(
         self,
         module: FMLightningModule,
-        sampler: EulerSampler,
+        sampler: Any,
         z_target: torch.Tensor,
         nfe: int,
     ) -> tuple[torch.Tensor, float]:

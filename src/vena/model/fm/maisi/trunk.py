@@ -4,11 +4,14 @@ The NV-Generate-MR checkpoint at the path declared in ``src/external/LINKS.md``
 stores its weights under ``unet_state_dict`` and a per-volume latent
 ``scale_factor`` (a scalar ``MetaTensor``) alongside the optimiser/scheduler
 state. This module instantiates ``DiffusionModelUNetMaisi`` with the kwargs in
-``configs/diff_unet_rflow.json``, loads weights, ``eval()`` s, freezes
-parameters, and returns a provenance-carrying :class:`TrunkHandle`.
+``configs/diff_unet_rflow.json``, loads weights, sets train/eval mode and
+``requires_grad`` according to ``trainable``, and returns a
+provenance-carrying :class:`TrunkHandle`.
 
-The trunk is **frozen throughout VENA training** (proposal §4.2); only the
-ControlNet branch is trained.
+By default the trunk is **frozen throughout VENA training** (proposal §4.2) and
+only the ControlNet branch is trained. Passing ``trainable=True`` unfreezes the
+trunk for joint fine-tuning with the ControlNet (the unfrozen-trunk ablation,
+cf. TumorFlow).
 """
 
 from __future__ import annotations
@@ -93,6 +96,7 @@ def load_trunk(
     device: torch.device | str = "cuda",
     arch_config: Path | str | None = None,
     arch_overrides: dict[str, Any] | None = None,
+    trainable: bool = False,
 ) -> TrunkHandle:
     """Instantiate and load the frozen MAISI rectified-flow trunk.
 
@@ -106,6 +110,10 @@ def load_trunk(
         Optional override for the architecture-kwargs JSON.
     arch_overrides : dict | None
         Optional per-call kwargs overrides.
+    trainable : bool
+        If ``True``, unfreeze the trunk (``train()`` mode, ``requires_grad=True``)
+        for joint fine-tuning. If ``False`` (default), freeze it (``eval()`` mode,
+        ``requires_grad=False``).
 
     Returns
     -------
@@ -167,17 +175,29 @@ def load_trunk(
     num_train_timesteps = int(blob.get("num_train_timesteps", 1000))
 
     dev = torch.device(device)
-    model = model.to(dev).eval()
+    # ``train(trainable)`` sets eval() when frozen and train() when fine-tuning.
+    # The trunk is held as an unregistered property on the LightningModule, so
+    # Lightning's own train()/eval() toggles do not reach it — its mode is owned
+    # here and must match ``trainable``.
+    model = model.to(dev).train(trainable)
     for p in model.parameters():
-        p.requires_grad_(False)
+        p.requires_grad_(trainable)
+    if trainable:
+        # MONAI's MAISI U-Net injects ControlNet residuals in-place, which breaks
+        # autograd once the trunk carries gradients. Rebind those two adds
+        # out-of-place (numerics unchanged). See ``grad_safe`` for the rationale.
+        from .grad_safe import make_trunk_grad_safe
+
+        make_trunk_grad_safe(model)
 
     sha = sha256_file(ckpt)
     logger.info(
-        "MAISI FM trunk loaded: sha256=%s device=%s scale_factor=%s T=%d",
+        "MAISI FM trunk loaded: sha256=%s device=%s scale_factor=%s T=%d trainable=%s",
         sha[:12],
         dev,
         scale_factor,
         num_train_timesteps,
+        trainable,
     )
     return TrunkHandle(
         model=model,
