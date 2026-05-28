@@ -114,6 +114,7 @@ vena-preflight-venous-atlas-build = "routines.preflights.venous_atlas_build.cli:
 vena-h5-ucsf-pdgm-image = "routines.h5_datasets.ucsf_pdgm.cli:main"
 vena-encode-maisi = "routines.encode.maisi.cli:main"
 vena-fm-train = "routines.fm.train.cli:main"
+vena-fm-exhaustive-val = "routines.fm.exhaustive_val.cli:main"
 
 # ----------------------------------------------------------------------------
 # Setuptools layout — src/-layout for the library, flat-layout for routines/

@@ -20,30 +20,24 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pytorch_lightning as pl
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
-from pytorch_lightning.callbacks import LearningRateMonitor
-from pytorch_lightning.loggers import CSVLogger
 
 from vena.data.h5.shared import now_iso_utc
-from vena.model.autoencoder.maisi.decode.engine import MaisiDecoder
-from vena.model.autoencoder.maisi.loader import load_autoencoder
 from vena.model.fm.lightning import FMLightningModule, LatentH5DataModule
 from vena.model.fm.lightning.callbacks import (
-    GradNormLogger,
-    NFETimingCSV,
-    QualitativeH5Writer,
+    BestCheckpointCallback,
+    ExhaustiveValLauncher,
     SigtermHandler,
-    ValMetricsCSV,
+    TrainMetricsCSV,
     VENACheckpointCallback,
 )
 from vena.model.fm.maisi.config import TrunkConfig
-from vena.model.fm.metrics import RegionResolver, RegionSpec
+from vena.model.fm.metrics import RegionSpec
 
 from .runner import generate_run_id, write_provenance
 
@@ -145,7 +139,33 @@ class _ValidationCfg(BaseModel):
     full_sweep_every_epochs: int = 5
     sweep_nfes: list[int] = Field(default_factory=lambda: [1, 2, 5, 10, 50])
     qualitative_every_epochs: int = 10
-    image_metrics: bool = True   # require VAE decode
+    image_metrics: bool = True  # master switch for image-space PSNR/SSIM
+    # Image-space metrics are expensive (one VAE decode/patient) and only
+    # meaningful at the canonical per_epoch_nfe, so they run on a slow cadence
+    # rather than every epoch. 0 disables them entirely.
+    image_metrics_every_epochs: int = 20
+
+
+class _ExhaustiveValCfg(BaseModel):
+    """Asynchronous image-space validation offloaded to a second GPU.
+
+    On a slow cadence the trainer snapshots the EMA weights and launches a
+    standalone subprocess (``routines.fm.exhaustive_val``) on ``device`` while
+    training continues uninterrupted on the primary GPU. The subprocess samples
+    each validation patient at every ``nfe_levels`` entry, decodes to image
+    space, compares against the real T1c (percentile-normalised exactly as the
+    encoder's input), and writes metrics/timing/figures + ``latent_preds.h5``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    every_epochs: int = 20
+    n_patients: int = 20
+    nfe_levels: list[int] = Field(default_factory=lambda: [1, 10, 50])
+    image_h5: Path | None = None
+    device: str = "cuda:1"
+    # Python used to launch the subprocess; defaults to the running interpreter.
+    python_executable: str | None = None
 
 
 class _OutputCfg(BaseModel):
@@ -174,8 +194,12 @@ class FMTrainRoutineConfig(BaseModel):
     ema: _EMACfg = Field(default_factory=_EMACfg)
     training: _TrainingCfg = Field(default_factory=_TrainingCfg)
     validation: _ValidationCfg = Field(default_factory=_ValidationCfg)
+    exhaustive_val: _ExhaustiveValCfg = Field(default_factory=_ExhaustiveValCfg)
     output: _OutputCfg
-    regions: dict[str, RegionSpec]
+    # Region specs are no longer consumed in-process (validation is offloaded),
+    # but the field is kept (optional) for backward compatibility with configs
+    # that still declare it.
+    regions: dict[str, RegionSpec] = Field(default_factory=dict)
 
     @classmethod
     def from_yaml(cls, path: Path | str) -> FMTrainRoutineConfig:
@@ -200,9 +224,25 @@ class FMTrainRoutineEngine:
     def _make_run_dir(self) -> tuple[str, Path]:
         run_id = generate_run_id(self.cfg.run.stage)
         run_dir = Path(self.cfg.output.experiments_root) / run_id
-        for sub in ("checkpoints", "logs", "metrics", "qualitative", "performance"):
+        # ``qualitative`` and ``performance`` are no longer produced in-process —
+        # their content (qualitative figures + latent preds, per-NFE timing) now
+        # lives under ``exhaustive_val/epoch_NNN/`` (created by the launcher).
+        for sub in ("checkpoints", "logs", "metrics"):
             (run_dir / sub).mkdir(parents=True, exist_ok=True)
         return run_id, run_dir
+
+    def _attach_file_log(self, run_dir: Path) -> logging.Handler:
+        """Tee log records to ``logs/train.log`` so the run is self-contained.
+
+        The CLI configures a console (rich) handler; here we add a plain
+        file handler on the root logger so the run directory captures its own
+        training log regardless of how stdout is redirected.
+        """
+        handler = logging.FileHandler(run_dir / "logs" / "train.log", mode="a")
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logging.getLogger().addHandler(handler)
+        return handler
 
     def _write_static_provenance(self, run_dir: Path) -> None:
         merged = self.cfg.model_dump(mode="json")
@@ -210,17 +250,42 @@ class FMTrainRoutineEngine:
         if self.config_yaml_path is not None:
             shutil.copy2(self.config_yaml_path, run_dir / "config.original.yaml")
         else:
-            (run_dir / "config.original.yaml").write_text(
-                yaml.safe_dump(merged, sort_keys=False)
-            )
+            (run_dir / "config.original.yaml").write_text(yaml.safe_dump(merged, sort_keys=False))
         write_provenance(run_dir, repo=Path(__file__).resolve().parents[3])
 
-    def _build_vae_decoder(self) -> MaisiDecoder | None:
-        ckpt = self.cfg.model.vae_checkpoint
-        if not self.cfg.validation.image_metrics or ckpt is None:
-            return None
-        handle = load_autoencoder(checkpoint_path=ckpt, device=self.cfg.run.device)
-        return MaisiDecoder(handle=handle)
+    def _build_exhaustive_job_base(self, cfg: FMTrainRoutineConfig) -> dict[str, Any]:
+        """Static fields for the exhaustive-val job YAML (epoch/snapshot added later).
+
+        All paths are stringified so the launcher can ``yaml.safe_dump`` them.
+        """
+        ev = cfg.exhaustive_val
+        if ev.image_h5 is None:
+            raise ValueError("exhaustive_val.enabled is true but exhaustive_val.image_h5 is null")
+        if cfg.model.vae_checkpoint is None:
+            raise ValueError("exhaustive_val.enabled is true but model.vae_checkpoint is null")
+        return {
+            "stage": cfg.run.stage,
+            "seed": cfg.run.seed,
+            "trunk": {
+                "checkpoint": str(cfg.model.trunk.checkpoint),
+                "arch_json": str(cfg.model.trunk.arch_json) if cfg.model.trunk.arch_json else None,
+                "arch_overrides": dict(cfg.model.trunk.arch_overrides),
+                "class_token": cfg.model.trunk.class_token,
+                "spacing_mm": list(cfg.model.trunk.spacing_mm),
+            },
+            "controlnet": {
+                "conditioning_inputs": list(cfg.model.controlnet.conditioning_inputs),
+                "arch_overrides": dict(cfg.model.controlnet.arch_overrides),
+            },
+            "vae_checkpoint": str(cfg.model.vae_checkpoint),
+            "rflow": cfg.rflow.model_dump(),
+            "ema": cfg.ema.model_dump(),
+            "latents_h5": str(cfg.data.latents_h5),
+            "image_h5": str(ev.image_h5),
+            "fold": cfg.data.fold,
+            "nfe_levels": list(ev.nfe_levels),
+            "n_patients": ev.n_patients,
+        }
 
     def _resolve_resume_ckpt(self) -> str | None:
         rf = self.cfg.run.resume_from
@@ -259,19 +324,28 @@ class FMTrainRoutineEngine:
         pl.seed_everything(cfg.run.seed, workers=True)
 
         run_id, run_dir = self._make_run_dir()
+        self._attach_file_log(run_dir)
         self._write_static_provenance(run_dir)
         logger.info("FM-train run_id=%s dir=%s", run_id, run_dir)
 
         # Decision JSON for downstream consumers.
-        (run_dir / "decision.json").write_text(json.dumps({
-            "schema_version": "0.2.0",
-            "produced_at": now_iso_utc(),
-            "producer": "routines.fm.train:0.2.0",
-            "run_id": run_id,
-            "stage": cfg.run.stage,
-        }, indent=2))
+        (run_dir / "decision.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "0.2.0",
+                    "produced_at": now_iso_utc(),
+                    "producer": "routines.fm.train:0.2.0",
+                    "run_id": run_id,
+                    "stage": cfg.run.stage,
+                },
+                indent=2,
+            )
+        )
 
-        # Data + region resolver.
+        # Data. In-process validation is offloaded to the async second-GPU job
+        # (see ExhaustiveValLauncher), so the training process runs *only*
+        # training on the primary GPU; ``region_resolver``/``vae_decoder`` are
+        # not needed here.
         dm = LatentH5DataModule(
             h5_path=cfg.data.latents_h5,
             fold=cfg.data.fold,
@@ -282,17 +356,8 @@ class FMTrainRoutineEngine:
             max_val_subjects=cfg.data.max_val_subjects,
             seed=cfg.run.seed,
         )
-        region_resolver = RegionResolver(specs=dict(cfg.regions))
 
-        # VAE decoder (validation image metrics).
-        vae_decoder = self._build_vae_decoder()
-        if vae_decoder is None and cfg.validation.image_metrics:
-            logger.warning(
-                "validation.image_metrics is true but no model.vae_checkpoint provided; "
-                "image-space metrics will be skipped (latent metrics still emitted)."
-            )
-
-        # LightningModule.
+        # LightningModule (training-only: region_resolver/vae_decoder = None).
         trunk_cfg = TrunkConfig(
             checkpoint=cfg.model.trunk.checkpoint,
             arch_json=cfg.model.trunk.arch_json,
@@ -318,35 +383,46 @@ class FMTrainRoutineEngine:
             optim_cfg=optim_cfg,
             rflow_cfg=cfg.rflow.model_dump(),
             ema_cfg=cfg.ema.model_dump(),
-            region_resolver=region_resolver,
-            validation_cfg=cfg.validation.model_dump(),
-            vae_decoder=vae_decoder,
+            region_resolver=None,
+            vae_decoder=None,
         )
 
-        # Callbacks.
+        # Checkpoint selection (ema_best) is on the epoch-aggregated training
+        # loss, since validation is offloaded and runs asynchronously.
+        ckpt_monitor = "train/total_epoch"
         callbacks: list[pl.Callback] = [
             VENACheckpointCallback(
                 dirpath=run_dir / "checkpoints",
                 retention_n_checkpoints=cfg.output.retention_n_checkpoints,
                 every_n_epochs=cfg.training.checkpoint_every_epochs,
-                best_metric_name=cfg.training.best_metric_name,
-                best_metric_region=cfg.training.best_metric_region,
-                best_metric_nfe=cfg.training.best_metric_nfe,
+                monitor_key=ckpt_monitor,
+                best_mode="min",
+                save_on_train_epoch_end=True,
             ),
-            ValMetricsCSV(csv_path=run_dir / "metrics" / "val_epoch.csv"),
-            QualitativeH5Writer(out_dir=run_dir / "qualitative", run_id=run_id),
-            NFETimingCSV(out_dir=run_dir / "performance"),
-            GradNormLogger(),
-            LearningRateMonitor(logging_interval="step"),
+            BestCheckpointCallback(
+                dirpath=run_dir / "checkpoints",
+                monitor_key=ckpt_monitor,
+                best_mode="min",
+                save_on_train_epoch_end=True,
+            ),
+            TrainMetricsCSV(out_dir=run_dir / "metrics"),
             SigtermHandler(ckpt_dir=run_dir / "checkpoints", filename="ema_final.ckpt"),
         ]
+        if cfg.exhaustive_val.enabled:
+            callbacks.append(
+                ExhaustiveValLauncher(
+                    run_dir=run_dir,
+                    run_id=run_id,
+                    job_base=self._build_exhaustive_job_base(cfg),
+                    every_epochs=cfg.exhaustive_val.every_epochs,
+                    device=cfg.exhaustive_val.device,
+                    cwd=Path(__file__).resolve().parents[3],
+                    python_executable=cfg.exhaustive_val.python_executable,
+                )
+            )
 
-        # Logger.
-        csv_logger = CSVLogger(
-            save_dir=str(run_dir / "metrics"), name="train_step", version=0,
-        )
-
-        # Trainer.
+        # Trainer. We write our own clean metric CSVs, so Lightning's logger is
+        # disabled. Validation is fully offloaded -> ``limit_val_batches=0``.
         trainer = pl.Trainer(
             max_steps=cfg.training.total_steps,
             precision=cfg.run.precision,
@@ -357,12 +433,12 @@ class FMTrainRoutineEngine:
             accumulate_grad_batches=cfg.training.grad_accum,
             deterministic=cfg.run.full_determinism,
             default_root_dir=str(run_dir),
-            logger=csv_logger,
+            logger=False,
             callbacks=callbacks,
             enable_checkpointing=True,
             enable_progress_bar=True,
             enable_model_summary=True,
-            check_val_every_n_epoch=cfg.validation.every_epochs,
+            limit_val_batches=0,
             num_sanity_val_steps=0,
         )
 

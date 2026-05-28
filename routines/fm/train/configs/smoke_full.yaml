@@ -1,0 +1,108 @@
+# S1 full-diagnostic smoke — 4 epochs, save EVERYTHING per epoch.
+#   • 16 steps → 4 epochs (4 train subjects, batch 1)
+#   • validation + NFE sweep {1,2,5} every epoch (nfe=1 exercises the no-warmup
+#     drop path; nfe>1 exercises per-component timing aggregation)
+#   • qualitative + image-space metrics every epoch
+#   • checkpoint every epoch, retain all 4 + ema_best.ckpt + last.ckpt
+# Purpose: exercise every training/validation system end-to-end so all
+# artifacts (val_epoch.csv, per-component nfe_timing, ema_best, qualitative
+# h5, train metrics) can be inspected.
+
+run:
+  stage: s1
+  resume_from: null
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
+
+data:
+  latents_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_latents.h5
+  fold: 0
+  batch_size: 1
+  num_workers: 2
+  pin_memory: true
+  max_train_subjects: 4
+  max_val_subjects: 4
+
+model:
+  trunk:
+    checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides: {}
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+  controlnet:
+    conditioning_inputs:
+      - latent:t1pre
+      - latent:t2
+      - latent:flair
+      - mask:wt:identity
+    arch_overrides: {}
+    perturb_keys: ["wt"]
+  vae_checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+
+loss:
+  cfm:
+    weight: 1.0
+    reduction: mean
+    norm: l2
+
+rflow:
+  num_train_timesteps: 1000
+  use_discrete_timesteps: true
+  sample_method: uniform
+
+optim:
+  lr: 5.0e-5
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  warmup_steps: 5
+  scheduler: polynomial
+
+ema:
+  decay: 0.9999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 16
+  batch_size: 1
+  grad_accum: 1
+  checkpoint_every_epochs: 1
+  log_train_every_steps: 1
+  best_metric_name: mse_latent
+  best_metric_region: bg
+  best_metric_nfe: 5
+  gradient_clip_val: 1.0
+
+validation:
+  every_epochs: 1
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 1
+  sweep_nfes: [1, 2, 5]
+  qualitative_every_epochs: 1
+  image_metrics: true
+
+output:
+  experiments_root: /media/hddb/mario/experiments
+  retention_n_checkpoints: 4
+  tensorboard: false
+  wandb: false
+
+regions:
+  brain:
+    source: fallback_all_ones
+  wt:
+    source: derived_from_tumor_latent
+    threshold: 0.5
+  wt_dilated:
+    source: derived_via_scipy_binary_dilation
+    structure: ones_3x3x3
+  bg:
+    source: derived
+  vessel:
+    source: skipped

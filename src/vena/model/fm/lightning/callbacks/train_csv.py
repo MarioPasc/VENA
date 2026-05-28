@@ -1,0 +1,164 @@
+"""Clean per-step and per-epoch training-metrics CSVs.
+
+Replaces Lightning's default ``CSVLogger`` output, which interleaves per-step
+train metrics, per-epoch validation metrics, and per-step LR onto disjoint rows
+— producing a wide, mostly-empty matrix that also duplicates ``val_epoch.csv``.
+
+Instead we write two tight, fully-populated files:
+
+* ``metrics/train_step.csv`` — one row per *optimiser* step. Columns are
+  discovered once (every ``train/*`` key logged by the module + the optimiser
+  LR) and then frozen, so every row is fully populated.
+* ``metrics/train_epoch.csv`` — one row per training epoch with the mean/std of
+  the core losses and throughput across that epoch's optimiser steps, for a
+  clean train-vs-val-per-epoch comparison.
+
+Gradient accumulation: ``on_train_batch_end`` fires once per *micro-batch*, but
+``trainer.global_step`` advances only on optimiser steps, so we gate the write
+on it changing — one row per optimiser step regardless of ``grad_accum``.
+
+Note: ``train/ema_decay`` is logged in the module's ``on_train_batch_end`` which
+fires *after* this callback, so its value lags by one optimiser step. It is a
+slowly-varying schedule quantity, so the lag is immaterial.
+"""
+
+from __future__ import annotations
+
+import csv
+import logging
+import math
+from pathlib import Path
+
+import pytorch_lightning as pl
+
+logger = logging.getLogger(__name__)
+
+# Losses accumulated for the per-epoch summary (column name without ``train/``).
+_EPOCH_AGG_KEYS: tuple[str, ...] = ("cfm", "total", "samples_per_sec", "grad_norm_cn_postclip")
+
+
+class TrainMetricsCSV(pl.Callback):
+    """Writes ``train_step.csv`` (per optimiser step) and ``train_epoch.csv``."""
+
+    def __init__(self, out_dir: Path | str) -> None:
+        super().__init__()
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.step_path = self.out_dir / "train_step.csv"
+        self.epoch_path = self.out_dir / "train_epoch.csv"
+        self._step_header: list[str] | None = None
+        # 0 = "no optimiser step written yet"; we write only when global_step
+        # advances past it (one row per optimiser step, grad-accum-safe, and
+        # skips the pre-first-step accumulation micro-batches at global_step 0).
+        self._last_step: int = 0
+        self._epoch_accum: dict[str, list[float]] = {}
+
+    # ------------------------------------------------------------------
+    # Per-step
+    # ------------------------------------------------------------------
+
+    def on_train_batch_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule, *args: object
+    ) -> None:
+        step = int(trainer.global_step)
+        if step <= self._last_step:
+            return  # no optimiser step happened (gradient accumulation / pre-step)
+        self._last_step = step
+
+        scalars = self._collect_train_scalars(trainer)
+        if not scalars:
+            return
+        scalars["lr"] = self._current_lr(trainer)
+        # ``train/ema_decay`` is logged in the module's ``on_train_batch_end``,
+        # which fires *after* this callback, so it is absent from
+        # ``callback_metrics`` on the first written row (and would be dropped
+        # from the frozen header). Read it live from the module instead so the
+        # column always exists.
+        ema = getattr(pl_module, "ema", None)
+        if ema is not None:
+            try:
+                scalars["ema_decay"] = float(ema.get_current_decay())
+            except Exception:
+                pass
+
+        if self._step_header is None:
+            self._step_header = ["epoch", "step", "lr", *sorted(scalars.keys() - {"lr"})]
+            if not self.step_path.exists():
+                with self.step_path.open("w", newline="") as f:
+                    csv.writer(f).writerow(self._step_header)
+
+        row = [int(trainer.current_epoch), step]
+        row += [_f(scalars.get(c)) for c in self._step_header[2:]]
+        with self.step_path.open("a", newline="") as f:
+            csv.writer(f).writerow(row)
+
+        for k in _EPOCH_AGG_KEYS:
+            if k in scalars:
+                self._epoch_accum.setdefault(k, []).append(scalars[k])
+
+    # ------------------------------------------------------------------
+    # Per-epoch
+    # ------------------------------------------------------------------
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if not self._epoch_accum:
+            return
+        epoch = int(trainer.current_epoch)
+        cols = ["epoch", "step", "n_steps"]
+        for k in _EPOCH_AGG_KEYS:
+            cols += [f"{k}_mean", f"{k}_std"]
+        if not self.epoch_path.exists():
+            with self.epoch_path.open("w", newline="") as f:
+                csv.writer(f).writerow(cols)
+        n_steps = max((len(v) for v in self._epoch_accum.values()), default=0)
+        row: list[object] = [epoch, int(trainer.global_step), n_steps]
+        for k in _EPOCH_AGG_KEYS:
+            xs = self._epoch_accum.get(k, [])
+            m, s = _mean_std(xs)
+            row += [_f(m), _f(s)]
+        with self.epoch_path.open("a", newline="") as f:
+            csv.writer(f).writerow(row)
+        self._epoch_accum.clear()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _collect_train_scalars(trainer: pl.Trainer) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for key, val in trainer.callback_metrics.items():
+            if not key.startswith("train/"):
+                continue
+            try:
+                out[key[len("train/") :]] = float(val)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    @staticmethod
+    def _current_lr(trainer: pl.Trainer) -> float | None:
+        if not trainer.optimizers:
+            return None
+        return float(trainer.optimizers[0].param_groups[0]["lr"])
+
+
+def _mean_std(xs: list[float]) -> tuple[float | None, float | None]:
+    finite = [x for x in xs if x is not None and not math.isnan(x)]
+    if not finite:
+        return None, None
+    m = sum(finite) / len(finite)
+    if len(finite) < 2:
+        return m, 0.0
+    return m, math.sqrt(sum((x - m) ** 2 for x in finite) / (len(finite) - 1))
+
+
+def _f(v: float | None) -> str:
+    if v is None:
+        return ""
+    try:
+        if v != v:  # NaN
+            return ""
+    except TypeError:
+        return ""
+    return f"{float(v):.6g}"

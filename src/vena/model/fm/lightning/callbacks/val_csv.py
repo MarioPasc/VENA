@@ -1,10 +1,12 @@
 """Append-only writer for ``val_epoch.csv`` in long format.
 
 Schema per training_routine.md §4.4. The LightningModule populates a
-per-region accumulator in ``validation_step`` and exposes it as
-``trainer.lightning_module._val_accumulator`` (a dict keyed by ``(epoch, nfe,
-region)``). This callback consumes the accumulator on
-``on_validation_epoch_end`` and flushes one row per tuple to the CSV.
+per-region accumulator in ``validation_step`` (a dict keyed by ``(nfe,
+region)`` holding raw per-patient lists). This callback collapses it to
+mean/std via ``pl_module.collapse_val_metrics()`` on
+``on_validation_epoch_end`` and flushes one row per ``(nfe, region)`` to the
+CSV. The accumulator is cleared by the module's own (later-firing)
+``on_validation_epoch_end`` hook, not here.
 
 Resume semantics: on ``on_train_start``, if a CSV exists, truncate any rows
 with ``epoch > resumed_epoch`` to keep the file monotonic and free of
@@ -15,7 +17,7 @@ from __future__ import annotations
 
 import csv
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytorch_lightning as pl
@@ -24,13 +26,21 @@ logger = logging.getLogger(__name__)
 
 
 COLUMNS: tuple[str, ...] = (
-    "epoch", "step", "nfe", "region",
-    "mse_latent_mean", "mse_latent_std",
-    "l1_latent_mean", "l1_latent_std",
+    "epoch",
+    "step",
+    "nfe",
+    "region",
+    "mse_latent_mean",
+    "mse_latent_std",
+    "l1_latent_mean",
+    "l1_latent_std",
     "cosine_latent_mean",
-    "psnr_image_mean", "psnr_image_std",
-    "ssim_image_mean", "ssim_image_std",
+    "psnr_image_mean",
+    "psnr_image_std",
+    "ssim_image_mean",
+    "ssim_image_std",
     "n_patients",
+    "n_image_patients",
     "timestamp_utc",
 )
 
@@ -78,33 +88,49 @@ class ValMetricsCSV(pl.Callback):
             len(kept),
         )
 
-    def on_validation_epoch_end(
-        self, trainer: pl.Trainer, pl_module: pl.LightningModule
-    ) -> None:
-        accumulator = getattr(pl_module, "_val_accumulator", None)
-        if accumulator is None:
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        # The module collapses the raw per-region accumulator (lists of
+        # per-patient values) into mean/std stats on demand. We must NOT read
+        # ``_val_accumulator`` directly: Lightning fires this callback hook
+        # *before* ``LightningModule.on_validation_epoch_end``, so at this point
+        # the accumulator still holds raw lists, not the ``*_mean``/``*_std``
+        # keys this CSV needs. The module clears the accumulator in its own
+        # (later) hook, so we do not clear here.
+        collapse = getattr(pl_module, "collapse_val_metrics", None)
+        if collapse is None:
+            return
+        metrics = collapse()
+        if not metrics:
             return
         epoch = int(trainer.current_epoch)
         step = int(trainer.global_step)
-        ts = datetime.now(timezone.utc).isoformat()
+        ts = datetime.now(UTC).isoformat()
         rows: list[list[str]] = []
-        for (nfe, region), agg in accumulator.items():
-            rows.append([
-                epoch, step, nfe, region,
-                _f(agg.get("mse_latent_mean")), _f(agg.get("mse_latent_std")),
-                _f(agg.get("l1_latent_mean")), _f(agg.get("l1_latent_std")),
-                _f(agg.get("cosine_latent_mean")),
-                _f(agg.get("psnr_image_mean")), _f(agg.get("psnr_image_std")),
-                _f(agg.get("ssim_image_mean")), _f(agg.get("ssim_image_std")),
-                int(agg.get("n_patients", 0)),
-                ts,
-            ])
+        for (nfe, region), agg in metrics.items():
+            rows.append(
+                [
+                    epoch,
+                    step,
+                    nfe,
+                    region,
+                    _f(agg.get("mse_latent_mean")),
+                    _f(agg.get("mse_latent_std")),
+                    _f(agg.get("l1_latent_mean")),
+                    _f(agg.get("l1_latent_std")),
+                    _f(agg.get("cosine_latent_mean")),
+                    _f(agg.get("psnr_image_mean")),
+                    _f(agg.get("psnr_image_std")),
+                    _f(agg.get("ssim_image_mean")),
+                    _f(agg.get("ssim_image_std")),
+                    int(agg.get("n_patients", 0)),
+                    int(agg.get("n_image_patients", 0)),
+                    ts,
+                ]
+            )
         if not rows:
             return
         with self.csv_path.open("a", newline="") as f:
             csv.writer(f).writerows(rows)
-        # Clear after flush so subsequent epochs start fresh.
-        accumulator.clear()
 
 
 def _f(v: float | None) -> str:

@@ -37,10 +37,9 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Literal
 
-import numpy as np
 import torch
+import torch.nn.functional as F
 from pydantic import BaseModel, ConfigDict, Field
-from scipy import ndimage
 
 logger = logging.getLogger(__name__)
 
@@ -84,9 +83,10 @@ class RegionMasks:
         return getattr(self, name)
 
 
-def _make_structure(name: str) -> np.ndarray:
+def _structure_kernel_size(name: str) -> int:
+    """Map a structuring-element name to the equivalent max-pool kernel size."""
     if name == "ones_3x3x3":
-        return np.ones((3, 3, 3), dtype=bool)
+        return 3
     raise ValueError(f"unknown structure '{name}'; supported: {{ones_3x3x3}}")
 
 
@@ -106,8 +106,12 @@ class RegionResolver:
     def _summarise(self) -> None:
         for name in REQUIRED_REGIONS:
             spec = self.specs[name]
-            logger.info("region '%s': source=%s%s", name, spec.source,
-                        f" h5_key={spec.h5_key}" if spec.h5_key else "")
+            logger.info(
+                "region '%s': source=%s%s",
+                name,
+                spec.source,
+                f" h5_key={spec.h5_key}" if spec.h5_key else "",
+            )
             if spec.source == "skipped":
                 logger.warning(
                     "region '%s' is skipped — metrics for this region will be NaN.",
@@ -115,8 +119,7 @@ class RegionResolver:
                 )
             if spec.source == "fallback_all_ones":
                 logger.warning(
-                    "region '%s' falls back to all-ones — metrics include "
-                    "non-brain voxels.",
+                    "region '%s' falls back to all-ones — metrics include non-brain voxels.",
                     name,
                 )
 
@@ -160,13 +163,14 @@ class RegionResolver:
         if spec.source == "derived_via_scipy_binary_dilation":
             if wt is None:
                 return None
-            struct = _make_structure(spec.structure)
-            out = torch.empty_like(wt, dtype=torch.bool)
-            wt_np = wt.detach().cpu().numpy().astype(bool)
-            for b in range(wt_np.shape[0]):
-                dilated = ndimage.binary_dilation(wt_np[b, 0], structure=struct)
-                out[b, 0] = torch.from_numpy(dilated)
-            return out.to(wt.device)
+            # Binary dilation with an all-ones (k,k,k) structuring element is
+            # exactly stride-1 max-pooling of the binary mask with padding
+            # ``k//2`` (which preserves the spatial shape for odd ``k``). Doing
+            # it on-device avoids the per-batch CPU/NumPy round-trip the old
+            # ``scipy.ndimage.binary_dilation`` loop incurred — same result.
+            k = _structure_kernel_size(spec.structure)
+            dilated = F.max_pool3d(wt.float(), kernel_size=k, stride=1, padding=k // 2)
+            return dilated > 0.5
         raise ValueError(f"unsupported source for wt_dilated: {spec.source}")
 
     def _resolve_brain(
