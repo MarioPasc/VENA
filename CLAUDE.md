@@ -28,6 +28,7 @@ Read these before non-trivial work:
 - [`.claude/rules/h5-design-principles.md`](.claude/rules/h5-design-principles.md) — Schema-versioned, self-describing HDF5 artifacts (applies to the UCSF-PDGM cache at `UCSFPDGM_image.h5`).
 - [`.claude/rules/training-stages.md`](.claude/rules/training-stages.md) — Six-phase timeline (data → pipeline → training → internal val → external val → writing) and the canonical routine names that map onto it.
 - [`.claude/rules/external-deps.md`](.claude/rules/external-deps.md) — How to consume frozen MAISI-V2 weights and UCSF-PDGM data; what `src/external/` is and is not.
+- [`.claude/rules/model-coding-standards.md`](.claude/rules/model-coding-standards.md) — FM-generator conventions (`src/vena/model/fm/`): training-only module + offloaded validation, metric-CSV logging, EMA/grad-accum, intensity-space parity, async second-GPU exhaustive validation.
 
 ## Quick context
 

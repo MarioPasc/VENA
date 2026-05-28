@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import platform
 import subprocess
+import sys
 from pathlib import Path
 
 from vena.data.h5.shared import resolve_git_sha
@@ -13,9 +14,17 @@ logger = logging.getLogger(__name__)
 
 
 def _pip_freeze() -> str:
+    # Use ``<current interpreter> -m pip`` rather than a bare ``pip`` on PATH:
+    # the run is launched from a conda env whose ``pip`` is not always on PATH
+    # (e.g. ``~/.conda/envs/vena/bin/python -m routines...``), so a bare ``pip``
+    # raises FileNotFoundError and ``env.txt`` ends up empty.
     try:
         out = subprocess.run(
-            ["pip", "freeze"], capture_output=True, text=True, check=True, timeout=30,
+            [sys.executable, "-m", "pip", "freeze"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
         )
         return out.stdout
     except (subprocess.SubprocessError, FileNotFoundError) as exc:
@@ -27,7 +36,10 @@ def _git_diff_stat(repo: Path) -> str:
     try:
         out = subprocess.run(
             ["git", "-C", str(repo), "diff", "--stat"],
-            capture_output=True, text=True, check=False, timeout=10,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
         )
         return out.stdout
     except (subprocess.SubprocessError, FileNotFoundError):
