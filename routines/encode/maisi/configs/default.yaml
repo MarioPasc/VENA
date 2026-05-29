@@ -9,7 +9,7 @@
 source_image_h5: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_image.h5
 autoencoder_checkpoint: /media/mpascual/Sandisk2TB/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
 output_dir: artifacts/encode/maisi
-output_h5_path: null   # default: <run_dir>/UCSFPDGM_latent.h5
+output_h5_path: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_latents.h5
 
 modalities: [t1pre, t1c, t2, flair]
 device: cuda
@@ -24,6 +24,9 @@ sliding_window:
 mask_downsampler:
   name: per_class_avg_pool
   params: {}
+
+percentile_foreground_only: true
+percentile_upper: 99.5
 
 limit: null
 overwrite: false

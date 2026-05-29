@@ -4,8 +4,54 @@ from __future__ import annotations
 
 from typing import Any
 
+import nibabel as nib
 import numpy as np
+from nibabel.orientations import (
+    apply_orientation,
+    axcodes2ornt,
+    io_orientation,
+    ornt_transform,
+)
 from numpy.typing import NDArray
+
+
+def reorient_to_axcodes(
+    array: NDArray[Any],
+    affine: NDArray[np.floating[Any]],
+    axcodes: tuple[str, str, str] = ("L", "P", "S"),
+) -> NDArray[Any]:
+    """Reorient a volume's voxel axes to a target anatomical orientation.
+
+    All cohorts in the corpus must share one voxel orientation so a fixed crop
+    box and the frozen MAISI VAE see consistent anatomy. UCSF-PDGM is natively
+    ``LPS``; BraTS-GLI is ``LAS`` (anterior-posterior flipped). Both are mapped
+    to ``LPS`` (the default) before cropping/encoding.
+
+    Parameters
+    ----------
+    array
+        Voxel data of shape ``(X, Y, Z)`` in the source orientation.
+    affine
+        4×4 voxel-to-world affine for ``array``.
+    axcodes
+        Target orientation axis codes (default ``("L", "P", "S")``).
+
+    Returns
+    -------
+    NDArray
+        ``array`` reoriented to ``axcodes`` (axis permutations/flips only; no
+        resampling, so voxel spacing is preserved). For an array already in the
+        target orientation this is the identity.
+    """
+    src = io_orientation(affine)
+    dst = axcodes2ornt(axcodes)
+    transform = ornt_transform(src, dst)
+    return apply_orientation(np.asarray(array), transform)
+
+
+def array_axcodes(affine: NDArray[np.floating[Any]]) -> tuple[str, str, str]:
+    """Return the anatomical axis codes of an affine, e.g. ``("L", "P", "S")``."""
+    return tuple(nib.aff2axcodes(affine))  # type: ignore[return-value]
 
 
 def brain_z_extent(mask: NDArray[Any], axial_axis: int = 2) -> tuple[int, int]:

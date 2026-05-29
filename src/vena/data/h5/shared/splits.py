@@ -20,8 +20,9 @@ supplied; otherwise plain :class:`KFold` / random selection.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import numpy as np
 from sklearn.model_selection import KFold, StratifiedKFold, StratifiedShuffleSplit
@@ -133,3 +134,75 @@ def make_nested_cv_splits(
         labels is not None,
     )
     return {"test": test_ids, "folds": folds}
+
+
+def make_cohort_splits(
+    patient_ids: Sequence[str],
+    *,
+    n_folds: int = 5,
+    test_fraction: float = 0.10,
+    n_test_min: int = 25,
+    seed: int = 42,
+    stratify_by: Sequence[int] | Sequence[str] | None = None,
+    role: Literal["cv", "test_only"] = "cv",
+) -> NestedCVSplits:
+    """Per-cohort, leakage-proof split with a quota-based test holdout.
+
+    The held-out test size is ``n_test(c) = max(n_test_min, ceil(test_fraction *
+    N))`` so every cohort retains enough cases for a per-cohort metric with a
+    usable confidence interval (the ``n_test_min`` floor matters for small
+    cohorts). Test-only cohorts assign every patient to ``test`` with no CV folds.
+
+    Parameters
+    ----------
+    patient_ids
+        Patient identifiers. Splitting is patient-level so no patient straddles
+        a split (the caller expands patient → scan rows downstream).
+    n_folds
+        Number of CV folds for ``role == "cv"``.
+    test_fraction
+        Fraction ``ρ`` of patients held out for test (before the floor).
+    n_test_min
+        Minimum held-out test size; the floor that protects small cohorts.
+    seed
+        Seed for the test split and CV shuffler.
+    stratify_by
+        Optional per-patient label (e.g. WHO grade); ``None`` → random.
+    role
+        ``"cv"`` for train/val/test cohorts; ``"test_only"`` for held-out cohorts.
+
+    Returns
+    -------
+    NestedCVSplits
+        ``{"test": [...], "folds": {...}}``; ``folds`` is empty for test-only.
+
+    Raises
+    ------
+    ValueError
+        If ``role == "cv"`` but the cohort is too small to hold out the quota
+        and still run ``n_folds``-fold CV.
+    """
+    ids = list(patient_ids)
+    n = len(ids)
+    if role == "test_only":
+        logger.info("Cohort split: role=test_only, all %d patients → test", n)
+        return {"test": list(ids), "folds": {}}
+
+    n_test = max(int(n_test_min), math.ceil(test_fraction * n))
+    if n_test >= n:
+        raise ValueError(
+            f"cohort too small for cv role: n={n}, computed n_test={n_test} "
+            f"(test_fraction={test_fraction}, n_test_min={n_test_min})"
+        )
+    if n - n_test < n_folds:
+        raise ValueError(
+            f"cohort too small for {n_folds}-fold CV after holding out "
+            f"n_test={n_test} from n={n}"
+        )
+    return make_nested_cv_splits(
+        ids,
+        n_folds=n_folds,
+        n_test=n_test,
+        seed=seed,
+        stratify_by=stratify_by,
+    )

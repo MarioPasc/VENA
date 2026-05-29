@@ -39,6 +39,12 @@ _REQUIRED_ROOT_ATTRS = (
     "config_json",
     "manifest_json",
     "git_sha",
+    # schema-v2 semantic/provenance attrs (stamped with defaults by H5Writer)
+    "split_role",
+    "longitudinal",
+    "label_system",
+    "crop_box",
+    "orientation",
 )
 
 

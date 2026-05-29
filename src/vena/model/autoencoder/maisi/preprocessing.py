@@ -177,3 +177,143 @@ def crop_to_original(x: torch.Tensor, pad: DepthPad) -> torch.Tensor:
             f"crop_to_original: input depth {x.shape[-1]} != padded_depth {pad.padded_depth}"
         )
     return x[..., pad.before : pad.before + pad.original_depth]
+
+
+@dataclass(frozen=True)
+class CropPadSpec:
+    """Brain-centred crop+pad mapping a native RAS volume onto a fixed box.
+
+    The box is defined in canonical-LPS voxel space (axes L→R, P→A, S→I,
+    matching the ``(H, W, D)`` order of the stored arrays). ``crop_origin`` is
+    the index in the *native* grid at which the box starts; it may be negative
+    (the box extends before the native array → zero-pad before) and
+    ``crop_origin + target_shape`` may exceed ``native_shape`` (→ zero-pad
+    after). On axes where ``native_shape >= target_shape`` the box crops the
+    native volume; where ``native_shape < target_shape`` it pads.
+
+    Attributes
+    ----------
+    crop_origin : tuple[int, int, int]
+        Native-grid start index of the box per axis ``(H, W, D)``.
+    native_shape : tuple[int, int, int]
+        Spatial shape of the source volume.
+    target_shape : tuple[int, int, int]
+        Common box shape (e.g. ``(192, 224, 192)``).
+    """
+
+    crop_origin: tuple[int, int, int]
+    native_shape: tuple[int, int, int]
+    target_shape: tuple[int, int, int]
+
+
+def apply_crop_pad(x: torch.Tensor, spec: CropPadSpec) -> torch.Tensor:
+    """Crop/zero-pad a native-RAS volume onto ``spec.target_shape``.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Volume of shape ``(B, C, *spec.native_shape)``.
+    spec : CropPadSpec
+        Crop/pad geometry.
+
+    Returns
+    -------
+    torch.Tensor
+        Volume of shape ``(B, C, *spec.target_shape)``.
+
+    Raises
+    ------
+    ShapeContractError
+        If ``x`` is not 5-D or its spatial shape disagrees with
+        ``spec.native_shape``.
+    """
+    if x.ndim != 5:
+        raise ShapeContractError(
+            f"apply_crop_pad expects (B,C,H,W,D); got shape {tuple(x.shape)}"
+        )
+    if tuple(x.shape[2:]) != tuple(spec.native_shape):
+        raise ShapeContractError(
+            f"apply_crop_pad: input spatial {tuple(x.shape[2:])} != "
+            f"native_shape {spec.native_shape}"
+        )
+    o, n, t = spec.crop_origin, spec.native_shape, spec.target_shape
+    src: list[tuple[int, int]] = []
+    pad: list[tuple[int, int]] = []
+    for i in range(3):
+        s_start = max(0, o[i])
+        s_end = min(n[i], o[i] + t[i])
+        before = s_start - o[i]
+        copied = max(0, s_end - s_start)
+        after = t[i] - before - copied
+        src.append((s_start, s_end))
+        pad.append((before, after))
+    cropped = x[
+        :,
+        :,
+        src[0][0] : src[0][1],
+        src[1][0] : src[1][1],
+        src[2][0] : src[2][1],
+    ]
+    # F.pad pads the last spatial axis first: (D_before, D_after, W_*, H_*).
+    pad_arg = (
+        pad[2][0],
+        pad[2][1],
+        pad[1][0],
+        pad[1][1],
+        pad[0][0],
+        pad[0][1],
+    )
+    return F.pad(cropped, pad_arg, mode="constant", value=0.0)
+
+
+def invert_crop_pad(x: torch.Tensor, spec: CropPadSpec) -> torch.Tensor:
+    """Inverse of :func:`apply_crop_pad`: map a box volume back to native shape.
+
+    Padded margins are dropped and native regions the box never covered are
+    zero-filled. Used to write box-space predictions back into the native grid;
+    metric computation instead crops the *real* image with :func:`apply_crop_pad`.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Volume of shape ``(B, C, *spec.target_shape)``.
+    spec : CropPadSpec
+        Crop/pad geometry.
+
+    Returns
+    -------
+    torch.Tensor
+        Volume of shape ``(B, C, *spec.native_shape)``.
+    """
+    if x.ndim != 5:
+        raise ShapeContractError(
+            f"invert_crop_pad expects (B,C,H,W,D); got shape {tuple(x.shape)}"
+        )
+    if tuple(x.shape[2:]) != tuple(spec.target_shape):
+        raise ShapeContractError(
+            f"invert_crop_pad: input spatial {tuple(x.shape[2:])} != "
+            f"target_shape {spec.target_shape}"
+        )
+    o, n, t = spec.crop_origin, spec.native_shape, spec.target_shape
+    out = x.new_zeros((x.shape[0], x.shape[1], *n))
+    dst: list[tuple[int, int]] = []
+    box: list[tuple[int, int]] = []
+    for i in range(3):
+        d_start = max(0, o[i])
+        d_end = min(n[i], o[i] + t[i])
+        dst.append((d_start, d_end))
+        box.append((d_start - o[i], d_end - o[i]))
+    out[
+        :,
+        :,
+        dst[0][0] : dst[0][1],
+        dst[1][0] : dst[1][1],
+        dst[2][0] : dst[2][1],
+    ] = x[
+        :,
+        :,
+        box[0][0] : box[0][1],
+        box[1][0] : box[1][1],
+        box[2][0] : box[2][1],
+    ]
+    return out

@@ -97,11 +97,21 @@ def test_ucsf_pdgm_manifest_loads() -> None:
     """The cohort manifest itself must be importable and self-consistent."""
     from vena.data.h5.ucsf_pdgm.image_domain import UCSF_PDGM_IMAGE_MANIFEST
 
-    assert UCSF_PDGM_IMAGE_MANIFEST.schema_version == "1.0.0"
+    assert UCSF_PDGM_IMAGE_MANIFEST.schema_version == "2.0.0"
     assert UCSF_PDGM_IMAGE_MANIFEST.expected_shape == (240, 240, 155)
     # Manifest round-trip
     assert H5Manifest.from_json(UCSF_PDGM_IMAGE_MANIFEST.to_json()) == UCSF_PDGM_IMAGE_MANIFEST
-    # The four sequences declared in the proposal are present.
+    # The four sequences plus schema-2.0.0 additions (brain mask, crop origin, CSR).
     paths = {d.path for d in UCSF_PDGM_IMAGE_MANIFEST.datasets}
-    for required in ("images/t1pre", "images/t1c", "images/t2", "images/flair", "masks/tumor"):
+    for required in (
+        "images/t1pre",
+        "images/t1c",
+        "images/t2",
+        "images/flair",
+        "masks/tumor",
+        "masks/brain",
+        "crop/origin",
+        "patients/offsets",
+        "patients/keys",
+    ):
         assert required in paths

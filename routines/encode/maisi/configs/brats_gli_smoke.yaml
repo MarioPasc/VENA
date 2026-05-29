@@ -1,0 +1,50 @@
+# MAISI encode — BraTS-GLI CPU smoke run (full cohort from /tmp smoke H5).
+#
+# Uses the pre-built smoke image H5 at /tmp/vena_smoke_h5/BraTS_GLI_image_smoke.h5
+# (10 sessions, 8 patients). Encodes on CPU with fp32 so no GPU is required.
+# encode_full_cohort=true so CSR + splits are copied to the latent H5.
+
+source_image_h5: /tmp/vena_smoke_h5/BraTS_GLI_image_smoke.h5
+autoencoder_checkpoint: /media/mpascual/Sandisk2TB/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+output_dir: /tmp/vena_smoke_encode_maisi/brats_gli
+output_h5_path: null
+
+modalities: [t1pre, t1c, t2, flair]
+device: cpu
+inference_mode: full
+precision_mode: fp32
+depth_pad_base: 8
+
+sliding_window:
+  roi_size: [80, 80, 32]
+  overlap: 0.4
+  mode: gaussian
+
+mask_downsampler:
+  name: per_class_avg_pool
+  params: {}
+
+percentile_foreground_only: true
+percentile_upper: 99.5
+
+limit: null
+encode_full_cohort: true
+overwrite: true
+log_level: INFO
+seed: 0
+
+roundtrip:
+  enabled: true
+  n_patients: 2
+  modalities: [t1c]
+  per_modality_figures: true
+  save_nifti: false
+
+stabilization:
+  enabled: false
+
+pca:
+  enabled: true
+  figure_filename: pca.png
+  pooling: global_avg
+  n_components: 2

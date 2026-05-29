@@ -1,11 +1,12 @@
-"""Image-domain H5 → MAISI latent-domain H5 converter.
+"""Image-domain H5 → MAISI latent-domain H5 converter (cohort-agnostic).
 
 This converter is the library-level engine consumed by
 ``routines/encode/maisi``. It does *one* thing: read every modality row
 declared in the config from the source image H5, push it through
-:class:`MaisiEncoder`, downsample the tumour mask once per patient, and
-stack everything into the latent H5 alongside metadata and splits copied
-verbatim from the source.
+:class:`MaisiEncoder` using the brain-centred crop box stored in the source,
+downsample the tumour mask once per patient, and stack everything into the
+latent H5 alongside metadata (when present) and splits/CSR copied verbatim
+from the source.
 
 What this module does NOT do:
 
@@ -16,6 +17,17 @@ What this module does NOT do:
   the same models can be reused for downstream QC without reloading.
 * It does not enforce a specific modality list. The set of latents
   written is determined entirely by ``config.modalities``.
+
+Cohort-agnostic notes:
+
+* Metadata is optional: cohorts without ``metadata/*`` datasets (e.g.
+  BraTS-GLI) produce no metadata entries in the latent H5. The source
+  image H5's ``manifest_json`` attr is used to detect which metadata
+  datasets are available.
+* CSR (``patients/offsets``, ``patients/keys``) and ``splits/*`` are
+  copied verbatim ONLY when encoding the full cohort (``src_indices ==
+  list(range(n_all))``). Subset runs log a warning and skip CSR/splits
+  because the patient grouping would be inconsistent.
 """
 
 from __future__ import annotations
@@ -34,6 +46,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from vena.data.h5.shared import (
     H5ConvertError,
+    H5Manifest,
     H5Writer,
     assert_h5_valid,
     assign_row,
@@ -42,20 +55,20 @@ from vena.data.h5.shared import (
     sha256_file,
 )
 from vena.model.autoencoder.maisi.encode import AbstractMaskDownsampler, MaisiEncoder
+from vena.model.autoencoder.maisi.preprocessing import CropPadSpec, apply_crop_pad
 
 from .manifest import (
-    UCSF_PDGM_IMAGE_NATIVE_SHAPE,
-    UCSF_PDGM_IMAGE_PADDED_SHAPE,
     UCSF_PDGM_LATENT_CHANNELS,
     UCSF_PDGM_LATENT_SCHEMA_VERSION,
     UCSF_PDGM_LATENT_SEQUENCE_MAP,
     UCSF_PDGM_LATENT_SPATIAL,
+    _UCSF_PDGM_METADATA_FIELDS,
     build_latent_manifest,
 )
 
 logger = logging.getLogger(__name__)
 
-_PRODUCER_VERSION = "0.1.0"
+_PRODUCER_VERSION = "0.2.0"
 _PRODUCER = f"vena.data.h5.ucsf_pdgm.latent_domain.convert:{_PRODUCER_VERSION}"
 
 
@@ -137,9 +150,15 @@ class UCSFPDGMLatentH5Converter:
         if not cfg.source_image_h5.is_file():
             raise H5ConvertError(f"source image H5 not found: {cfg.source_image_h5}")
 
+        with h5py.File(cfg.source_image_h5, "r") as src:
+            cohort = str(src.attrs.get("cohort", "unknown"))
+            metadata_fields = self._detect_metadata_fields(src)
+
         manifest = build_latent_manifest(
             modalities=cfg.modalities,
             mask_output_channels=self.mask_downsampler.output_channels,
+            cohort=cohort,
+            metadata_fields=metadata_fields,
         )
 
         if cfg.output_path.exists() and not cfg.overwrite:
@@ -161,8 +180,14 @@ class UCSFPDGMLatentH5Converter:
             n_all = len(all_ids)
             ids, src_indices = self._select_rows(cfg, all_ids)
             n = len(ids)
+            is_full_cohort = src_indices == list(range(n_all))
+
+            # Read crop box from source root attr once.
+            box = tuple(json.loads(str(src.attrs["crop_box"])))
+
             logger.info(
-                "UCSF-PDGM latent-domain conversion (fresh): n_patients=%d (source has %d)",
+                "%s latent-domain conversion (fresh): n_scans=%d (source has %d)",
+                src.attrs.get("cohort", "unknown"),
                 n,
                 n_all,
             )
@@ -170,6 +195,9 @@ class UCSFPDGMLatentH5Converter:
             timestamp = now_iso_utc()
             git_sha = resolve_git_sha()
             handle = self.encoder.handle
+
+            # Collect extra root attrs to copy from source.
+            extra_root_attrs = self._collect_extra_root_attrs(src)
 
             with H5Writer(
                 cfg.output_path,
@@ -179,6 +207,7 @@ class UCSFPDGMLatentH5Converter:
                 created_at=timestamp,
                 git_sha=git_sha,
                 overwrite=cfg.overwrite,
+                extra_root_attrs=extra_root_attrs,
             ) as w:
                 self._stamp_root_attrs(w, src, manifest, handle)
                 ids_dset = w.create_1d(manifest.get("ids"), n=n)
@@ -188,11 +217,22 @@ class UCSFPDGMLatentH5Converter:
                 tumor_dset = self._allocate_tumor_mask(w, manifest, n)
                 completed_dset = self._allocate_progress(w, n)
 
-                # Copy non-encoded payload (metadata, splits, priors) upfront
-                # so a partial file is structurally complete except for the
-                # rows ``progress/completed`` marks as pending.
+                # Copy non-encoded payload upfront so a partial file is
+                # structurally complete except for pending encoded rows.
                 self._copy_metadata(src, w, manifest, n, src_indices)
-                self._copy_splits(src, w)
+                if is_full_cohort:
+                    self._copy_csr(src, w)
+                    self._copy_splits(src, w)
+                else:
+                    logger.warning(
+                        "Subset run (n=%d < n_all=%d): skipping CSR (patients/*) and "
+                        "splits copy — the subset patient grouping would be inconsistent.",
+                        n,
+                        n_all,
+                    )
+                    # Write empty placeholder CSR datasets so the manifest
+                    # validator finds the declared paths (structural completeness).
+                    self._write_empty_csr(w)
                 self._create_priors_placeholder(w)
                 w.file.flush()
 
@@ -208,6 +248,7 @@ class UCSFPDGMLatentH5Converter:
                     h5_file=w.file,
                     checkpoint_every=cfg.checkpoint_every,
                     prior_modes={"full": 0, "sliding": 0},
+                    box=box,
                 )
 
                 if not bool(np.all(completed_dset[:])):
@@ -234,6 +275,7 @@ class UCSFPDGMLatentH5Converter:
             ids, src_indices = self._select_rows(cfg, all_ids)
             n = len(ids)
             handle = self.encoder.handle
+            box = tuple(json.loads(str(src.attrs["crop_box"])))
 
             with h5py.File(cfg.output_path, "r+") as f:
                 self._assert_resume_compatible(f, src, ids, handle)
@@ -242,7 +284,8 @@ class UCSFPDGMLatentH5Converter:
                 pending_out_rows = [i for i, d in enumerate(done_mask) if not d]
                 n_done = int(done_mask.sum())
                 logger.info(
-                    "UCSF-PDGM latent-domain conversion (resume): n_patients=%d done=%d pending=%d",
+                    "%s latent-domain conversion (resume): n_scans=%d done=%d pending=%d",
+                    src.attrs.get("cohort", "unknown"),
                     n,
                     n_done,
                     len(pending_out_rows),
@@ -269,6 +312,7 @@ class UCSFPDGMLatentH5Converter:
                         h5_file=f,
                         checkpoint_every=cfg.checkpoint_every,
                         prior_modes=prior_modes,
+                        box=box,
                     )
 
                     if not bool(np.all(completed_dset[:])):
@@ -282,25 +326,67 @@ class UCSFPDGMLatentH5Converter:
 
     # ------------------------------------------------------------------ helpers
 
+    @staticmethod
+    def _detect_metadata_fields(src: h5py.File) -> list[dict[str, str]]:
+        """Return the per-cohort metadata field specs for this source H5.
+
+        Reads the source's ``manifest_json`` root attr (when present) to
+        detect which ``metadata/*`` datasets are declared. Falls back to
+        the UCSF-PDGM default list when the manifest is absent.  Returns
+        ``[]`` when the source declares no metadata datasets (e.g. BraTS-GLI).
+        """
+        manifest_json = src.attrs.get("manifest_json")
+        if manifest_json is None:
+            # Older schema: assume UCSF-PDGM metadata.
+            return list(_UCSF_PDGM_METADATA_FIELDS)
+
+        try:
+            src_manifest = H5Manifest.from_json(str(manifest_json))
+        except Exception as exc:
+            logger.warning(
+                "Could not parse source manifest_json; falling back to UCSF-PDGM metadata: %s",
+                exc,
+            )
+            return list(_UCSF_PDGM_METADATA_FIELDS)
+
+        # Collect the metadata dataset specs from the source manifest and map
+        # them to our field-dict format (path, dtype, units, description).
+        fields: list[dict[str, str]] = []
+        for spec in src_manifest.datasets:
+            if spec.kind == "metadata" and spec.path.startswith("metadata/"):
+                fields.append(
+                    {
+                        "path": spec.path,
+                        "dtype": spec.dtype,
+                        "units": spec.units,
+                        "description": spec.description,
+                    }
+                )
+        return fields
+
     def _assert_source_compatibility(self, src: h5py.File) -> None:
         cfg = self.cfg
-        # Soft-check: the image H5 schema_version may evolve; require it
-        # to exist but do not pin to a single value here, because the
-        # image-domain manifest is bumped independently.
         if "schema_version" not in src.attrs:
             raise H5ConvertError("source image H5 lacks schema_version root attr")
+        if "crop_box" not in src.attrs:
+            raise H5ConvertError(
+                "source image H5 lacks crop_box root attr; "
+                "schema v2.0.0 is required for the box encoding path"
+            )
+        if "crop/origin" not in src:
+            raise H5ConvertError("source image H5 lacks crop/origin dataset")
         for slug in cfg.modalities:
             path = f"images/{slug}"
             if path not in src:
                 raise H5ConvertError(
-                    f"source image H5 has no dataset {path!r} (modalities requested: {cfg.modalities})"
+                    f"source image H5 has no dataset {path!r} "
+                    f"(modalities requested: {cfg.modalities})"
                 )
         if "masks/tumor" not in src:
             raise H5ConvertError("source image H5 has no masks/tumor")
 
     def _read_ids(self, src: h5py.File) -> list[str]:
         raw = src["ids"][:]
-        # vlen-str returns numpy object array of bytes or str depending on h5py.
         return [v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in raw]
 
     def _select_rows(
@@ -308,12 +394,7 @@ class UCSFPDGMLatentH5Converter:
         cfg: UCSFPDGMLatentH5Config,
         all_ids: list[str],
     ) -> tuple[list[str], list[int]]:
-        """Resolve the (ids, source-indices) pair for this run.
-
-        ``patient_ids`` (when set) takes precedence; otherwise ``limit``
-        truncates to the first ``limit`` rows of the source H5; otherwise
-        the full cohort is used.
-        """
+        """Resolve the (ids, source-indices) pair for this run."""
         if cfg.patient_ids is not None:
             index_of = {pid: i for i, pid in enumerate(all_ids)}
             missing = [p for p in cfg.patient_ids if p not in index_of]
@@ -325,6 +406,16 @@ class UCSFPDGMLatentH5Converter:
             n = min(cfg.limit, len(all_ids))
             return all_ids[:n], list(range(n))
         return list(all_ids), list(range(len(all_ids)))
+
+    @staticmethod
+    def _collect_extra_root_attrs(src: h5py.File) -> dict[str, Any]:
+        """Copy the schema-v2 semantic attrs from source into the latent H5."""
+        keys = ("split_role", "longitudinal", "label_system", "crop_box", "orientation")
+        out: dict[str, Any] = {}
+        for k in keys:
+            if k in src.attrs:
+                out[k] = src.attrs[k]
+        return out
 
     def _stamp_root_attrs(
         self,
@@ -347,10 +438,9 @@ class UCSFPDGMLatentH5Converter:
         )
         f.attrs["latent_channels"] = UCSF_PDGM_LATENT_CHANNELS
         f.attrs["latent_spatial_json"] = json.dumps(list(UCSF_PDGM_LATENT_SPATIAL))
-        f.attrs["image_native_shape_json"] = json.dumps(list(UCSF_PDGM_IMAGE_NATIVE_SHAPE))
-        f.attrs["image_padded_shape_json"] = json.dumps(list(UCSF_PDGM_IMAGE_PADDED_SHAPE))
+        f.attrs["crop_box_json"] = str(src.attrs.get("crop_box", "null"))
         f.attrs["spatial_compression"] = 4
-        f.attrs["padding_strategy"] = "zero_pad_depth_to_multiple_of_8"
+        f.attrs["padding_strategy"] = "brain_centred_crop_box"
         f.attrs["encode_runtime_attrs_json"] = json.dumps(self.encoder.to_attrs())
         f.attrs["mask_downsampler_attrs_json"] = json.dumps(self.mask_downsampler.to_attrs())
         f.attrs["scale_factor"] = "null"  # reserved; set by FM training when chosen.
@@ -372,13 +462,7 @@ class UCSFPDGMLatentH5Converter:
         return out
 
     def _allocate_progress(self, w: H5Writer, n: int) -> h5py.Dataset:
-        """Allocate the ``progress/completed`` sidecar dataset.
-
-        Bool, shape ``(n,)``, initialised to False. Marked True per-row by
-        :meth:`_encode_loop` after both latents and the tumour mask have
-        been written for that row. Lives outside the manifest so the
-        structural validator ignores it.
-        """
+        """Allocate the ``progress/completed`` sidecar dataset."""
         f = w.file
         if "progress" not in f:
             f.create_group("progress")
@@ -392,8 +476,7 @@ class UCSFPDGMLatentH5Converter:
         dset.attrs["units"] = "dimensionless"
         dset.attrs["description"] = (
             "Per-row completion flag for the encode loop. True iff the "
-            "row's latents and tumour mask are fully written. Used by "
-            "the resume path to skip already-done patients."
+            "row's latents and tumour mask are fully written."
         )
         dset.attrs["dtype"] = "bool"
         dset.attrs["leading_dim"] = "n_scans"
@@ -409,9 +492,7 @@ class UCSFPDGMLatentH5Converter:
         ids: list[str],
         handle: Any,
     ) -> None:
-        """Validate that the existing output H5 was produced under a config
-        compatible with the current one. Raises :class:`H5ConvertError` with
-        every violation listed."""
+        """Validate that the existing output H5 is compatible with the current config."""
         cfg = self.cfg
         violations: list[str] = []
 
@@ -442,7 +523,6 @@ class UCSFPDGMLatentH5Converter:
                 v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in f["ids"][:]
             ]
             if existing_ids != ids:
-                # Show the first divergence for actionable diagnostics.
                 first_diff = next(
                     (i for i, (a, b) in enumerate(zip(existing_ids, ids)) if a != b),
                     min(len(existing_ids), len(ids)),
@@ -479,8 +559,6 @@ class UCSFPDGMLatentH5Converter:
         spec = manifest.get("masks/tumor_latent")
         dset = w.create_stacked(spec, n=n, spatial_shape=ds_shape)
         for k, v in self.mask_downsampler.to_attrs().items():
-            # h5py rejects arbitrary nested dicts/lists; serialise to JSON
-            # for non-scalar values to keep things robust.
             if isinstance(v, (str, int, float, bool)):
                 dset.attrs[k] = v
             else:
@@ -501,6 +579,7 @@ class UCSFPDGMLatentH5Converter:
         h5_file: h5py.File,
         checkpoint_every: int,
         prior_modes: dict[str, int],
+        box: tuple[int, ...],
     ) -> None:
         cfg = self.cfg
         device = self.encoder.handle.device
@@ -509,28 +588,56 @@ class UCSFPDGMLatentH5Converter:
         n_pending = len(out_rows)
         log_every = max(1, n_pending // 50)
 
+        # Native shape is the same for all scans in a given cohort.
+        # Read from the first image dataset.
+        first_slug = cfg.modalities[0]
+        native_shape: tuple[int, int, int] = tuple(src[f"images/{first_slug}"].shape[1:])  # type: ignore[assignment]
+
         for k, out_row in enumerate(out_rows):
             src_row = src_indices[out_row]
             pid = ids[out_row]
+
+            # Build the per-scan crop spec from the stored crop/origin.
+            crop_origin: tuple[int, int, int] = tuple(  # type: ignore[assignment]
+                int(v) for v in src["crop/origin"][src_row]
+            )
+            spec = CropPadSpec(
+                crop_origin=crop_origin,
+                native_shape=native_shape,
+                target_shape=tuple(box),  # type: ignore[arg-type]
+            )
+
             # ---- latents ---------------------------------------------------
             for slug in cfg.modalities:
                 arr = src[f"images/{slug}"][src_row]  # (H, W, D), float32
                 t = torch.from_numpy(np.asarray(arr, dtype=np.float32))
                 t = t.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W, D)
                 t = t.to(device, non_blocking=True)
-                res = self.encoder.encode(t, mode=cfg.inference_mode)
+                res = self.encoder.encode(t, mode=cfg.inference_mode, crop_spec=spec)
                 modes_seen[res.inference_mode] = modes_seen.get(res.inference_mode, 0) + 1
                 z = res.latent.detach().to("cpu", dtype=torch.float32).contiguous()
                 z_np = z[0].numpy()  # (C, h, w, d)
+                # Assert the latent has the expected spatial shape.
+                if tuple(z_np.shape) != (UCSF_PDGM_LATENT_CHANNELS, *UCSF_PDGM_LATENT_SPATIAL):
+                    raise H5ConvertError(
+                        f"unexpected latent shape for {pid}/{slug}: "
+                        f"got {z_np.shape}, expected "
+                        f"({UCSF_PDGM_LATENT_CHANNELS}, {UCSF_PDGM_LATENT_SPATIAL})"
+                    )
                 assign_row(latent_dsets[slug], out_row, z_np)
                 del t, z, res
 
             # ---- tumor mask -----------------------------------------------
+            # Crop the native seg to the box before downsampling so that the
+            # downsampler sees (192, 224, 192) → avg_pool4 → (48, 56, 48).
             seg = src["masks/tumor"][src_row]  # (H, W, D), int8
             seg_t = torch.from_numpy(np.asarray(seg, dtype=np.int64))
             seg_t = seg_t.unsqueeze(0).unsqueeze(0).to(device)
+            # apply_crop_pad requires float; cast, crop, cast back.
+            seg_float = apply_crop_pad(seg_t.float(), spec)
+            seg_cropped = seg_float.to(torch.int64)
             mask_latent = self.mask_downsampler.downsample(
-                seg_t, target_shape=UCSF_PDGM_LATENT_SPATIAL
+                seg_cropped, target_shape=UCSF_PDGM_LATENT_SPATIAL
             )
             mask_np = mask_latent[0].detach().to("cpu").numpy()
             assign_row(tumor_dset, out_row, mask_np)
@@ -540,14 +647,11 @@ class UCSFPDGMLatentH5Converter:
                 torch.cuda.empty_cache()
 
             # Order matters: mark this row complete only after BOTH latents
-            # and the tumour mask have been written. The flush below makes
-            # the flag visible to a future resume.
+            # and the tumour mask have been written.
             completed_dset[out_row] = True
 
             done_now = k + 1
             if done_now % checkpoint_every == 0 or done_now == n_pending:
-                # Record running inference-mode tally so a resume sees the
-                # full historical count even if it never re-loops.
                 h5_file.attrs["inference_mode_counts_json"] = json.dumps(modes_seen)
                 h5_file.flush()
                 logger.info(
@@ -573,10 +677,9 @@ class UCSFPDGMLatentH5Converter:
                     modes_seen,
                 )
 
-        # Final stamp of the inference-mode counts.
         h5_file.attrs["inference_mode_counts_json"] = json.dumps(modes_seen)
 
-    # ----- metadata + splits + priors --------------------------------------
+    # ----- metadata + CSR + splits + priors --------------------------------
 
     def _copy_metadata(
         self,
@@ -590,12 +693,13 @@ class UCSFPDGMLatentH5Converter:
         for spec in manifest.datasets:
             if spec.kind != "metadata":
                 continue
+            # Skip CSR datasets (patients/*) — those are handled by _copy_csr.
+            if spec.path.startswith("patients/"):
+                continue
             if spec.path not in src:
                 logger.warning("source missing metadata %s; writing default fill", spec.path)
                 values = self._default_metadata_values(spec.dtype, n)
             else:
-                # h5py supports fancy indexing on 1-D datasets; pull only
-                # the rows we encoded so the metadata aligns with ``ids``.
                 full = src[spec.path][:]
                 raw = np.asarray(full)[idx]
                 values = self._coerce_metadata(raw, spec.dtype)
@@ -605,7 +709,6 @@ class UCSFPDGMLatentH5Converter:
     @staticmethod
     def _coerce_metadata(raw: NDArray[Any], dtype: str) -> NDArray[Any]:
         if dtype == "vlen-str":
-            # ``raw`` is object dtype; convert bytes → str defensively.
             out = np.empty(raw.shape, dtype=object)
             for i, v in enumerate(raw):
                 out[i] = v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
@@ -626,21 +729,68 @@ class UCSFPDGMLatentH5Converter:
             return np.full(n, np.nan, dtype=np.float32)
         raise ValueError(f"unhandled metadata dtype {dtype!r}")
 
+    @staticmethod
+    def _write_empty_csr(w: H5Writer) -> None:
+        """Write zero-length placeholder CSR datasets for subset runs.
+
+        The manifest always declares ``patients/offsets`` and ``patients/keys``
+        (structural completeness). Subset runs cannot copy the real CSR because
+        the patient grouping would be inconsistent, so we write empty arrays
+        here so ``assert_h5_valid`` does not flag missing datasets.
+        """
+        w.write_int_1d(
+            "patients/offsets",
+            np.zeros(0, dtype=np.int32),
+            dtype="int32",
+            units="dimensionless",
+            description=(
+                "CSR offsets — empty placeholder (subset run; full cohort CSR not copied)."
+            ),
+        )
+        w.write_vlen_str_1d(
+            "patients/keys",
+            [],
+            description="Patient keys — empty placeholder (subset run).",
+        )
+
+    @staticmethod
+    def _copy_csr(src: h5py.File, w: H5Writer) -> None:
+        """Copy ``patients/offsets`` (int32) and ``patients/keys`` (vlen-str) verbatim."""
+        if "patients/offsets" not in src or "patients/keys" not in src:
+            logger.warning("source image H5 has no patients/* CSR; skipping CSR copy")
+            return
+        offsets = np.asarray(src["patients/offsets"][:], dtype=np.int32)
+        w.write_int_1d(
+            "patients/offsets",
+            offsets,
+            dtype="int32",
+            units="dimensionless",
+            description=(
+                "CSR offsets, length n_patients+1; scans of patient k are "
+                "rows [offsets[k]:offsets[k+1]]."
+            ),
+        )
+        keys_raw = src["patients/keys"][:]
+        keys = [v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in keys_raw]
+        w.write_vlen_str_1d(
+            "patients/keys",
+            keys,
+            description="Unique patient keys, length n_patients, in offset order.",
+        )
+        logger.info("CSR copied: %d patients, %d scans", len(keys), int(offsets[-1]))
+
     def _copy_splits(self, src: h5py.File, w: H5Writer) -> None:
         if "splits" not in src:
             logger.warning("source image H5 has no splits group; skipping copy")
             return
 
-        # Walk every dataset under splits/ and copy as-is.
         def _visit(name: str, obj: h5py.HLObject) -> None:
             if isinstance(obj, h5py.Dataset):
-                # Build the values list (vlen-str expected).
                 raw = obj[:]
                 values = [v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in raw]
                 w.write_vlen_str_1d(name, values)
 
         src["splits"].visititems(lambda subname, obj: _visit(f"splits/{subname}", obj))
-        # Also stamp the group-level description / n_folds if present.
         if "splits" in w.file and "splits" in src:
             grp_src = src["splits"]
             grp_dst = w.file["splits"]
@@ -654,7 +804,7 @@ class UCSFPDGMLatentH5Converter:
         g = w.file.create_group("priors")
         g.attrs["description"] = (
             "Reserved placeholder for prior maps (vessel, cellularity, perfusion, "
-            "susceptibility, ...). Empty in latent v0.1.0 — future routines append "
+            "susceptibility, ...). Empty in latent v2.0.0 — future routines append "
             "datasets here with their own provenance attrs."
         )
         g.attrs["schema_version"] = UCSF_PDGM_LATENT_SCHEMA_VERSION

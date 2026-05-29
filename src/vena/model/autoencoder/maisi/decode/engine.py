@@ -21,7 +21,7 @@ import torch
 
 from ..exceptions import EncodeOOMError, ShapeContractError
 from ..loader import AutoencoderHandle
-from ..preprocessing import DepthPad, crop_to_original
+from ..preprocessing import CropPadSpec, DepthPad, crop_to_original
 
 logger = logging.getLogger(__name__)
 
@@ -74,13 +74,60 @@ class MaisiDecoder:
     def decode(
         self,
         z: torch.Tensor,
-        pad: DepthPad,
+        pad: DepthPad | None = None,
+        crop_spec: CropPadSpec | None = None,
         mode: Literal["auto", "full", "sliding"] = "auto",
     ) -> DecodeResult:
-        """Decode a MAISI latent batch to image space."""
+        """Decode a MAISI latent batch to image space.
+
+        Parameters
+        ----------
+        z : torch.Tensor
+            Shape ``(B, C, h, w, d)`` in MAISI latent space.
+        pad : DepthPad | None
+            Legacy depth-pad metadata. When provided (and ``crop_spec`` is
+            ``None``), :func:`crop_to_original` restores the original depth.
+        crop_spec : CropPadSpec | None
+            When provided, decode to box space ``(B, 1, *target_shape)`` and
+            return the decoded box AS-IS (no inversion to native). QC and
+            exhaustive-val compare in box space. Mutually exclusive with
+            ``pad``; if both are provided ``crop_spec`` takes precedence.
+        mode : {"auto", "full", "sliding"}
+            Inference strategy; same semantics as the encoder.
+        """
         if z.ndim != 5:
             raise ShapeContractError(f"decode expects (B,C,h,w,d); got {tuple(z.shape)}")
         z = z.to(self.handle.device, dtype=torch.float32, non_blocking=True)
+
+        if crop_spec is not None:
+            # Box path: decode straight to box volume; no inversion.
+            if mode == "full":
+                return DecodeResult(self._full(z), "full")
+            if mode == "sliding":
+                return DecodeResult(self._sliding(z), "sliding")
+            try:
+                return DecodeResult(self._full(z), "full")
+            except torch.cuda.OutOfMemoryError:
+                logger.warning(
+                    "MAISI decode OOM on full-volume latent %s (box path); retrying via sliding-window roi=%s",
+                    tuple(z.shape),
+                    self.sliding_roi,
+                )
+                torch.cuda.empty_cache()
+            try:
+                return DecodeResult(self._sliding(z), "sliding")
+            except torch.cuda.OutOfMemoryError as exc:
+                torch.cuda.empty_cache()
+                raise EncodeOOMError(
+                    f"sliding-window decode OOM at roi={self.sliding_roi}; "
+                    f"reduce roi_size or downsample the latent batch"
+                ) from exc
+
+        # Legacy depth-pad path. Require pad to be provided.
+        if pad is None:
+            raise ValueError(
+                "decode: either crop_spec or pad must be provided; both are None"
+            )
 
         if mode == "full":
             x = self._full(z)

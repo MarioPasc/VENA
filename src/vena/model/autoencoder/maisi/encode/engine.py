@@ -25,7 +25,13 @@ import torch
 
 from ..exceptions import EncodeOOMError, ShapeContractError
 from ..loader import AutoencoderHandle
-from ..preprocessing import DepthPad, pad_depth_to_multiple_of, percentile_normalise
+from ..preprocessing import (
+    CropPadSpec,
+    DepthPad,
+    apply_crop_pad,
+    pad_depth_to_multiple_of,
+    percentile_normalise,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,18 +45,21 @@ class EncodeResult:
     Attributes
     ----------
     latent : torch.Tensor
-        Shape ``(B, latent_channels, H/4, W/4, D'/4)`` where ``D'`` is the
-        depth-padded value.
-    pad : DepthPad
-        Depth-pad metadata; required by :class:`MaisiDecoder` to restore the
-        original ``D``.
+        Shape ``(B, latent_channels, H/4, W/4, D'/4)``.
+    pad : DepthPad | None
+        Depth-pad metadata when the legacy depth-pad path was used. ``None``
+        when the crop-box path was used.
+    crop : CropPadSpec | None
+        Crop/pad spec when the crop-box path was used. ``None`` when the
+        legacy depth-pad path was used.
     inference_mode : str
         ``"full"`` or ``"sliding"``; round-tripped into H5 attrs.
     """
 
     latent: torch.Tensor
-    pad: DepthPad
+    pad: DepthPad | None
     inference_mode: InferenceMode
+    crop: CropPadSpec | None = None
 
 
 class MaisiEncoder:
@@ -89,6 +98,7 @@ class MaisiEncoder:
         self,
         x: torch.Tensor,
         mode: Literal["auto", "full", "sliding"] = "auto",
+        crop_spec: CropPadSpec | None = None,
         normalise: bool = True,
     ) -> EncodeResult:
         """Encode an image batch to the MAISI latent.
@@ -102,6 +112,11 @@ class MaisiEncoder:
             ``"auto"`` (default) tries full-volume and falls back to sliding
             window on OOM. ``"full"`` and ``"sliding"`` force a path; no
             fallback is attempted.
+        crop_spec : CropPadSpec | None
+            When provided, crop/pad ``x`` to the common brain-centred box
+            defined by ``spec.target_shape`` before encoding. This replaces
+            the legacy depth-pad path. When ``None``, the legacy
+            :func:`pad_depth_to_multiple_of` path is used unchanged.
         normalise : bool
             Apply :func:`percentile_normalise` first. Disable only if the
             caller already normalised (e.g. when re-encoding from a cached
@@ -112,6 +127,44 @@ class MaisiEncoder:
                 f"encode expects (B,1,H,W,D); got {tuple(x.shape)}"
             )
         x = x.to(self.handle.device, dtype=torch.float32, non_blocking=True)
+
+        if crop_spec is not None:
+            # Crop-box path: map native volume onto the fixed brain box first,
+            # then normalise over the (already brain-containing) box region.
+            x = apply_crop_pad(x, crop_spec)
+            if normalise:
+                x = percentile_normalise(
+                    x,
+                    lower=self.percentile_lower,
+                    upper=self.percentile_upper,
+                    foreground_only=self.percentile_foreground_only,
+                )
+            if mode == "full":
+                return EncodeResult(self._full(x), None, "full", crop=crop_spec)
+            if mode == "sliding":
+                return EncodeResult(self._sliding(x), None, "sliding", crop=crop_spec)
+            # auto
+            try:
+                z = self._full(x)
+                return EncodeResult(z, None, "full", crop=crop_spec)
+            except torch.cuda.OutOfMemoryError:
+                logger.warning(
+                    "MAISI encode OOM on full-volume box input %s; retrying via sliding-window roi=%s",
+                    tuple(x.shape),
+                    self.sliding_roi,
+                )
+                torch.cuda.empty_cache()
+            try:
+                z = self._sliding(x)
+                return EncodeResult(z, None, "sliding", crop=crop_spec)
+            except torch.cuda.OutOfMemoryError as exc:
+                torch.cuda.empty_cache()
+                raise EncodeOOMError(
+                    f"sliding-window encode OOM at roi={self.sliding_roi}; "
+                    f"reduce roi_size or lower the input spatial shape"
+                ) from exc
+
+        # Legacy depth-pad path (back-compat for existing tests/callers).
         if normalise:
             x = percentile_normalise(
                 x,

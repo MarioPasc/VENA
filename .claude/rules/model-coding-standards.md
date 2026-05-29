@@ -105,10 +105,13 @@ proposal wins.
     degenerates on tiny regions — the exhaustive job uses whole-volume SSIM
     instead.
 15. **Intensity-space parity is mandatory for image metrics.** A decoded
-    prediction is in the VAE `[0,1]` space (MAISI decodes to `[0,1]`, cropped back
-    to native depth). To compare against a real image, apply the *same*
-    `percentile_normalise(lower=0, upper=99.5, foreground_only=False)` the encoder
-    applied to its input. Never compare decoded `[0,1]` against raw intensities.
+    prediction is in the VAE `[0,1]` space (MAISI decodes to the box
+    `(B,1,*target_shape)`). To compare against a real image, apply the *same*
+    `percentile_normalise(lower=0, upper=99.5, foreground_only=True)` over the
+    skull-stripped brain foreground (nonzero voxels only) that the encoder applied
+    to its input — multi-cohort training and encoding always use `foreground_only=True`
+    because all stored volumes are skull-stripped. Never compare decoded `[0,1]`
+    against raw intensities or use `foreground_only=False` for skull-stripped inputs.
 
 ## Exhaustive validation (async, second GPU)
 

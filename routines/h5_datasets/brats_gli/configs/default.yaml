@@ -1,0 +1,21 @@
+# BraTS-GLI image-domain H5 cache — full conversion (schema 2.0.0).
+#
+# Output: LPS-reoriented (N, 182, 218, 182) tensors for t1pre / t1c / t2 / flair +
+# tumour seg (BraTS2023 labels {0,1,2,3}) + brain mask; per-scan crop/origin for
+# the common 192x224x192 box; CSR patient grouping (longitudinal-aware);
+# patient-ID nested CV splits.
+#
+# Runtime estimate: ~25-40 min on 8 CPU cores (1251 sessions x 5 NIfTI loads).
+
+source_root: /media/mpascual/MeningD2/GLIOMA/BRATS_GLI/PRE_OPERATIVE/BraTS2025-GLI-PRE-Challenge-TrainingData
+output_path: /media/mpascual/MeningD2/GLIOMA/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_image.h5
+
+n_jobs: 8
+crop_box: [192, 224, 192]
+test_fraction: 0.10
+n_test_min: 25
+n_folds: 5
+seed: 42
+
+overwrite: false
+log_level: INFO

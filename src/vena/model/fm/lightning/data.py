@@ -26,6 +26,7 @@ dataset will produce the matching keys (``z_<name>`` / ``prior_<name>``).
 from __future__ import annotations
 
 import logging
+import math
 import random
 from collections.abc import Sequence
 from pathlib import Path
@@ -261,3 +262,503 @@ class LatentH5DataModule(pl.LightningDataModule):
 
     def test_dataloader(self) -> DataLoader:
         return self._make_loader(self._test_ids, shuffle=False)
+
+
+# ---------------------------------------------------------------------------
+# Multi-cohort pooling
+# ---------------------------------------------------------------------------
+
+
+class MultiCohortLatentDataset(Dataset):
+    """Flat global index over a list of per-cohort ``LatentH5Dataset`` objects.
+
+    Parameters
+    ----------
+    cohorts : list[tuple[str, LatentH5Dataset]]
+        Ordered ``(cohort_name, dataset)`` pairs. The global flat index is
+        built by concatenating per-cohort indices in this order.
+    """
+
+    def __init__(self, cohorts: list[tuple[str, LatentH5Dataset]]) -> None:
+        super().__init__()
+        if not cohorts:
+            raise ValueError("MultiCohortLatentDataset requires at least one cohort")
+        self._cohort_names: list[str] = [name for name, _ in cohorts]
+        self._datasets: list[LatentH5Dataset] = [ds for _, ds in cohorts]
+
+        # Precompute cumulative offsets for O(log N) global→local mapping.
+        self._offsets: list[int] = [0]
+        for ds in self._datasets:
+            self._offsets.append(self._offsets[-1] + len(ds))
+
+    # ------------------------------------------------------------------
+    # Introspection helpers
+    # ------------------------------------------------------------------
+
+    def cohort_of(self, global_idx: int) -> str:
+        """Return the cohort name for a global index."""
+        cohort_idx, _ = self._resolve(global_idx)
+        return self._cohort_names[cohort_idx]
+
+    def cohort_ranges(self) -> list[tuple[str, int, int]]:
+        """Return ``(cohort_name, start, length)`` for each cohort."""
+        return [
+            (self._cohort_names[i], self._offsets[i], len(self._datasets[i]))
+            for i in range(len(self._datasets))
+        ]
+
+    # ------------------------------------------------------------------
+    # Dataset protocol
+    # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        return self._offsets[-1]
+
+    def __getitem__(self, global_idx: int) -> dict[str, torch.Tensor | str]:
+        cohort_idx, local_idx = self._resolve(global_idx)
+        item = self._datasets[cohort_idx][local_idx]
+        item["cohort"] = self._cohort_names[cohort_idx]
+        return item
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _resolve(self, global_idx: int) -> tuple[int, int]:
+        """Map *global_idx* to ``(cohort_idx, local_idx)``."""
+        if global_idx < 0 or global_idx >= len(self):
+            raise IndexError(
+                f"global_idx {global_idx} out of range [0, {len(self)})"
+            )
+        # Binary search over offsets.
+        lo, hi = 0, len(self._datasets) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._offsets[mid] <= global_idx:
+                lo = mid
+            else:
+                hi = mid - 1
+        cohort_idx = lo
+        local_idx = global_idx - self._offsets[cohort_idx]
+        return cohort_idx, local_idx
+
+
+class TemperatureBalancedSampler(torch.utils.data.Sampler):
+    """Temperature-balanced patient-aware sampler for multi-cohort training.
+
+    Cohort sampling probabilities are proportional to ``N_c^tau``, where
+    ``N_c`` is the number of *patients* in cohort c and ``tau`` is the
+    temperature. ``tau=0`` → uniform over cohorts; ``tau=1`` → proportional
+    to patient count.
+
+    Within each cohort a patient is drawn uniformly, then one of that
+    patient's scans is drawn uniformly — producing an unbiased per-scan
+    estimate over the cohort's distribution.
+
+    Parameters
+    ----------
+    cohort_patient_scan_indices : list[list[list[int]]]
+        Outer dimension = cohorts (same order as the ``MultiCohortLatentDataset``
+        cohorts); middle = patients; inner = that patient's GLOBAL scan indices.
+    batch_size : int
+        Number of samples per batch yielded.
+    tau : float
+        Temperature for cohort weighting.
+    seed : int
+        Base RNG seed; epoch counter is mixed in so successive epochs differ.
+    length_in_batches : int | None
+        Override the default epoch length (default: ``ceil(total_train_scans /
+        batch_size)``).
+    """
+
+    def __init__(
+        self,
+        cohort_patient_scan_indices: list[list[list[int]]],
+        batch_size: int,
+        tau: float = 0.5,
+        seed: int = 42,
+        length_in_batches: int | None = None,
+    ) -> None:
+        super().__init__()
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be ≥ 1, got {batch_size}")
+        if not cohort_patient_scan_indices:
+            raise ValueError("cohort_patient_scan_indices must be non-empty")
+
+        self._cps = cohort_patient_scan_indices
+        self.batch_size = int(batch_size)
+        self.tau = float(tau)
+        self.seed = int(seed)
+        self._epoch: int = 0
+
+        n_cohorts = len(self._cps)
+        n_patients_per_cohort = [len(patients) for patients in self._cps]
+        total_scans = sum(
+            sum(len(scans) for scans in patients)
+            for patients in self._cps
+        )
+
+        # Cohort probabilities via temperature scaling.
+        nc = np.array(n_patients_per_cohort, dtype=np.float64)
+        if self.tau == 0.0:
+            weights = np.ones(n_cohorts, dtype=np.float64)
+        else:
+            weights = nc ** self.tau
+        self._p_cohort: np.ndarray = weights / weights.sum()
+
+        if length_in_batches is not None:
+            self._length_in_batches = int(length_in_batches)
+        else:
+            self._length_in_batches = max(1, math.ceil(total_scans / self.batch_size))
+
+    def __len__(self) -> int:
+        return self._length_in_batches * self.batch_size
+
+    def set_epoch(self, epoch: int) -> None:
+        """Advance the internal epoch so successive epochs differ."""
+        self._epoch = int(epoch)
+
+    def __iter__(self):  # type: ignore[override]
+        # Mix seed and epoch so the same sampler produces different sequences
+        # across epochs while remaining fully reproducible.
+        rng = np.random.default_rng(self.seed + self._epoch * 1_000_003)
+        self._epoch += 1  # auto-advance
+
+        n_cohorts = len(self._cps)
+
+        for _ in range(self._length_in_batches):
+            batch_indices: list[int] = []
+            # Draw cohort slots for this batch.
+            # First draw min(B, n_cohorts) distinct cohorts (diversity guarantee).
+            n_distinct = min(self.batch_size, n_cohorts)
+            distinct_cohorts = list(
+                rng.choice(
+                    n_cohorts,
+                    size=n_distinct,
+                    replace=False,
+                    p=self._p_cohort,
+                )
+            )
+            cohort_slots: list[int] = distinct_cohorts
+            # Fill remaining slots with replacement.
+            remaining = self.batch_size - n_distinct
+            if remaining > 0:
+                extra = list(
+                    rng.choice(
+                        n_cohorts,
+                        size=remaining,
+                        replace=True,
+                        p=self._p_cohort,
+                    )
+                )
+                cohort_slots = cohort_slots + extra
+
+            for cohort_idx in cohort_slots:
+                patients = self._cps[cohort_idx]
+                patient_idx = int(rng.integers(0, len(patients)))
+                scans = patients[patient_idx]
+                scan_pos = int(rng.integers(0, len(scans)))
+                batch_indices.append(scans[scan_pos])
+
+            yield from batch_indices
+
+
+# ---------------------------------------------------------------------------
+# Multi-cohort LightningDataModule
+# ---------------------------------------------------------------------------
+
+
+class MultiCohortLatentDataModule(pl.LightningDataModule):
+    """LightningDataModule pooling multiple cohort latent H5s for FM training.
+
+    Reads split keys from each cohort's H5 (``splits/cv/fold_<fold>/train``,
+    ``splits/cv/fold_<fold>/val``, ``splits/test``), expands patient keys to
+    scan rows via the CSR layout, and builds a ``MultiCohortLatentDataset``
+    for train / val / test. The train loader uses ``TemperatureBalancedSampler``
+    for cohort-balanced sampling.
+
+    Parameters
+    ----------
+    registry : CorpusRegistry
+        Corpus catalogue; cv cohorts feed train/val/test; test-only cohorts
+        feed only the test split.
+    fold : int
+        CV fold index (0-based, must exist in every cv cohort's H5).
+    batch_size : int
+    tau : float
+        Temperature for cohort weighting in ``TemperatureBalancedSampler``.
+    num_workers : int
+    pin_memory : bool
+    seed : int
+    max_train_patients_per_cohort : int | None
+        If set, deterministically cap each cohort's train patient list to this
+        many (useful for smoke runs).
+    """
+
+    def __init__(
+        self,
+        registry,  # CorpusRegistry — avoid circular import at module level
+        fold: int = 0,
+        batch_size: int = 2,
+        tau: float = 0.5,
+        num_workers: int = 2,
+        pin_memory: bool = True,
+        seed: int = 42,
+        max_train_patients_per_cohort: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.registry = registry
+        self.fold = int(fold)
+        self.batch_size = int(batch_size)
+        self.tau = float(tau)
+        self.num_workers = int(num_workers)
+        self.pin_memory = bool(pin_memory)
+        self.seed = int(seed)
+        self.max_train_patients_per_cohort = max_train_patients_per_cohort
+
+        self._train_ds: MultiCohortLatentDataset | None = None
+        self._val_ds: MultiCohortLatentDataset | None = None
+        self._test_ds: MultiCohortLatentDataset | None = None
+        # Per-cohort patient→[global_indices] for the sampler.
+        self._train_patient_scan_indices: list[list[list[int]]] = []
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _decode_ids(ds: "h5py.Dataset") -> list[str]:
+        return [b.decode() if isinstance(b, bytes) else str(b) for b in ds[:]]
+
+    @staticmethod
+    def _expand_patients_to_scans(
+        offsets: "np.ndarray",
+        keys: list[str],
+        ids: list[str],
+        patient_keys: list[str],
+    ) -> tuple[list[str], list[list[int]]]:
+        """Expand patient keys to scan-level ids and local-scan-index groups.
+
+        Parameters
+        ----------
+        offsets : np.ndarray
+            CSR offsets array, shape ``(n_patients+1,)``.
+        keys : list[str]
+            Patient keys in CSR order, length ``n_patients``.
+        ids : list[str]
+            All scan ids in the H5, length ``n_scans``.
+        patient_keys : list[str]
+            Requested patient keys (subset of ``keys``).
+
+        Returns
+        -------
+        scan_ids : list[str]
+            Scan ids for the requested patients (order: patients then scans
+            within each patient).
+        patient_to_local_indices : list[list[int]]
+            For each patient in ``patient_keys``, the LOCAL scan indices
+            (into ``scan_ids``) belonging to that patient.
+        """
+        key_to_pos: dict[str, int] = {k: i for i, k in enumerate(keys)}
+        missing = [pk for pk in patient_keys if pk not in key_to_pos]
+        if missing:
+            raise KeyError(
+                f"patient keys not found in CSR: {missing[:5]}"
+                + (" ..." if len(missing) > 5 else "")
+            )
+
+        scan_ids: list[str] = []
+        patient_to_local: list[list[int]] = []
+        for pk in patient_keys:
+            pos = key_to_pos[pk]
+            start, end = int(offsets[pos]), int(offsets[pos + 1])
+            local_start = len(scan_ids)
+            for row in range(start, end):
+                scan_ids.append(ids[row])
+            patient_to_local.append(list(range(local_start, len(scan_ids))))
+
+        return scan_ids, patient_to_local
+
+    def _open_cohort_h5(self, latent_h5: "Path") -> "h5py.File":
+        return h5py.File(latent_h5, "r", swmr=True)
+
+    # ------------------------------------------------------------------
+    # setup
+    # ------------------------------------------------------------------
+
+    def setup(self, stage: str | None = None) -> None:  # noqa: C901
+        from vena.data.registry.models import CorpusRegistry  # local import
+
+        train_cohort_datasets: list[tuple[str, LatentH5Dataset]] = []
+        val_cohort_datasets: list[tuple[str, LatentH5Dataset]] = []
+        test_cohort_datasets: list[tuple[str, LatentH5Dataset]] = []
+        self._train_patient_scan_indices = []
+
+        rng_subsample = np.random.default_rng(self.seed)
+
+        # --- cv cohorts (contribute train/val/test) ---
+        for cohort in self.registry.cv_cohorts():
+            with self._open_cohort_h5(cohort.latent_h5) as f:
+                ids = self._decode_ids(f["ids"])
+                offsets = f["patients/offsets"][:]
+                keys = self._decode_ids(f["patients/keys"])
+                train_patient_keys = self._decode_ids(
+                    f[f"splits/cv/fold_{self.fold}/train"]
+                )
+                val_patient_keys = self._decode_ids(
+                    f[f"splits/cv/fold_{self.fold}/val"]
+                )
+                test_patient_keys = self._decode_ids(f["splits/test"])
+
+            # Optional cap for smoke runs.
+            if (
+                self.max_train_patients_per_cohort is not None
+                and len(train_patient_keys) > self.max_train_patients_per_cohort
+            ):
+                chosen = rng_subsample.choice(
+                    len(train_patient_keys),
+                    size=self.max_train_patients_per_cohort,
+                    replace=False,
+                )
+                train_patient_keys = [train_patient_keys[int(i)] for i in sorted(chosen)]
+                logger.info(
+                    "%s: capped train patients to %d",
+                    cohort.name,
+                    self.max_train_patients_per_cohort,
+                )
+
+            # Expand patients → scan ids and local index groups.
+            train_scan_ids, train_p2l = self._expand_patients_to_scans(
+                offsets, keys, ids, train_patient_keys
+            )
+            val_scan_ids, _ = self._expand_patients_to_scans(
+                offsets, keys, ids, val_patient_keys
+            )
+            test_scan_ids, _ = self._expand_patients_to_scans(
+                offsets, keys, ids, test_patient_keys
+            )
+
+            logger.info(
+                "%s: train=%d patients / %d scans | val=%d patients / %d scans | "
+                "test=%d patients / %d scans",
+                cohort.name,
+                len(train_patient_keys),
+                len(train_scan_ids),
+                len(val_patient_keys),
+                len(val_scan_ids),
+                len(test_patient_keys),
+                len(test_scan_ids),
+            )
+
+            # Build per-cohort datasets.
+            train_ds = LatentH5Dataset(cohort.latent_h5, train_scan_ids)
+            val_ds = LatentH5Dataset(cohort.latent_h5, val_scan_ids)
+            test_ds = LatentH5Dataset(cohort.latent_h5, test_scan_ids)
+
+            train_cohort_datasets.append((cohort.name, train_ds))
+            val_cohort_datasets.append((cohort.name, val_ds))
+            test_cohort_datasets.append((cohort.name, test_ds))
+
+            # Build global scan indices for the sampler.
+            # At this point, the train MultiCohortLatentDataset is not yet
+            # assembled, so we accumulate local indices and resolve them to
+            # global indices after building the train dataset.
+            self._train_patient_scan_indices.append(train_p2l)
+
+        # --- test-only cohorts (contribute to test only) ---
+        for cohort in self.registry.test_cohorts():
+            with self._open_cohort_h5(cohort.latent_h5) as f:
+                ids = self._decode_ids(f["ids"])
+                offsets = f["patients/offsets"][:]
+                keys = self._decode_ids(f["patients/keys"])
+                # Use all patients in the H5 (no train split for test-only).
+                all_patient_keys = list(keys)
+
+            all_scan_ids, _ = self._expand_patients_to_scans(
+                offsets, keys, ids, all_patient_keys
+            )
+            logger.info(
+                "%s (test-only): %d patients / %d scans",
+                cohort.name,
+                len(all_patient_keys),
+                len(all_scan_ids),
+            )
+            test_ds = LatentH5Dataset(cohort.latent_h5, all_scan_ids)
+            test_cohort_datasets.append((cohort.name, test_ds))
+
+        if not train_cohort_datasets:
+            raise RuntimeError("No cv cohorts in registry; cannot build train dataset.")
+
+        # Assemble multi-cohort datasets.
+        self._train_ds = MultiCohortLatentDataset(train_cohort_datasets)
+        self._val_ds = MultiCohortLatentDataset(val_cohort_datasets)
+        self._test_ds = MultiCohortLatentDataset(test_cohort_datasets)
+
+        # Resolve local scan indices → global scan indices for the sampler.
+        # The offsets of train_cohort_datasets in the assembled dataset:
+        #   cohort i starts at self._train_ds._offsets[i]
+        resolved: list[list[list[int]]] = []
+        for cohort_idx, p2l in enumerate(self._train_patient_scan_indices):
+            cohort_global_offset = self._train_ds._offsets[cohort_idx]
+            global_p2l = [
+                [cohort_global_offset + local for local in patient_locals]
+                for patient_locals in p2l
+            ]
+            resolved.append(global_p2l)
+        self._train_patient_scan_indices = resolved
+
+        logger.info(
+            "MultiCohortLatentDataModule ready: train=%d scans, val=%d scans, "
+            "test=%d scans across %d cv cohort(s)",
+            len(self._train_ds),
+            len(self._val_ds),
+            len(self._test_ds),
+            len(self.registry.cv_cohorts()),
+        )
+
+    # ------------------------------------------------------------------
+    # DataLoaders
+    # ------------------------------------------------------------------
+
+    def train_dataloader(self) -> DataLoader:
+        assert self._train_ds is not None, "call setup() first"
+        sampler = TemperatureBalancedSampler(
+            cohort_patient_scan_indices=self._train_patient_scan_indices,
+            batch_size=self.batch_size,
+            tau=self.tau,
+            seed=self.seed,
+        )
+        return DataLoader(
+            self._train_ds,
+            batch_size=self.batch_size,
+            sampler=sampler,
+            drop_last=True,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            worker_init_fn=_seed_worker if self.num_workers > 0 else None,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        assert self._val_ds is not None, "call setup() first"
+        return DataLoader(
+            self._val_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            worker_init_fn=_seed_worker if self.num_workers > 0 else None,
+        )
+
+    def test_dataloader(self) -> DataLoader:
+        assert self._test_ds is not None, "call setup() first"
+        return DataLoader(
+            self._test_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            worker_init_fn=_seed_worker if self.num_workers > 0 else None,
+        )

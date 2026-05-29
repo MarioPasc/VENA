@@ -1,20 +1,23 @@
-# UCSF-PDGM image-domain H5 cache — full conversion (v0).
+# UCSF-PDGM image-domain H5 cache — full conversion (schema 2.0.0).
 #
-# Output: stacked (N, 240, 240, 155) tensors for t1pre / t1c / t2 / flair +
-# tumour seg; metadata columns; patient-ID-based nested CV splits (50 held-out
-# test + 5-fold CV stratified by WHO grade on the remaining 445 patients).
+# Output: native-LPS (N, 240, 240, 155) tensors for t1pre / t1c / t2 / flair +
+# tumour seg + brain mask; per-scan crop/origin for the common 192x224x192 box;
+# trivial CSR patient grouping; metadata columns; patient-ID nested CV splits
+# under a per-cohort test quota (max(25, ceil(0.10*N)) held out, here 50).
 #
-# Runtime estimate: ~15-25 min on 8 CPU cores (495 patients × 5 NIfTI loads).
+# Runtime estimate: ~15-25 min on 8 CPU cores (495 patients x 5 NIfTI loads).
 
 source_root: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/source
 metadata_csv: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/metadata/UCSF-PDGM-metadata_v5.csv
 output_path: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_image.h5
 
-n_jobs: 1
-n_test: 50
+n_jobs: 8
+crop_box: [192, 224, 192]
+test_fraction: 0.10
+n_test_min: 25
 n_folds: 5
 seed: 42
 stratify_by: "WHO CNS Grade"
 
-overwrite: false
+overwrite: true
 log_level: INFO

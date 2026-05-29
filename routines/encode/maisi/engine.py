@@ -38,7 +38,8 @@ from vena.model.autoencoder.maisi import load_autoencoder
 from vena.model.autoencoder.maisi.decode import MaisiDecoder
 from vena.model.autoencoder.maisi.encode import MaisiEncoder, get_downsampler
 from vena.model.autoencoder.maisi.preprocessing import (
-    DepthPad,
+    CropPadSpec,
+    apply_crop_pad,
     percentile_normalise,
 )
 
@@ -144,11 +145,11 @@ class EncodeMaisiRoutineConfig(BaseModel):
     precision_mode: str = "autocast"
     autoencoder_norm_float16: bool | None = None  # None → resolved from precision_mode
 
-    # Intensity-normalisation knobs (detail-preserving preset uses
-    # foreground_only=True and upper=99.95).
+    # Intensity-normalisation knobs. MAISI's VAE_Transform uses upper=99.5;
+    # foreground_only=True is the correct default for skull-stripped volumes.
     percentile_lower: float = 0.0
     percentile_upper: float = 99.5
-    percentile_foreground_only: bool = False
+    percentile_foreground_only: bool = True
 
     limit: int | None = None
     patient_ids: list[str] | None = None
@@ -465,13 +466,13 @@ class EncodeMaisiRoutineEngine:
             [g for _, _, g in selected],
         )
 
-        pad = self._depth_pad()
+        crop_spec_map: dict[str, CropPadSpec] = {}
         rows: list[RoundtripRow] = self._decode_rows(
             latent_h5=latent_h5,
             decoder=decoder,
             selected=selected,
             modalities=cfg.roundtrip.modalities,
-            pad=pad,
+            crop_spec_map=crop_spec_map,
         )
         if not rows:
             logger.warning("Roundtrip QC: no rows produced; skipping figure/CSV")
@@ -528,10 +529,21 @@ class EncodeMaisiRoutineEngine:
         self,
         latent_h5: Path,
     ) -> list[tuple[str, int, int]]:
+        """Return ``[(pid, row_idx, who_grade), ...]`` for the roundtrip QC.
+
+        When ``metadata/who_grade`` is absent (e.g. BraTS-GLI), all grades
+        are reported as ``-1`` and the grade-stratified fallback selects the
+        first ``n_patients`` rows instead.
+        """
         cfg = self.cfg
         with h5py.File(latent_h5, "r") as f:
             ids = [v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in f["ids"][:]]
-            grades = np.asarray(f["metadata/who_grade"][:], dtype=np.int8)
+            n = len(ids)
+            if "metadata/who_grade" in f:
+                grades = np.asarray(f["metadata/who_grade"][:], dtype=np.int8)
+            else:
+                grades = np.full(n, -1, dtype=np.int8)
+
         if cfg.patient_ids is not None:
             id_to_row = {pid: i for i, pid in enumerate(ids)}
             out: list[tuple[str, int, int]] = []
@@ -542,24 +554,58 @@ class EncodeMaisiRoutineEngine:
                 row = id_to_row[pid]
                 out.append((pid, row, int(grades[row])))
             return out
-        # Fallback: one patient per unique WHO grade.
+
+        # Fallback: one patient per unique WHO grade (or first N when grade unavailable).
         unique_grades = sorted({int(g) for g in grades if int(g) >= 0})
         rng = np.random.default_rng(cfg.seed)
         out = []
-        for g in unique_grades:
-            candidates = [i for i, gg in enumerate(grades) if int(gg) == g]
-            pick = int(rng.choice(candidates))
-            out.append((ids[pick], pick, g))
+        if unique_grades:
+            for g in unique_grades:
+                candidates = [i for i, gg in enumerate(grades) if int(gg) == g]
+                pick = int(rng.choice(candidates))
+                out.append((ids[pick], pick, g))
+        else:
+            # No grade info: pick first min(n_patients or 4, n) rows.
+            cap = cfg.roundtrip.n_patients if cfg.roundtrip.n_patients is not None else 4
+            for i in range(min(cap, n)):
+                out.append((ids[i], i, -1))
         if cfg.roundtrip.n_patients is not None:
             out = out[: cfg.roundtrip.n_patients]
         return out
 
-    def _depth_pad(self) -> DepthPad:
-        cfg = self.cfg
-        depth = UCSF_PDGM_IMAGE_NATIVE_SHAPE[-1]
-        rem = depth % cfg.depth_pad_base
-        after = 0 if rem == 0 else (cfg.depth_pad_base - rem)
-        return DepthPad(before=0, after=after, original_depth=depth, padded_depth=depth + after)
+    @staticmethod
+    def _build_crop_spec(latent_h5: Path, pid: str) -> CropPadSpec:
+        """Reconstruct the per-patient :class:`CropPadSpec` from the latent H5.
+
+        Reads ``crop/origin``, the native image shape, and ``crop_box`` from
+        the source image H5 referenced by the latent H5's root attr.
+        """
+        import json as _json
+
+        with h5py.File(latent_h5, "r") as f:
+            src_path = Path(str(f.attrs["source_image_h5_path"]))
+            crop_box_json = str(f.attrs.get("crop_box_json", f.attrs.get("crop_box", "null")))
+
+        box: tuple[int, int, int] = tuple(_json.loads(crop_box_json))  # type: ignore[assignment]
+
+        with h5py.File(src_path, "r") as src:
+            all_ids = [
+                v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+                for v in src["ids"][:]
+            ]
+            src_row = all_ids.index(pid)
+            crop_origin: tuple[int, int, int] = tuple(  # type: ignore[assignment]
+                int(v) for v in src["crop/origin"][src_row]
+            )
+            # Native shape from the first image dataset in the source.
+            first_ds = next(iter(src["images"].values()))
+            native_shape: tuple[int, int, int] = tuple(first_ds.shape[1:])  # type: ignore[assignment]
+
+        return CropPadSpec(
+            crop_origin=crop_origin,
+            native_shape=native_shape,
+            target_shape=box,
+        )
 
     def _decode_rows(
         self,
@@ -567,22 +613,36 @@ class EncodeMaisiRoutineEngine:
         decoder: MaisiDecoder,
         selected: list[tuple[str, int, int]],
         modalities: list[str],
-        pad: DepthPad,
+        crop_spec_map: dict[str, CropPadSpec] | None = None,
     ) -> list[RoundtripRow]:
+        """Decode the selected rows and return roundtrip rows in box space."""
         cfg = self.cfg
         rows: list[RoundtripRow] = []
         with h5py.File(latent_h5, "r") as f:
             for pid, idx, grade in selected:
-                centroid = self._tumor_centroid(f, pid)
+                # Build crop spec for this patient (cache in caller's map).
+                if crop_spec_map is not None and pid in crop_spec_map:
+                    spec = crop_spec_map[pid]
+                else:
+                    try:
+                        spec = self._build_crop_spec(latent_h5, pid)
+                    except Exception as exc:
+                        logger.warning("Could not build crop spec for %s: %s; skipping", pid, exc)
+                        continue
+                    if crop_spec_map is not None:
+                        crop_spec_map[pid] = spec
+
+                centroid = self._tumor_centroid_box(spec)
                 for mod in modalities:
                     if mod not in cfg.modalities:
                         logger.warning("decode row: modality %s not encoded; skipping", mod)
                         continue
                     z = np.asarray(f[f"latents/{mod}"][idx], dtype=np.float32)
                     z_t = torch.from_numpy(z).unsqueeze(0).to(decoder.handle.device)
-                    rec = decoder.decode(z_t, pad=pad).image
+                    # Box path: decode returns box volume directly.
+                    rec = decoder.decode(z_t, crop_spec=spec).image
                     rec_np = rec[0, 0].detach().to("cpu", dtype=torch.float32).numpy()
-                    src = self._read_normalised_source(latent_h5, pid, mod)
+                    src = self._read_normalised_source(latent_h5, pid, mod, spec)
                     if src.shape != rec_np.shape:
                         raise RuntimeError(
                             f"shape mismatch {pid}/{mod}: src={src.shape} rec={rec_np.shape}"
@@ -671,9 +731,20 @@ class EncodeMaisiRoutineEngine:
     ) -> dict[int, list[str]]:
         """Sample ``n_per_grade`` patient IDs per requested WHO grade from
         the *source image H5*. Returns ``{grade: [ids...]}``; grades that
-        are not present in the cohort yield an empty list."""
+        are not present in the cohort yield an empty list.
+
+        When ``metadata/who_grade`` is absent (e.g. BraTS-GLI), returns
+        ``{}`` (empty dict) and logs a warning — the stabilization pass is
+        effectively skipped for that cohort.
+        """
         with h5py.File(cfg.source_image_h5, "r") as f:
             ids = [v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in f["ids"][:]]
+            if "metadata/who_grade" not in f:
+                logger.warning(
+                    "source image H5 has no metadata/who_grade; "
+                    "stabilization stratification is unavailable — returning empty."
+                )
+                return {}
             grades = np.asarray(f["metadata/who_grade"][:], dtype=np.int8)
         rng = np.random.default_rng(cfg.stabilization.seed)
         out: dict[int, list[str]] = {}
@@ -707,7 +778,10 @@ class EncodeMaisiRoutineEngine:
             latent_ids = [
                 v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in f["ids"][:]
             ]
-            grades_in_latent = np.asarray(f["metadata/who_grade"][:], dtype=np.int8)
+            if "metadata/who_grade" in f:
+                grades_in_latent = np.asarray(f["metadata/who_grade"][:], dtype=np.int8)
+            else:
+                grades_in_latent = np.full(len(latent_ids), -1, dtype=np.int8)
         row_of = {pid: i for i, pid in enumerate(latent_ids)}
         selected: list[tuple[str, int, int]] = []
         for pid in all_ids:
@@ -723,13 +797,13 @@ class EncodeMaisiRoutineEngine:
             sorted({g for _, _, g in selected}),
         )
 
-        pad = self._depth_pad()
+        crop_spec_map: dict[str, CropPadSpec] = {}
         rows = self._decode_rows(
             latent_h5=latent_path,
             decoder=decoder,
             selected=selected,
             modalities=cfg.stabilization.modalities,
-            pad=pad,
+            crop_spec_map=crop_spec_map,
         )
 
         # Raw per-(patient, modality) metrics.
@@ -829,30 +903,29 @@ class EncodeMaisiRoutineEngine:
             raise RuntimeError(f"patient {pid!r} not in source image H5") from exc
 
     @staticmethod
-    def _tumor_centroid(f: h5py.File, pid: str) -> tuple[int, int, int]:
-        # Centroid from the *source image H5*: latent has only a soft mask.
-        # Recover via the source path stored in the latent H5 attrs.
-        src_path = Path(str(f.attrs["source_image_h5_path"]))
-        if not src_path.is_file():
-            # Fall back to volume centre.
-            return (
-                UCSF_PDGM_IMAGE_NATIVE_SHAPE[0] // 2,
-                UCSF_PDGM_IMAGE_NATIVE_SHAPE[1] // 2,
-                UCSF_PDGM_IMAGE_NATIVE_SHAPE[2] // 2,
-            )
-        with h5py.File(src_path, "r") as src:
-            src_row = EncodeMaisiRoutineEngine._source_row_for_pid(src, pid)
-            seg = np.asarray(src["masks/tumor"][src_row])
-        coords = np.argwhere(seg > 0)
-        if coords.size == 0:
-            return tuple(s // 2 for s in seg.shape)  # type: ignore[return-value]
-        c = coords.mean(axis=0).astype(int)
-        return (int(c[0]), int(c[1]), int(c[2]))
+    def _tumor_centroid_box(spec: CropPadSpec) -> tuple[int, int, int]:
+        """Return the centre of the crop box as the (approximate) tumour centroid.
 
-    def _read_normalised_source(self, latent_h5: Path, pid: str, modality: str) -> np.ndarray:
-        """Re-percentile-normalise the source image so it matches decoder
-        output range. Uses the same normalisation knobs as the encoder so
-        the reconstruction comparison is apples-to-apples."""
+        In box space we no longer have easy access to the native segmentation
+        centroid without re-reading the source H5. For QC slice selection the
+        box centre is a safe, cheap fallback — the tumour is expected to be
+        near the box centre by construction of the brain-centred crop.
+        """
+        return (
+            spec.target_shape[0] // 2,
+            spec.target_shape[1] // 2,
+            spec.target_shape[2] // 2,
+        )
+
+    def _read_normalised_source(
+        self, latent_h5: Path, pid: str, modality: str, spec: CropPadSpec
+    ) -> np.ndarray:
+        """Crop and normalise the native source image to box space.
+
+        Applies :func:`apply_crop_pad` with ``spec`` then
+        :func:`percentile_normalise` so the box-space normalised source is
+        directly comparable against the decoded box output.
+        """
         cfg = self.cfg
         with h5py.File(latent_h5, "r") as f:
             src_path = Path(str(f.attrs["source_image_h5_path"]))
@@ -860,8 +933,10 @@ class EncodeMaisiRoutineEngine:
             src_row = self._source_row_for_pid(src, pid)
             arr = np.asarray(src[f"images/{modality}"][src_row], dtype=np.float32)
         t = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
+        # Crop to box first, then normalise over the box region.
+        t_box = apply_crop_pad(t, spec)
         return percentile_normalise(
-            t,
+            t_box,
             lower=cfg.percentile_lower,
             upper=cfg.percentile_upper,
             foreground_only=cfg.percentile_foreground_only,

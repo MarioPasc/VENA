@@ -33,7 +33,11 @@ import h5py
 import numpy as np
 import torch
 
-from vena.model.autoencoder.maisi.preprocessing import percentile_normalise
+from vena.model.autoencoder.maisi.preprocessing import (
+    CropPadSpec,
+    apply_crop_pad,
+    percentile_normalise,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,22 +52,24 @@ def load_real_t1c_normalised(
     *,
     percentile_lower: float = 0.0,
     percentile_upper: float = 99.5,
-    foreground_only: bool = False,
+    foreground_only: bool = True,
 ) -> torch.Tensor:
     """Load and normalise a patient's reference T1c from the image-domain H5.
 
-    The normalisation mirrors :class:`vena.model.fm....MaisiEncoder` exactly
-    (``percentile_normalise(lower=0, upper=99.5, foreground_only=False)``), so
-    the result occupies the same ``[0, 1]`` space as a VAE-decoded prediction.
+    The normalisation mirrors the MAISI encoder exactly
+    (``percentile_normalise(lower=0, upper=99.5, foreground_only=True)`` over
+    the skull-stripped brain foreground), so the decoded prediction (already in
+    ``[0, 1]``) and the reference live in the same intensity space.
 
     Parameters
     ----------
     image_h5 : Path | str
-        Path to ``UCSFPDGM_image.h5`` (``images/t1c`` raw intensities, ``ids``).
+        Path to the cohort's image H5 (``images/t1c`` raw intensities, ``ids``).
     patient_id : str
         Patient ID as found under ``/ids``.
     percentile_lower, percentile_upper, foreground_only : float, float, bool
-        Forwarded to :func:`percentile_normalise`; defaults match the encoder.
+        Forwarded to :func:`percentile_normalise`; defaults match the encoder
+        (foreground_only=True for skull-stripped volumes).
 
     Returns
     -------
@@ -90,6 +96,128 @@ def load_real_t1c_normalised(
         foreground_only=foreground_only,
     )
     return norm[0, 0].contiguous()
+
+
+def load_real_t1c_box(
+    image_h5: Path | str,
+    patient_id: str,
+    crop_spec: CropPadSpec,
+    *,
+    percentile_lower: float = 0.0,
+    percentile_upper: float = 99.5,
+    foreground_only: bool = True,
+) -> torch.Tensor:
+    """Load, crop to the box, and normalise a patient's reference T1c.
+
+    Reads the native T1c from the image-domain H5, constructs the
+    ``CropPadSpec`` from the stored ``crop/origin``, then applies
+    :func:`apply_crop_pad` so the result occupies the same box space as the
+    VAE-decoded prediction. Normalisation uses ``percentile_normalise`` with
+    ``foreground_only=True`` over the skull-stripped brain — identical to the
+    encoder's input transform.
+
+    Parameters
+    ----------
+    image_h5 : Path | str
+        Path to the cohort's image H5 (schema 2.0.0: ``images/t1c``,
+        ``crop/origin`` int32 ``(N, 3)``, root attr ``crop_box`` JSON list).
+    patient_id : str
+        Patient ID (matched via ``/ids``).
+    crop_spec : CropPadSpec
+        Pre-built crop geometry (caller reads ``crop/origin`` and ``crop_box``
+        from the H5 and passes them here). Separating this from the H5 read
+        keeps the helper pure and unit-testable.
+    percentile_lower, percentile_upper, foreground_only : float, float, bool
+        Forwarded to :func:`percentile_normalise`.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(*crop_spec.target_shape,)`` float32 in ``[0, 1]``.
+
+    Raises
+    ------
+    ExhaustiveValError
+        If the patient ID is absent from the image H5.
+    """
+    image_h5 = Path(image_h5)
+    with h5py.File(image_h5, "r") as f:
+        ids = [b.decode() if isinstance(b, bytes) else str(b) for b in f["ids"][:]]
+        idx_by_id = {pid: i for i, pid in enumerate(ids)}
+        if patient_id not in idx_by_id:
+            raise ExhaustiveValError(f"patient '{patient_id}' not found in {image_h5}/ids")
+        raw = f["images/t1c"][idx_by_id[patient_id]]  # (H, W, D) raw float32
+    vol = torch.from_numpy(np.ascontiguousarray(raw)).float()
+    # Crop/pad to the common box shape before normalisation so percentiles are
+    # computed over the box (consistent with the encoder path).
+    box_5d = apply_crop_pad(vol[None, None], crop_spec)  # (1, 1, *target_shape)
+    norm = percentile_normalise(
+        box_5d,
+        lower=percentile_lower,
+        upper=percentile_upper,
+        foreground_only=foreground_only,
+    )
+    return norm[0, 0].contiguous()
+
+
+def build_crop_spec_from_h5(
+    image_h5: Path | str,
+    patient_id: str,
+) -> CropPadSpec:
+    """Build a :class:`CropPadSpec` for one patient from the image-domain H5.
+
+    Reads ``crop/origin[row]`` (int32 per-axis start) and the ``crop_box``
+    root attribute (JSON-encoded ``[H, W, D]`` target shape), then infers
+    the native volume shape from ``images/t1c.shape[1:]``.
+
+    Parameters
+    ----------
+    image_h5 : Path | str
+        Path to the cohort's image H5 (schema 2.0.0).
+    patient_id : str
+        Patient ID (matched via ``/ids``).
+
+    Returns
+    -------
+    CropPadSpec
+
+    Raises
+    ------
+    ExhaustiveValError
+        If the patient ID is absent from the H5 or required fields are missing.
+    """
+    import json as _json
+
+    image_h5 = Path(image_h5)
+    with h5py.File(image_h5, "r") as f:
+        ids = [b.decode() if isinstance(b, bytes) else str(b) for b in f["ids"][:]]
+        idx_by_id = {pid: i for i, pid in enumerate(ids)}
+        if patient_id not in idx_by_id:
+            raise ExhaustiveValError(f"patient '{patient_id}' not found in {image_h5}/ids")
+        row = idx_by_id[patient_id]
+        try:
+            crop_origin = tuple(int(v) for v in f["crop/origin"][row])
+        except KeyError as exc:
+            raise ExhaustiveValError(
+                f"image H5 {image_h5} missing 'crop/origin' (schema 2.0.0 required)"
+            ) from exc
+        try:
+            crop_box_raw = f.attrs["crop_box"]
+            if isinstance(crop_box_raw, str):
+                target_shape = tuple(int(v) for v in _json.loads(crop_box_raw))
+            else:
+                target_shape = tuple(int(v) for v in crop_box_raw)
+        except KeyError as exc:
+            raise ExhaustiveValError(
+                f"image H5 {image_h5} missing 'crop_box' root attribute (schema 2.0.0 required)"
+            ) from exc
+        native_shape = tuple(int(v) for v in f["images/t1c"].shape[1:])
+
+    return CropPadSpec(
+        crop_origin=crop_origin,  # type: ignore[arg-type]
+        native_shape=native_shape,  # type: ignore[arg-type]
+        target_shape=target_shape,  # type: ignore[arg-type]
+    )
 
 
 def full_volume_psnr_ssim(

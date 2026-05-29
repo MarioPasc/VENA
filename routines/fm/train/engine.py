@@ -25,10 +25,12 @@ from typing import Any
 
 import pytorch_lightning as pl
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from vena.data.h5.shared import now_iso_utc
+from vena.data.registry import load_registry
 from vena.model.fm.lightning import FMLightningModule, LatentH5DataModule
+from vena.model.fm.lightning.data import MultiCohortLatentDataModule
 from vena.model.fm.lightning.callbacks import (
     BestCheckpointCallback,
     ExhaustiveValLauncher,
@@ -61,13 +63,27 @@ class _RunCfg(BaseModel):
 
 class _DataCfg(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    latents_h5: Path
+    latents_h5: Path | None = None
+    corpus_registry: Path | None = None
+    tau: float = 0.5
+    max_train_patients_per_cohort: int | None = None
     fold: int = 0
     batch_size: int = 1
     num_workers: int = 2
     pin_memory: bool = True
     max_train_subjects: int | None = None
     max_val_subjects: int | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> "_DataCfg":
+        has_h5 = self.latents_h5 is not None
+        has_reg = self.corpus_registry is not None
+        if has_h5 == has_reg:  # both set or neither set
+            raise ValueError(
+                "_DataCfg: exactly one of 'latents_h5' or 'corpus_registry' must be set "
+                f"(latents_h5={self.latents_h5!r}, corpus_registry={self.corpus_registry!r})"
+            )
+        return self
 
 
 class _ControlNetCfg(BaseModel):
@@ -172,6 +188,7 @@ class _ExhaustiveValCfg(BaseModel):
     nfe_levels: list[int] = Field(default_factory=lambda: [1, 2, 5, 10, 20])
     integrator: str = "euler"  # ODE integrator for sampling (registry: vena...inference.get_sampler)
     image_h5: Path | None = None
+    corpus_registry: Path | None = None
     device: str = "cuda:1"
     # Python used to launch the subprocess; defaults to the running interpreter.
     python_executable: str | None = None
@@ -302,13 +319,23 @@ class FMTrainRoutineEngine:
         """Static fields for the exhaustive-val job YAML (epoch/snapshot added later).
 
         All paths are stringified so the launcher can ``yaml.safe_dump`` them.
+        Supports both the single-cohort path (``image_h5`` + ``latents_h5``) and
+        the multi-cohort path (``corpus_registry``).
         """
         ev = cfg.exhaustive_val
-        if ev.image_h5 is None:
-            raise ValueError("exhaustive_val.enabled is true but exhaustive_val.image_h5 is null")
         if cfg.model.vae_checkpoint is None:
             raise ValueError("exhaustive_val.enabled is true but model.vae_checkpoint is null")
-        return {
+
+        # Validate source: one of corpus_registry or image_h5 must be set.
+        has_registry = ev.corpus_registry is not None
+        has_single = ev.image_h5 is not None
+        if not has_registry and not has_single:
+            raise ValueError(
+                "exhaustive_val.enabled is true but neither exhaustive_val.corpus_registry "
+                "nor exhaustive_val.image_h5 is set"
+            )
+
+        job: dict[str, Any] = {
             "stage": cfg.run.stage,
             "seed": cfg.run.seed,
             "trunk": {
@@ -326,13 +353,18 @@ class FMTrainRoutineEngine:
             "vae_checkpoint": str(cfg.model.vae_checkpoint),
             "rflow": cfg.rflow.model_dump(),
             "ema": cfg.ema.model_dump(),
-            "latents_h5": str(cfg.data.latents_h5),
-            "image_h5": str(ev.image_h5),
             "fold": cfg.data.fold,
             "nfe_levels": list(ev.nfe_levels),
             "integrator": ev.integrator,
             "n_patients": ev.n_patients,
         }
+        if has_registry:
+            job["corpus_registry"] = str(ev.corpus_registry)
+        else:
+            # Legacy single-cohort path.
+            job["latents_h5"] = str(cfg.data.latents_h5)
+            job["image_h5"] = str(ev.image_h5)
+        return job
 
     def _resolve_resume_ckpt(self, exclude_dir: Path | None = None) -> str | None:
         """Resolve ``run.resume_from`` to a checkpoint path.
@@ -396,33 +428,51 @@ class FMTrainRoutineEngine:
         # left intact on in-place resume.
         decision_path = run_dir / "decision.json"
         if not decision_path.exists():
-            decision_path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": "0.2.0",
-                        "produced_at": now_iso_utc(),
-                        "producer": "routines.fm.train:0.2.0",
-                        "run_id": run_id,
-                        "stage": cfg.run.stage,
-                    },
-                    indent=2,
-                )
-            )
+            provenance: dict[str, Any] = {
+                "schema_version": "0.2.0",
+                "produced_at": now_iso_utc(),
+                "producer": "routines.fm.train:0.2.0",
+                "run_id": run_id,
+                "stage": cfg.run.stage,
+            }
+            if cfg.data.latents_h5 is not None:
+                provenance["latents_h5"] = str(cfg.data.latents_h5)
+            if cfg.data.corpus_registry is not None:
+                provenance["corpus_registry"] = str(cfg.data.corpus_registry)
+            decision_path.write_text(json.dumps(provenance, indent=2))
 
         # Data. In-process validation is offloaded to the async second-GPU job
         # (see ExhaustiveValLauncher), so the training process runs *only*
         # training on the primary GPU; ``region_resolver``/``vae_decoder`` are
         # not needed here.
-        dm = LatentH5DataModule(
-            h5_path=cfg.data.latents_h5,
-            fold=cfg.data.fold,
-            batch_size=cfg.data.batch_size,
-            num_workers=cfg.data.num_workers,
-            pin_memory=cfg.data.pin_memory,
-            max_train_subjects=cfg.data.max_train_subjects,
-            max_val_subjects=cfg.data.max_val_subjects,
-            seed=cfg.run.seed,
-        )
+        if cfg.data.corpus_registry is not None:
+            registry = load_registry(cfg.data.corpus_registry)
+            dm = MultiCohortLatentDataModule(
+                registry=registry,
+                fold=cfg.data.fold,
+                batch_size=cfg.data.batch_size,
+                tau=cfg.data.tau,
+                num_workers=cfg.data.num_workers,
+                pin_memory=cfg.data.pin_memory,
+                seed=cfg.run.seed,
+                max_train_patients_per_cohort=cfg.data.max_train_patients_per_cohort,
+            )
+            logger.info(
+                "Using MultiCohortLatentDataModule (registry=%s, tau=%.2f)",
+                cfg.data.corpus_registry,
+                cfg.data.tau,
+            )
+        else:
+            dm = LatentH5DataModule(
+                h5_path=cfg.data.latents_h5,
+                fold=cfg.data.fold,
+                batch_size=cfg.data.batch_size,
+                num_workers=cfg.data.num_workers,
+                pin_memory=cfg.data.pin_memory,
+                max_train_subjects=cfg.data.max_train_subjects,
+                max_val_subjects=cfg.data.max_val_subjects,
+                seed=cfg.run.seed,
+            )
 
         # LightningModule (training-only: region_resolver/vae_decoder = None).
         trunk_cfg = TrunkConfig(

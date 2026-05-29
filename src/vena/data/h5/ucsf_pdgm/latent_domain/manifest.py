@@ -1,14 +1,14 @@
-"""Manifest for the UCSF-PDGM latent-domain H5 cache (v0.1.0).
+"""Manifest for the latent-domain H5 cache (schema v2.0.0).
 
-The cache mirrors the image-domain layout (one row per patient, stacked
+The cache mirrors the image-domain layout (one row per scan, stacked
 ``chunks=(1, …)`` datasets, ``vlen-str`` IDs and splits) but stores MAISI-V2
 VAE-GAN latents instead of raw intensities, plus a MAISI-space tumour mask.
 
-Dimensions are fixed by the spatial compression factor of the autoencoder
-(``4×`` along every axis) and the post-pad image shape (``240, 240, 160``):
+Dimensions are fixed by the common brain-centred crop box
+``(192, 224, 192)`` and the autoencoder's 4× spatial compression factor:
 
-* image space (after depth-pad): ``(240, 240, 160)``;
-* latent space:                  ``(60, 60, 40)`` with ``C = 4``.
+* box shape:    ``(192, 224, 192)``;
+* latent shape: ``(48, 56, 48)`` with ``C = 4``.
 
 Modalities are listed *dynamically* by the converter: the manifest is built
 at write time with the subset declared in the routine config so a v1 run
@@ -27,6 +27,13 @@ cellularity, perfusion, susceptibility). It is created as an empty group
 on every run; downstream routines append datasets and stamp their own
 provenance attrs (producing routine, sha256 of the source priors module,
 etc.).
+
+Metadata fields are cohort-specific: UCSF-PDGM carries clinical variables;
+BraTS-GLI (and other metadata-free cohorts) produce no ``metadata/*``
+datasets. Pass ``metadata_fields=[]`` for those cohorts.
+
+CSR structure (``patients/offsets``, ``patients/keys``) and ``splits/*``
+are copied verbatim from the source image H5 when encoding the full cohort.
 """
 
 from __future__ import annotations
@@ -35,15 +42,17 @@ from typing import TypedDict
 
 from vena.data.h5.shared import DatasetSpec, H5Manifest
 
-UCSF_PDGM_LATENT_SCHEMA_VERSION = "0.1.0"
+UCSF_PDGM_LATENT_SCHEMA_VERSION = "2.0.0"
 
-# Image-domain shape after end-pad to a multiple of 8 along depth; the
-# latent_domain manifest never re-validates this directly — it lives here
-# to keep the magic numbers in one place.
-UCSF_PDGM_IMAGE_NATIVE_SHAPE: tuple[int, int, int] = (240, 240, 155)
-UCSF_PDGM_IMAGE_PADDED_SHAPE: tuple[int, int, int] = (240, 240, 160)
-UCSF_PDGM_LATENT_SPATIAL: tuple[int, int, int] = (60, 60, 40)
+# Common brain-centred crop box applied to every cohort's native volumes.
+# The MAISI VAE compresses 4× along each axis.
+UCSF_PDGM_LATENT_SPATIAL: tuple[int, int, int] = (48, 56, 48)
 UCSF_PDGM_LATENT_CHANNELS: int = 4
+
+# Kept for documentation; the latent schema no longer references depth-pad.
+UCSF_PDGM_IMAGE_NATIVE_SHAPE: tuple[int, int, int] = (240, 240, 155)
+# The "padded" shape is replaced by the crop box in schema v2.
+UCSF_PDGM_IMAGE_PADDED_SHAPE: tuple[int, int, int] = (192, 224, 192)
 
 # Same MAISI integer codes table that lives in
 # src/vena/model/autoencoder/maisi/configs/modality_mapping.json. Mirrored
@@ -57,10 +66,10 @@ UCSF_PDGM_LATENT_SEQUENCE_MAP: dict[str, str] = {
     "swi": "mri_swi",
 }
 
-# Metadata columns are copied verbatim from the image H5. Keeping the list
-# here means the latent file is *self-contained* (no need to JOIN against
+# UCSF-PDGM clinical metadata. Kept as a module-level default so
+# the latent file remains self-contained for this cohort (no JOIN against
 # the image H5 to read who_grade for a downstream split-by-grade query).
-_LATENT_METADATA_FIELDS: list[dict[str, str]] = [
+_UCSF_PDGM_METADATA_FIELDS: list[dict[str, str]] = [
     {"path": "metadata/sex", "dtype": "vlen-str", "units": "dimensionless",
      "description": "Biological sex (M/F)."},
     {"path": "metadata/age", "dtype": "float32", "units": "years",
@@ -100,19 +109,28 @@ class _ModalitySpec(TypedDict):
 
 
 def _build_manifest(
+    cohort: str,
     modalities: list[str],
     mask_output_channels: int,
+    metadata_fields: list[dict[str, str]] | None = None,
 ) -> H5Manifest:
     """Build the manifest for one encoder run.
 
     Parameters
     ----------
+    cohort : str
+        Source cohort tag (e.g. ``"UCSF-PDGM"``, ``"BraTS-GLI"``).
     modalities : list[str]
         Subset of :data:`UCSF_PDGM_LATENT_SEQUENCE_MAP` keys to allocate
         latent datasets for.
     mask_output_channels : int
         Number of channels produced by the mask downsampler. Determines the
         spatial shape declared for ``masks/tumor_latent``.
+    metadata_fields : list[dict[str, str]] | None
+        Per-cohort metadata dataset specs. Each entry carries ``path``,
+        ``dtype``, ``units``, and ``description``. Pass ``None`` or ``[]``
+        for metadata-free cohorts (e.g. BraTS-GLI); those cohorts produce
+        no ``metadata/*`` datasets in the latent H5.
     """
     unknown = [m for m in modalities if m not in UCSF_PDGM_LATENT_SEQUENCE_MAP]
     if unknown:
@@ -128,7 +146,7 @@ def _build_manifest(
             dtype="vlen-str",
             kind="id",
             units="dimensionless",
-            description="Patient identifier (UCSF-PDGM-NNNN).",
+            description=f"Scan/patient identifier for cohort {cohort!r}.",
             leading_dim="n_scans",
         ),
     ]
@@ -138,11 +156,11 @@ def _build_manifest(
             DatasetSpec(
                 path=f"latents/{slug}",
                 dtype="float32",
-                kind="image",  # spatial array; reuse the "image" kind for shape validation
+                kind="image",  # spatial array; reuse "image" kind for shape validation
                 units="latent_au",
                 description=(
                     f"MAISI-V2 VAE-GAN latent of {slug} (MAISI modality slug {mapped!r}); "
-                    "encoded from depth-padded image space."
+                    "encoded from the common brain-centred crop box."
                 ),
                 leading_dim="n_scans",
             )
@@ -162,7 +180,33 @@ def _build_manifest(
         )
     )
 
-    for field in _LATENT_METADATA_FIELDS:
+    # CSR patient grouping — always present (copied from source image H5).
+    datasets.append(
+        DatasetSpec(
+            path="patients/offsets",
+            dtype="int32",
+            kind="metadata",
+            units="dimensionless",
+            description=(
+                "CSR offsets, length n_patients+1; scans of patient k are "
+                "rows [offsets[k]:offsets[k+1]]."
+            ),
+            leading_dim=None,
+        )
+    )
+    datasets.append(
+        DatasetSpec(
+            path="patients/keys",
+            dtype="vlen-str",
+            kind="id",
+            units="dimensionless",
+            description="Unique patient keys, length n_patients, in offset order.",
+            leading_dim=None,
+        )
+    )
+
+    # Cohort-specific metadata (may be empty for BraTS-GLI etc.).
+    for field in (metadata_fields or []):
         datasets.append(
             DatasetSpec(
                 path=field["path"],
@@ -174,15 +218,13 @@ def _build_manifest(
             )
         )
 
-    # ``expected_shape`` would be the latent spatial shape *plus* the leading
-    # channel axis, but H5Manifest.expected_shape applies only to image/mask
-    # kinds and assumes shape == (N, *expected). For multi-channel latents
-    # we override per-dataset via ``leading_dim`` and skip the shared
-    # spatial check by setting ``expected_shape=None`` — the converter
-    # asserts the exact (C, h, w, d) shape itself at create_stacked time.
+    # ``expected_shape`` is set to None: H5Manifest shape checks assume
+    # (N, *spatial) but latents have an extra channel axis (N, C, h, w, d).
+    # The converter asserts the exact (C, h, w, d) shape itself at
+    # create_stacked time.
     return H5Manifest(
         schema_version=UCSF_PDGM_LATENT_SCHEMA_VERSION,
-        cohort="UCSF-PDGM",
+        cohort=cohort,
         domain="latent",
         expected_shape=None,
         datasets=datasets,
@@ -193,26 +235,53 @@ def _build_manifest(
         extras={
             "latent_channels": str(UCSF_PDGM_LATENT_CHANNELS),
             "latent_spatial": str(UCSF_PDGM_LATENT_SPATIAL),
-            "image_native_shape": str(UCSF_PDGM_IMAGE_NATIVE_SHAPE),
-            "image_padded_shape": str(UCSF_PDGM_IMAGE_PADDED_SHAPE),
+            "crop_box": str(UCSF_PDGM_IMAGE_PADDED_SHAPE),
             "mask_output_channels": str(mask_output_channels),
-            "intensity_policy": "MAISI percentile [0,99.5] -> [0,1] on the encoder input.",
-            "decoding_note": "Use DepthPad(after=5) to crop the depth axis back to 155.",
+            "intensity_policy": (
+                "MAISI percentile [0, 99.5] -> [0, 1] on the brain-centred box; "
+                "foreground_only=True for skull-stripped volumes."
+            ),
+            "decoding_note": (
+                "Decode returns the box volume (192, 224, 192); compare against "
+                "the source cropped to the same box via apply_crop_pad."
+            ),
         },
     )
 
 
-# Default manifest for the canonical v1 run (four sequences, NETC/ED/ET soft mask).
+# Default manifest for the canonical UCSF-PDGM v2 run (four sequences,
+# NETC/ED/ET soft mask, full clinical metadata).
 UCSF_PDGM_LATENT_DEFAULT_MODALITIES: list[str] = ["t1pre", "t1c", "t2", "flair"]
 UCSF_PDGM_LATENT_MANIFEST: H5Manifest = _build_manifest(
+    cohort="UCSF-PDGM",
     modalities=UCSF_PDGM_LATENT_DEFAULT_MODALITIES,
     mask_output_channels=3,
+    metadata_fields=_UCSF_PDGM_METADATA_FIELDS,
 )
 
 
 def build_latent_manifest(
     modalities: list[str],
     mask_output_channels: int,
+    cohort: str = "UCSF-PDGM",
+    metadata_fields: list[dict[str, str]] | None = None,
 ) -> H5Manifest:
-    """Public wrapper around :func:`_build_manifest` for the converter."""
-    return _build_manifest(modalities=modalities, mask_output_channels=mask_output_channels)
+    """Public wrapper around :func:`_build_manifest` for the converter.
+
+    Parameters
+    ----------
+    modalities : list[str]
+        Subset of :data:`UCSF_PDGM_LATENT_SEQUENCE_MAP` keys.
+    mask_output_channels : int
+        Number of channels produced by the mask downsampler.
+    cohort : str
+        Source cohort tag; defaults to ``"UCSF-PDGM"`` for back-compat.
+    metadata_fields : list[dict[str, str]] | None
+        Per-cohort metadata specs; ``None`` or ``[]`` for metadata-free cohorts.
+    """
+    return _build_manifest(
+        cohort=cohort,
+        modalities=modalities,
+        mask_output_channels=mask_output_channels,
+        metadata_fields=metadata_fields,
+    )

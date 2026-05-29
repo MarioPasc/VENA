@@ -20,8 +20,11 @@ from typing import TypedDict
 
 from vena.data.h5.shared import DatasetSpec, H5Manifest
 
-UCSF_PDGM_IMAGE_SCHEMA_VERSION = "1.0.0"
+UCSF_PDGM_IMAGE_SCHEMA_VERSION = "2.0.0"
+# Native LPS shape, preserved verbatim. The common crop box (192,224,192) is
+# applied at encode time, not stored here; see crop/origin and crop_box attr.
 UCSF_PDGM_IMAGE_EXPECTED_SHAPE: tuple[int, int, int] = (240, 240, 155)
+UCSF_PDGM_LABEL_SYSTEM = "BraTS2021"  # tumour labels {0, 1, 2, 4}
 
 
 class MetadataFieldSpec(TypedDict):
@@ -226,6 +229,44 @@ def _build_manifest() -> H5Manifest:
             description="BraTS-style tumour labels {0=bg, 1=necrosis, 2=edema, 4=enhancing}.",
             leading_dim="n_scans",
         ),
+        DatasetSpec(
+            path="masks/brain",
+            dtype="int8",
+            kind="mask",
+            units="label",
+            description="Binary brain mask (1=brain, 0=background) from brain_segmentation.",
+            leading_dim="n_scans",
+        ),
+        DatasetSpec(
+            path="crop/origin",
+            dtype="int32",
+            kind="metadata",
+            units="voxels",
+            description=(
+                "Per-scan brain-centred start index (H,W,D) in the native LPS grid "
+                "of the common crop box (see root attr crop_box); may be negative."
+            ),
+            leading_dim="n_scans",
+        ),
+        # CSR patient grouping (trivial 1:1 for cross-sectional UCSF). Lengths are
+        # n_patients(+1), not n_scans, so leading_dim is None (validator skips the
+        # n_scans equality check).
+        DatasetSpec(
+            path="patients/offsets",
+            dtype="int32",
+            kind="metadata",
+            units="dimensionless",
+            description="CSR offsets, length n_patients+1; scans of patient k are rows [offsets[k]:offsets[k+1]].",
+            leading_dim=None,
+        ),
+        DatasetSpec(
+            path="patients/keys",
+            dtype="vlen-str",
+            kind="id",
+            units="dimensionless",
+            description="Unique patient keys, length n_patients, in offset order.",
+            leading_dim=None,
+        ),
     ]
     for entry in UCSF_PDGM_METADATA_FIELDS:
         datasets.append(
@@ -250,10 +291,11 @@ def _build_manifest() -> H5Manifest:
             "cv": "splits/cv/fold_{0..K-1}/{train,val}  vlen-str  per-fold patient IDs.",
         },
         extras={
-            "intensity_policy": "raw N4-bias-corrected intensities; normalisation deferred to dataloader.",
+            "intensity_policy": "raw N4-bias-corrected intensities; brain-only percentile norm at encode time.",
             "tumor_label_set": "BraTS21: {0, 1, 2, 4}",
             "spacing_mm": "(1.0, 1.0, 1.0)",
-            "space_convention": "LPS (matches MAISI-V2 expectations).",
+            "space_convention": "LPS (matches MAISI-V2 expectations); reoriented to LPS at write time.",
+            "crop_box_hwd": "(192, 224, 192)",
         },
     )
 

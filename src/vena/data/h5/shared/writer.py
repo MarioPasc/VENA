@@ -59,9 +59,25 @@ class H5Writer:
         ISO-8601 UTC timestamp.
     git_sha : str | None
         ``HEAD`` SHA of the producing repo, or ``None`` outside a repo.
+    extra_root_attrs : dict[str, Any] | None
+        Additional root attributes stamped on file creation, overriding the
+        schema-v2 defaults (``split_role``, ``longitudinal``, ``label_system``,
+        ``crop_box``, ``orientation``). Cohort converters pass their resolved
+        values here; other producers inherit the conservative defaults so the
+        validator's required-attr check passes uniformly.
     overwrite : bool
         Whether to unlink an existing file before opening.
     """
+
+    #: Schema-v2 root attrs every file carries; converters override via
+    #: ``extra_root_attrs``. Kept as defaults so non-cohort producers stay valid.
+    _V2_DEFAULT_ROOT_ATTRS: dict[str, Any] = {
+        "split_role": "cv",
+        "longitudinal": False,
+        "label_system": "unknown",
+        "crop_box": "null",
+        "orientation": "unknown",
+    }
 
     def __init__(
         self,
@@ -72,6 +88,7 @@ class H5Writer:
         producer: str,
         created_at: str,
         git_sha: str | None,
+        extra_root_attrs: dict[str, Any] | None = None,
         overwrite: bool = False,
     ) -> None:
         self.path = Path(path)
@@ -80,6 +97,7 @@ class H5Writer:
         self._producer = producer
         self._created_at = created_at
         self._git_sha = git_sha
+        self._extra_root_attrs = dict(extra_root_attrs or {})
         self._overwrite = overwrite
         self._f: h5py.File | None = None
 
@@ -124,6 +142,10 @@ class H5Writer:
         f.attrs["config_json"] = self._config_json
         f.attrs["manifest_json"] = self.manifest.to_json()
         f.attrs["git_sha"] = self._git_sha if self._git_sha is not None else "unknown"
+        # Schema-v2 semantic/provenance attrs: defaults, overridden per cohort.
+        merged = {**self._V2_DEFAULT_ROOT_ATTRS, **self._extra_root_attrs}
+        for key, value in merged.items():
+            f.attrs[key] = value
 
     # ------------------------------------------------------------------ alloc
 
@@ -161,11 +183,18 @@ class H5Writer:
         self._stamp_dataset_attrs(dset, spec)
         return dset
 
-    def write_vlen_str_1d(self, path: str, values: list[str]) -> h5py.Dataset:
+    def write_vlen_str_1d(
+        self,
+        path: str,
+        values: list[str],
+        *,
+        description: str = "Patient/scan identifiers.",
+    ) -> h5py.Dataset:
         """Write a 1D vlen-str dataset without manifest enforcement.
 
-        Used for splits (e.g. ``splits/test``, ``splits/cv/fold_0/train``) which
-        carry self-describing attrs but are not stacked image data.
+        Used for splits (e.g. ``splits/test``, ``splits/cv/fold_0/train``) and
+        CSR patient keys, which carry self-describing attrs but are not stacked
+        image data.
         """
         dset = self.file.create_dataset(
             path,
@@ -173,8 +202,32 @@ class H5Writer:
             dtype=_VLEN_STR,
         )
         dset.attrs["units"] = "dimensionless"
-        dset.attrs["description"] = "Patient identifiers (UCSF-PDGM-NNNN)."
+        dset.attrs["description"] = description
         dset.attrs["dtype"] = "vlen-str"
+        return dset
+
+    def write_int_1d(
+        self,
+        path: str,
+        values: NDArray[Any],
+        *,
+        dtype: str = "int32",
+        units: str = "dimensionless",
+        description: str = "",
+    ) -> h5py.Dataset:
+        """Write a 1D integer dataset (e.g. CSR ``patients/offsets``).
+
+        Outside manifest enforcement: CSR datasets have a length that is not
+        ``n_scans`` (offsets is ``n_patients + 1``, keys is ``n_patients``), so
+        they are declared with ``leading_dim=None`` and written here directly.
+        """
+        dset = self.file.create_dataset(
+            path,
+            data=np.asarray(values, dtype=np.dtype(dtype)),
+        )
+        dset.attrs["units"] = units
+        dset.attrs["description"] = description
+        dset.attrs["dtype"] = dtype
         return dset
 
     # ------------------------------------------------------------------ attrs
@@ -196,6 +249,7 @@ def open_writer(
     producer: str,
     created_at: str,
     git_sha: str | None,
+    extra_root_attrs: dict[str, Any] | None = None,
     overwrite: bool = False,
 ) -> Iterator[H5Writer]:
     """Functional alias for ``with H5Writer(...) as w:``."""
@@ -206,6 +260,7 @@ def open_writer(
         producer=producer,
         created_at=created_at,
         git_sha=git_sha,
+        extra_root_attrs=extra_root_attrs,
         overwrite=overwrite,
     )
     with w as opened:

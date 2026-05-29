@@ -1,0 +1,49 @@
+# MAISI encode — BraTS-GLI full cohort, local-workstation defaults.
+#
+# BraTS-GLI is a longitudinal cohort (multiple sessions per patient).
+# No metadata/who_grade is available, so roundtrip QC selects the first
+# 4 sessions and stabilization is disabled.
+
+source_image_h5: /media/mpascual/MeningD2/GLIOMA/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_image.h5
+autoencoder_checkpoint: /media/mpascual/Sandisk2TB/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+output_dir: artifacts/encode/maisi/brats_gli
+output_h5_path: /media/mpascual/MeningD2/GLIOMA/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_latents.h5
+
+modalities: [t1pre, t1c, t2, flair]
+device: cuda
+inference_mode: auto
+depth_pad_base: 8
+
+sliding_window:
+  roi_size: [80, 80, 32]
+  overlap: 0.4
+  mode: gaussian
+
+mask_downsampler:
+  name: per_class_avg_pool
+  params: {}
+
+percentile_foreground_only: true
+percentile_upper: 99.5
+
+limit: null
+encode_full_cohort: true
+overwrite: false
+log_level: INFO
+seed: 42
+
+roundtrip:
+  enabled: true
+  n_patients: 4
+  modalities: [t1c]
+  per_modality_figures: true
+  save_nifti: false
+
+stabilization:
+  enabled: false
+
+pca:
+  enabled: true
+  figure_filename: pca.png
+  pooling: global_avg
+  n_components: 2
