@@ -1,0 +1,102 @@
+# MAISI encode — BraTS-GLI diagnostics-only re-run on server3 (icai-server).
+#
+# Purpose
+# -------
+# The original full-cohort encode at run-dir 2026-05-29T21-11-08Z disabled
+# `roundtrip` and `stabilization` because BraTS-GLI lacks metadata/who_grade.
+# Verification of the latent H5 confirms it is fully populated (1251 patients,
+# progress/completed all True, no NaN/Inf, latent shape (1251, 4, 48, 56, 48)
+# per modality, schema 2.0.0). The latents are sound; only the diagnostics are
+# missing.
+#
+# This config reuses the engine's `resume_from_run_id` path:
+#   1. point at the existing run-dir 2026-05-29T21-11-08Z
+#   2. the converter opens the existing latent H5 in r+, validates provenance
+#      (source SHA, autoencoder SHA, modalities, runtime attrs, mask
+#      downsampler, ids order), and finds zero rows to encode (all completed)
+#   3. QC then runs roundtrip (grade-less fallback: first 4 patients with
+#      who_grade=-1) + PCA against the existing latents
+#   4. report.md and decision.json are rewritten in-place under the same run-dir
+#
+# Stabilization stays disabled — it stratifies by WHO grade and BraTS-GLI has
+# no such metadata. The engine's `_sample_stratified_ids` already returns {}
+# in that case, so leaving it enabled would only write "skipped: no_patients".
+#
+# Runtime attrs (precision_mode, percentile bounds, sliding window, mask
+# downsampler, modalities) MUST match the prior run's persisted config exactly
+# — the resume-mode provenance check in LatentH5Converter rejects mismatches.
+# These were copied verbatim from
+# /media/hddb/mario/results/vena/encode_brats_gli_maisi/LATEST/config.yaml.
+
+source_image_h5: /media/hddb/mario/data/GLIOMAS/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_image.h5
+autoencoder_checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+output_dir: /media/hddb/mario/results/vena/encode_brats_gli_maisi
+# Leave null on resume — the engine reads the prior run's persisted
+# output_h5_path. Setting it explicitly here would only risk drift.
+output_h5_path: null
+
+modalities: [t1pre, t1c, t2, flair]
+device: cuda
+inference_mode: auto
+sliding_window:
+  roi_size: [80, 80, 32]
+  overlap: 0.4
+  mode: gaussian
+depth_pad_base: 8
+mask_downsampler:
+  name: per_class_avg_pool
+  params: {}
+
+# Precision — match the prior BraTS-GLI server3 encode (fp32, no autocast).
+precision_mode: fp32
+autoencoder_norm_float16: null
+
+# Intensity normalisation — match the prior encode EXACTLY.
+percentile_lower: 0.0
+percentile_upper: 99.95
+percentile_foreground_only: true
+
+limit: null
+patient_ids: null
+overwrite: false
+log_level: INFO
+seed: 42
+
+# Resume — point at the existing run-dir. The converter sees all 1251 rows
+# completed and exits the encode loop immediately; only QC runs.
+encode_full_cohort: true
+checkpoint_every: 50
+resume_from_run_id: 2026-05-29T21-11-08Z
+
+# Diagnostics knobs — the only fields that differ from the prior config.
+# Roundtrip: grade-less cohort, so the engine's fallback picks the first
+# N patients (who_grade reported as -1 throughout). Render all 4 modalities
+# in parity with the UCSF-PDGM roundtrip section. NIfTI dump on (small —
+# 4 patients × 4 modalities × 2 files = 32 .nii.gz).
+roundtrip:
+  enabled: true
+  figure_filename: roundtrip.png
+  n_patients: 4
+  modalities: [t1pre, t1c, t2, flair]
+  per_modality_figures: true
+  save_nifti: true
+
+# Stabilization: no WHO grade → skipped path. Keep disabled so decision.json
+# does not carry a "skipped: no_patients" stub.
+stabilization:
+  enabled: false
+  n_per_grade: 10
+  grades: [1, 2, 3, 4]
+  seed: 11
+  n_bootstrap: 5000
+  ci_level: 0.95
+  set_figures: true
+  modalities: [t1pre, t1c, t2, flair]
+
+# PCA: cheap GAP over the existing latents (~5004 rows × 4 channels).
+# Re-enabled so the rewritten report.md keeps the PCA section.
+pca:
+  enabled: true
+  figure_filename: pca.png
+  pooling: global_avg
+  n_components: 2
