@@ -1,0 +1,68 @@
+# Equivariance preflight — full sweep on BraTS-GLI + UCSF-PDGM.
+#
+# Paths assume execution on server 3 (icai-server). For local-laptop smoke
+# runs prefer ``smoke.yaml`` with N=2 patients and a single transform.
+
+output_root: /media/hddb/mario/artifacts/latent_aug_equivariance
+vae_checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+
+cohorts:
+  - name: UCSF-PDGM
+    latent_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_latents.h5
+    image_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_image.h5
+  - name: BraTS-GLI
+    latent_h5: /media/hddb/mario/data/GLIOMAS/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_latents.h5
+    image_h5: /media/hddb/mario/data/GLIOMAS/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_image.h5
+
+n_patients_per_cohort: 10
+seed: 42
+device: cuda:0
+
+pass_threshold:
+  psnr_db: 35.0
+  ssim: 0.95
+
+n_slices_for_figure: 8
+figure_slice_offset: 10
+figures_per_pair: 1
+
+augmentations:
+  - name: flip_lr
+    p: 1.0
+    # FlipLR is parameterless; param_grid omitted → single default draw.
+
+  - name: translate
+    p: 1.0
+    max_voxels: 12
+    axes: [h, w, d]
+    param_grid:
+      - {shifts_img: {h:  4, w:  0, d: 0}}
+      - {shifts_img: {h:  8, w:  0, d: 0}}
+      - {shifts_img: {h:  0, w:  4, d: 0}}
+      - {shifts_img: {h:  0, w:  8, d: 0}}
+      - {shifts_img: {h:  0, w:  0, d: 4}}
+      - {shifts_img: {h:  0, w:  0, d: 8}}
+
+  - name: rotate_yaw
+    p: 1.0
+    max_deg: 5.0
+    param_grid:
+      - {deg:  2.0}
+      - {deg:  5.0}
+      - {deg: -5.0}
+
+  - name: rotate_roll
+    p: 1.0
+    max_deg: 5.0
+    param_grid:
+      - {deg:  2.0}
+      - {deg:  5.0}
+      - {deg: -5.0}
+
+  - name: gamma
+    p: 1.0
+    gamma_min: 0.8
+    gamma_max: 1.2
+    param_grid:
+      - {gamma: 0.8}
+      - {gamma: 1.2}

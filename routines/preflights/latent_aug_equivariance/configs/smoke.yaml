@@ -1,0 +1,32 @@
+# Smoke config — 2 patients per cohort, 2 transforms; for end-to-end shape
+# check on a local 8 GB GPU or a CPU-only env. Server 3 prefers default.yaml.
+
+output_root: artifacts/latent_aug_equivariance
+vae_checkpoint: /media/mpascual/Sandisk2TB/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+
+cohorts:
+  - name: UCSF-PDGM
+    latent_h5: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_latents.h5
+    image_h5: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_image.h5
+
+n_patients_per_cohort: 2
+seed: 42
+device: cuda:0
+
+pass_threshold:
+  psnr_db: 35.0
+  ssim: 0.95
+
+n_slices_for_figure: 6
+figure_slice_offset: 8
+figures_per_pair: 1
+
+augmentations:
+  - name: flip_lr
+    p: 1.0
+  - name: translate
+    p: 1.0
+    max_voxels: 4
+    axes: [h]
+    param_grid:
+      - {shifts_img: {h: 4, w: 0, d: 0}}

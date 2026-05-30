@@ -1,0 +1,23 @@
+# Runtime augmentation pipeline for the 4-epoch smoke.
+#
+# Contents are gated by the equivariance preflight at training startup:
+# every ``name`` here must appear in the preflight's
+# ``decision.json::latent_safe_augmentations`` allowlist or the loader
+# fast-fails. The pass criterion is PSNR ≥ 35 dB AND SSIM ≥ 0.95 on the
+# decoded volume.
+#
+# Provenance: produced after the UCSF-PDGM + BraTS-GLI preflight run
+# (2026-05-30), where ``translate`` was the only operator that cleared the
+# strict threshold on both cohorts. ``flip_lr`` was 0.002 SSIM under the
+# threshold (32.3 dB / 0.948); rotations failed by a large margin; gamma
+# was flagged image-domain-only. Keeping the pipeline conservative for the
+# smoke; broader operators can be admitted after a relaxed-threshold rerun
+# or after image-domain on-the-fly re-encoding.
+
+schema_version: "1.0"
+seed: 0
+augmentations:
+  - name: translate
+    p: 0.5
+    max_voxels: 8
+    axes: [h, w, d]

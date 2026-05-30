@@ -8,11 +8,11 @@ Each item is a dict::
 
     {
         "patient_id": str,
-        "z_t1pre":    Tensor (4, 60, 60, 40),
-        "z_t2":       Tensor (4, 60, 60, 40),
-        "z_flair":    Tensor (4, 60, 60, 40),
-        "z_t1c":      Tensor (4, 60, 60, 40),    # target
-        "m_wt":       Tensor (1, 60, 60, 40),    # binary WT mask
+        "z_t1pre": Tensor(4, 60, 60, 40),
+        "z_t2": Tensor(4, 60, 60, 40),
+        "z_flair": Tensor(4, 60, 60, 40),
+        "z_t1c": Tensor(4, 60, 60, 40),  # target
+        "m_wt": Tensor(1, 60, 60, 40),  # binary WT mask
     }
 
 The WT mask is derived from ``masks/tumor_latent[i]`` (3 soft NETC/ED/ET maps)
@@ -30,12 +30,16 @@ import math
 import random
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import h5py
 import numpy as np
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader, Dataset
+
+if TYPE_CHECKING:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +88,7 @@ class LatentH5Dataset(Dataset):
         latents: Sequence[str] = DEFAULT_LATENTS,
         wt_threshold: float = 0.5,
         extra_priors: Sequence[str] | None = None,
+        transform: AugmentationPipeline | None = None,
     ) -> None:
         super().__init__()
         self.h5_path = Path(h5_path)
@@ -93,6 +98,10 @@ class LatentH5Dataset(Dataset):
         self.latents: tuple[str, ...] = tuple(latents)
         self.wt_threshold = float(wt_threshold)
         self.extra_priors: tuple[str, ...] = tuple(extra_priors or ())
+        # Optional latent-space augmentation pipeline. When set, the dataset
+        # invokes it at the end of ``_read_one`` so augmentation runs inside
+        # the DataLoader worker (CPU-parallel, no GPU blocking).
+        self.transform = transform
         self._h5: h5py.File | None = None
         self._idx_by_id: dict[str, int] | None = None
 
@@ -142,6 +151,9 @@ class LatentH5Dataset(Dataset):
             arr = h5[f"priors/{prior}"][row]
             out[f"prior_{prior}"] = torch.from_numpy(np.ascontiguousarray(arr)).float()
 
+        if self.transform is not None:
+            out, _ = self.transform(out)
+
         return out
 
     def __getstate__(self) -> dict:
@@ -182,6 +194,7 @@ class LatentH5DataModule(pl.LightningDataModule):
         max_train_subjects: int | None = None,
         max_val_subjects: int | None = None,
         seed: int = 42,
+        train_transform: AugmentationPipeline | None = None,
     ) -> None:
         super().__init__()
         self.h5_path = Path(h5_path)
@@ -192,6 +205,7 @@ class LatentH5DataModule(pl.LightningDataModule):
         self.max_train_subjects = max_train_subjects
         self.max_val_subjects = max_val_subjects
         self.seed = int(seed)
+        self.train_transform = train_transform
         self._train_ids: list[str] = []
         self._val_ids: list[str] = []
         self._test_ids: list[str] = []
@@ -206,13 +220,9 @@ class LatentH5DataModule(pl.LightningDataModule):
             self._train_ids = self._decode_ids(f[f"splits/cv/fold_{self.fold}/train"])
             self._val_ids = self._decode_ids(f[f"splits/cv/fold_{self.fold}/val"])
             self._test_ids = self._decode_ids(f["splits/test"])
-        if self.max_train_subjects is not None and self.max_train_subjects < len(
-            self._train_ids
-        ):
+        if self.max_train_subjects is not None and self.max_train_subjects < len(self._train_ids):
             rng = np.random.default_rng(self.seed)
-            chosen = rng.choice(
-                len(self._train_ids), size=self.max_train_subjects, replace=False
-            )
+            chosen = rng.choice(len(self._train_ids), size=self.max_train_subjects, replace=False)
             self._train_ids = [self._train_ids[int(i)] for i in sorted(chosen)]
             logger.info(
                 "LatentH5DataModule: subsampled train to %d subjects (seed=%d)",
@@ -221,9 +231,7 @@ class LatentH5DataModule(pl.LightningDataModule):
             )
         if self.max_val_subjects is not None and self.max_val_subjects < len(self._val_ids):
             rng = np.random.default_rng(self.seed + 1)
-            chosen = rng.choice(
-                len(self._val_ids), size=self.max_val_subjects, replace=False
-            )
+            chosen = rng.choice(len(self._val_ids), size=self.max_val_subjects, replace=False)
             self._val_ids = [self._val_ids[int(i)] for i in sorted(chosen)]
             logger.info(
                 "LatentH5DataModule: subsampled val to %d subjects (seed=%d)",
@@ -238,11 +246,17 @@ class LatentH5DataModule(pl.LightningDataModule):
             len(self._test_ids),
         )
 
-    def _make_dataset(self, ids: list[str]) -> LatentH5Dataset:
-        return LatentH5Dataset(self.h5_path, ids)
+    def _make_dataset(self, ids: list[str], *, with_transform: bool = False) -> LatentH5Dataset:
+        return LatentH5Dataset(
+            self.h5_path,
+            ids,
+            transform=self.train_transform if with_transform else None,
+        )
 
     def _make_loader(self, ids: list[str], shuffle: bool) -> DataLoader:
-        dataset = self._make_dataset(ids)
+        # Augmentation is gated to the train loader so val/test metrics stay
+        # reproducible across runs (shuffle flag doubles as the train marker).
+        dataset = self._make_dataset(ids, with_transform=shuffle)
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -327,9 +341,7 @@ class MultiCohortLatentDataset(Dataset):
     def _resolve(self, global_idx: int) -> tuple[int, int]:
         """Map *global_idx* to ``(cohort_idx, local_idx)``."""
         if global_idx < 0 or global_idx >= len(self):
-            raise IndexError(
-                f"global_idx {global_idx} out of range [0, {len(self)})"
-            )
+            raise IndexError(f"global_idx {global_idx} out of range [0, {len(self)})")
         # Binary search over offsets.
         lo, hi = 0, len(self._datasets) - 1
         while lo < hi:
@@ -393,17 +405,14 @@ class TemperatureBalancedSampler(torch.utils.data.Sampler):
 
         n_cohorts = len(self._cps)
         n_patients_per_cohort = [len(patients) for patients in self._cps]
-        total_scans = sum(
-            sum(len(scans) for scans in patients)
-            for patients in self._cps
-        )
+        total_scans = sum(sum(len(scans) for scans in patients) for patients in self._cps)
 
         # Cohort probabilities via temperature scaling.
         nc = np.array(n_patients_per_cohort, dtype=np.float64)
         if self.tau == 0.0:
             weights = np.ones(n_cohorts, dtype=np.float64)
         else:
-            weights = nc ** self.tau
+            weights = nc**self.tau
         self._p_cohort: np.ndarray = weights / weights.sum()
 
         if length_in_batches is not None:
@@ -505,6 +514,7 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
         pin_memory: bool = True,
         seed: int = 42,
         max_train_patients_per_cohort: int | None = None,
+        train_transform: AugmentationPipeline | None = None,
     ) -> None:
         super().__init__()
         self.registry = registry
@@ -515,6 +525,9 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
         self.pin_memory = bool(pin_memory)
         self.seed = int(seed)
         self.max_train_patients_per_cohort = max_train_patients_per_cohort
+        # Augmentation runs on training samples only; validation / test never
+        # see augmented data so metrics remain comparable across runs.
+        self.train_transform = train_transform
 
         self._train_ds: MultiCohortLatentDataset | None = None
         self._val_ds: MultiCohortLatentDataset | None = None
@@ -527,12 +540,12 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _decode_ids(ds: "h5py.Dataset") -> list[str]:
+    def _decode_ids(ds: h5py.Dataset) -> list[str]:
         return [b.decode() if isinstance(b, bytes) else str(b) for b in ds[:]]
 
     @staticmethod
     def _expand_patients_to_scans(
-        offsets: "np.ndarray",
+        offsets: np.ndarray,
         keys: list[str],
         ids: list[str],
         patient_keys: list[str],
@@ -579,15 +592,14 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
 
         return scan_ids, patient_to_local
 
-    def _open_cohort_h5(self, latent_h5: "Path") -> "h5py.File":
+    def _open_cohort_h5(self, latent_h5: Path) -> h5py.File:
         return h5py.File(latent_h5, "r", swmr=True)
 
     # ------------------------------------------------------------------
     # setup
     # ------------------------------------------------------------------
 
-    def setup(self, stage: str | None = None) -> None:  # noqa: C901
-        from vena.data.registry.models import CorpusRegistry  # local import
+    def setup(self, stage: str | None = None) -> None:
 
         train_cohort_datasets: list[tuple[str, LatentH5Dataset]] = []
         val_cohort_datasets: list[tuple[str, LatentH5Dataset]] = []
@@ -602,12 +614,8 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
                 ids = self._decode_ids(f["ids"])
                 offsets = f["patients/offsets"][:]
                 keys = self._decode_ids(f["patients/keys"])
-                train_patient_keys = self._decode_ids(
-                    f[f"splits/cv/fold_{self.fold}/train"]
-                )
-                val_patient_keys = self._decode_ids(
-                    f[f"splits/cv/fold_{self.fold}/val"]
-                )
+                train_patient_keys = self._decode_ids(f[f"splits/cv/fold_{self.fold}/train"])
+                val_patient_keys = self._decode_ids(f[f"splits/cv/fold_{self.fold}/val"])
                 test_patient_keys = self._decode_ids(f["splits/test"])
 
             # Optional cap for smoke runs.
@@ -631,12 +639,8 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
             train_scan_ids, train_p2l = self._expand_patients_to_scans(
                 offsets, keys, ids, train_patient_keys
             )
-            val_scan_ids, _ = self._expand_patients_to_scans(
-                offsets, keys, ids, val_patient_keys
-            )
-            test_scan_ids, _ = self._expand_patients_to_scans(
-                offsets, keys, ids, test_patient_keys
-            )
+            val_scan_ids, _ = self._expand_patients_to_scans(offsets, keys, ids, val_patient_keys)
+            test_scan_ids, _ = self._expand_patients_to_scans(offsets, keys, ids, test_patient_keys)
 
             logger.info(
                 "%s: train=%d patients / %d scans | val=%d patients / %d scans | "
@@ -650,8 +654,14 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
                 len(test_scan_ids),
             )
 
-            # Build per-cohort datasets.
-            train_ds = LatentH5Dataset(cohort.latent_h5, train_scan_ids)
+            # Build per-cohort datasets. Augmentation is attached to the
+            # training dataset only — validation / test datasets always read
+            # the raw latent so cross-run metrics stay comparable.
+            train_ds = LatentH5Dataset(
+                cohort.latent_h5,
+                train_scan_ids,
+                transform=self.train_transform,
+            )
             val_ds = LatentH5Dataset(cohort.latent_h5, val_scan_ids)
             test_ds = LatentH5Dataset(cohort.latent_h5, test_scan_ids)
 
@@ -674,9 +684,7 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
                 # Use all patients in the H5 (no train split for test-only).
                 all_patient_keys = list(keys)
 
-            all_scan_ids, _ = self._expand_patients_to_scans(
-                offsets, keys, ids, all_patient_keys
-            )
+            all_scan_ids, _ = self._expand_patients_to_scans(offsets, keys, ids, all_patient_keys)
             logger.info(
                 "%s (test-only): %d patients / %d scans",
                 cohort.name,
@@ -701,8 +709,7 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
         for cohort_idx, p2l in enumerate(self._train_patient_scan_indices):
             cohort_global_offset = self._train_ds._offsets[cohort_idx]
             global_p2l = [
-                [cohort_global_offset + local for local in patient_locals]
-                for patient_locals in p2l
+                [cohort_global_offset + local for local in patient_locals] for patient_locals in p2l
             ]
             resolved.append(global_p2l)
         self._train_patient_scan_indices = resolved

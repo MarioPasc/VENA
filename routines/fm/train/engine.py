@@ -27,10 +27,10 @@ import pytorch_lightning as pl
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from vena.data.augment import AugmentationTracker, build_pipeline_from_yaml
 from vena.data.h5.shared import now_iso_utc
 from vena.data.registry import load_registry
 from vena.model.fm.lightning import FMLightningModule, LatentH5DataModule
-from vena.model.fm.lightning.data import MultiCohortLatentDataModule
 from vena.model.fm.lightning.callbacks import (
     BestCheckpointCallback,
     ExhaustiveValLauncher,
@@ -38,6 +38,7 @@ from vena.model.fm.lightning.callbacks import (
     TrainMetricsCSV,
     VENACheckpointCallback,
 )
+from vena.model.fm.lightning.data import MultiCohortLatentDataModule
 from vena.model.fm.maisi.config import TrunkConfig
 from vena.model.fm.metrics import RegionSpec
 
@@ -73,9 +74,19 @@ class _DataCfg(BaseModel):
     pin_memory: bool = True
     max_train_subjects: int | None = None
     max_val_subjects: int | None = None
+    # Latent-space augmentation. ``augmentation_config_path`` points at a
+    # YAML built per ``vena.data.augment.config.SCHEMA_VERSION``. When set,
+    # the engine builds an ``AugmentationPipeline`` and passes it as the
+    # train transform; the ``AugmentationTracker`` callback writes
+    # ``metrics/augmentations_per_epoch.csv``. When
+    # ``preflight_decision_path`` is also set, the loader gates the pipeline
+    # by the preflight's ``latent_safe_augmentations`` allowlist and
+    # fast-fails if any requested augmentation is not safe.
+    augmentation_config_path: Path | None = None
+    preflight_decision_path: Path | None = None
 
     @model_validator(mode="after")
-    def _exactly_one_source(self) -> "_DataCfg":
+    def _exactly_one_source(self) -> _DataCfg:
         has_h5 = self.latents_h5 is not None
         has_reg = self.corpus_registry is not None
         if has_h5 == has_reg:  # both set or neither set
@@ -186,7 +197,9 @@ class _ExhaustiveValCfg(BaseModel):
     every_epochs: int = 20
     n_patients: int = 20
     nfe_levels: list[int] = Field(default_factory=lambda: [1, 2, 5, 10, 20])
-    integrator: str = "euler"  # ODE integrator for sampling (registry: vena...inference.get_sampler)
+    integrator: str = (
+        "euler"  # ODE integrator for sampling (registry: vena...inference.get_sampler)
+    )
     image_h5: Path | None = None
     corpus_registry: Path | None = None
     device: str = "cuda:1"
@@ -306,7 +319,9 @@ class FMTrainRoutineEngine:
             # Preserve the original run's provenance; record the resume invocation
             # under a timestamped name so the audit trail shows every restart.
             ts = now_iso_utc().replace(":", "-")
-            (run_dir / f"config.resume_{ts}.yaml").write_text(yaml.safe_dump(merged, sort_keys=False))
+            (run_dir / f"config.resume_{ts}.yaml").write_text(
+                yaml.safe_dump(merged, sort_keys=False)
+            )
             return
         (run_dir / "config.yaml").write_text(yaml.safe_dump(merged, sort_keys=False))
         if self.config_yaml_path is not None:
@@ -397,7 +412,9 @@ class FMTrainRoutineEngine:
                     if ema:
                         logger.info("Resuming (latest) from %s", ema[-1])
                         return str(ema[-1])
-            logger.warning("resume_from=%r: no matching checkpoint under %s; starting fresh.", rf, root)
+            logger.warning(
+                "resume_from=%r: no matching checkpoint under %s; starting fresh.", rf, root
+            )
             return None
 
         p = Path(rf)
@@ -441,6 +458,22 @@ class FMTrainRoutineEngine:
                 provenance["corpus_registry"] = str(cfg.data.corpus_registry)
             decision_path.write_text(json.dumps(provenance, indent=2))
 
+        # Augmentation pipeline (optional). Built once on the main process
+        # before fork so every DataLoader worker inherits the same operator
+        # objects.  The pipeline manages its own per-worker RNG.
+        train_transform = None
+        if cfg.data.augmentation_config_path is not None:
+            train_transform = build_pipeline_from_yaml(
+                cfg.data.augmentation_config_path,
+                preflight_decision_path=cfg.data.preflight_decision_path,
+            )
+            logger.info(
+                "augmentation pipeline ENABLED from %s (gate=%s) — augmentations: %s",
+                cfg.data.augmentation_config_path,
+                cfg.data.preflight_decision_path,
+                list(train_transform.names()),
+            )
+
         # Data. In-process validation is offloaded to the async second-GPU job
         # (see ExhaustiveValLauncher), so the training process runs *only*
         # training on the primary GPU; ``region_resolver``/``vae_decoder`` are
@@ -456,6 +489,7 @@ class FMTrainRoutineEngine:
                 pin_memory=cfg.data.pin_memory,
                 seed=cfg.run.seed,
                 max_train_patients_per_cohort=cfg.data.max_train_patients_per_cohort,
+                train_transform=train_transform,
             )
             logger.info(
                 "Using MultiCohortLatentDataModule (registry=%s, tau=%.2f)",
@@ -472,6 +506,7 @@ class FMTrainRoutineEngine:
                 max_train_subjects=cfg.data.max_train_subjects,
                 max_val_subjects=cfg.data.max_val_subjects,
                 seed=cfg.run.seed,
+                train_transform=train_transform,
             )
 
         # LightningModule (training-only: region_resolver/vae_decoder = None).
@@ -526,6 +561,8 @@ class FMTrainRoutineEngine:
             TrainMetricsCSV(out_dir=run_dir / "metrics"),
             SigtermHandler(ckpt_dir=run_dir / "checkpoints", filename="ema_final.ckpt"),
         ]
+        if train_transform is not None:
+            callbacks.append(AugmentationTracker(out_dir=run_dir / "metrics"))
         if cfg.exhaustive_val.enabled:
             callbacks.append(
                 ExhaustiveValLauncher(
