@@ -314,7 +314,7 @@ def test_full_cohort_copies_csr_and_splits(tmp_path: Path) -> None:
     # Patch sha256_file + handle attrs so no real file hashing occurs
     with (
         patch(
-            "vena.data.h5.ucsf_pdgm.latent_domain.convert.sha256_file",
+            "vena.data.h5.latent_domain.convert.sha256_file",
             return_value="deadbeef",
         ),
         patch.object(encoder, "handle", create=True) as mock_handle,
@@ -373,7 +373,7 @@ def test_subset_run_skips_csr_and_splits(tmp_path: Path) -> None:
 
     with (
         patch(
-            "vena.data.h5.ucsf_pdgm.latent_domain.convert.sha256_file",
+            "vena.data.h5.latent_domain.convert.sha256_file",
             return_value="deadbeef",
         ),
         patch.object(encoder, "handle", create=True) as mock_handle,

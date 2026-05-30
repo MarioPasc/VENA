@@ -1,4 +1,4 @@
-"""UCSF-PDGM latent-domain H5 cache (v0.1.0)."""
+"""UCSF-PDGM latent-domain H5 cache (thin wrapper over the neutral base)."""
 
 from .convert import UCSFPDGMLatentH5Config, UCSFPDGMLatentH5Converter
 from .manifest import (

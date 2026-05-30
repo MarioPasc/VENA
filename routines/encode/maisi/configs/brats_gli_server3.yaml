@@ -1,0 +1,60 @@
+# MAISI encode — BraTS-GLI full cohort, server3 (icai-server) paths.
+#
+# Normalisation/precision are kept IDENTICAL to the UCSF-PDGM server3 encode
+# (server3.yaml): fp32 inference + percentile [0, 99.95] + foreground-only.
+# This is mandatory for cross-cohort latent comparability — the FM model
+# trains on both cohorts' latents, so a different intensity scale or VAE
+# precision between cohorts would be a domain confound.
+#
+# BraTS-GLI is longitudinal and has NO metadata/who_grade, so the who_grade
+# QC passes (roundtrip / stabilization) are disabled; PCA (metadata-free) is on.
+
+source_image_h5: /media/hddb/mario/data/GLIOMAS/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_image.h5
+autoencoder_checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+output_dir: /media/hddb/mario/results/vena/encode_brats_gli_maisi
+output_h5_path: /media/hddb/mario/data/GLIOMAS/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_latents.h5
+
+modalities: [t1pre, t1c, t2, flair]
+device: cuda
+
+# Precision — match UCSF server3 encode (fp32, no autocast).
+precision_mode: fp32
+autoencoder_norm_float16: null
+
+inference_mode: auto
+depth_pad_base: 8
+
+sliding_window:
+  roi_size: [80, 80, 32]
+  overlap: 0.4
+  mode: gaussian
+
+# Intensity normalisation — match UCSF server3 encode EXACTLY.
+percentile_lower: 0.0
+percentile_upper: 99.95
+percentile_foreground_only: true
+
+mask_downsampler:
+  name: per_class_avg_pool
+  params: {}
+
+limit: null
+encode_full_cohort: true
+checkpoint_every: 50
+resume_from_run_id: null
+overwrite: false
+log_level: INFO
+seed: 42
+
+# who_grade-dependent QC disabled (BraTS-GLI has no clinical metadata).
+roundtrip:
+  enabled: false
+
+stabilization:
+  enabled: false
+
+pca:
+  enabled: true
+  figure_filename: pca.png
+  pooling: global_avg
+  n_components: 2

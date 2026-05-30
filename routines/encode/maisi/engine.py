@@ -1,11 +1,11 @@
-"""Routine engine for encoding the UCSF-PDGM image H5 to the MAISI latent H5.
+"""Routine engine for encoding an image H5 to the MAISI latent H5.
 
 Three responsibilities:
 
 1. **Load** the MAISI VAE-GAN once and build the encoder / decoder / mask
    downsampler instances.
 2. **Encode** every patient by delegating to
-   :class:`UCSFPDGMLatentH5Converter` (library code).
+   :class:`LatentH5Converter` (library code).
 3. **QC** the result — decode one patient per WHO grade for the roundtrip
    figure; pool every latent for the PCA figure; write ``report.md`` and
    ``decision.json``.
@@ -29,11 +29,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from vena.data.h5.shared import now_iso_utc, resolve_git_sha
-from vena.data.h5.ucsf_pdgm.latent_domain import (
-    UCSF_PDGM_IMAGE_NATIVE_SHAPE,
-    UCSFPDGMLatentH5Config,
-    UCSFPDGMLatentH5Converter,
-)
+from vena.data.h5.latent_domain import LatentH5Config, LatentH5Converter
+from vena.data.h5.ucsf_pdgm.latent_domain import UCSF_PDGM_IMAGE_NATIVE_SHAPE
 from vena.model.autoencoder.maisi import load_autoencoder
 from vena.model.autoencoder.maisi.decode import MaisiDecoder
 from vena.model.autoencoder.maisi.encode import MaisiEncoder, get_downsampler
@@ -298,7 +295,7 @@ class EncodeMaisiRoutineEngine:
         # Resume is opt-in via ``resume_from_run_id``. On a fresh run, the
         # converter takes its fresh path and respects ``overwrite``: an
         # existing latent H5 with overwrite=False raises FileExistsError.
-        conv_cfg = UCSFPDGMLatentH5Config(
+        conv_cfg = LatentH5Config(
             source_image_h5=cfg.source_image_h5,
             output_path=latent_h5,
             autoencoder_checkpoint=cfg.autoencoder_checkpoint,
@@ -310,7 +307,7 @@ class EncodeMaisiRoutineEngine:
             limit=cfg.limit,
             patient_ids=converter_patient_ids,
         )
-        converter = UCSFPDGMLatentH5Converter(
+        converter = LatentH5Converter(
             cfg=conv_cfg, encoder=encoder, mask_downsampler=mask_ds
         )
         latent_path = converter.run()
