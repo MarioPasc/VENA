@@ -14,7 +14,7 @@ cohorts:
     latent_h5: /media/hddb/mario/data/GLIOMAS/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_latents.h5
     image_h5: /media/hddb/mario/data/GLIOMAS/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_image.h5
 
-n_patients_per_cohort: 10
+n_patients_per_cohort: 30
 seed: 42
 device: cuda:0
 
