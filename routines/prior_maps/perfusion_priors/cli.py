@@ -2,8 +2,8 @@
 
 Usage
 -----
-    vena-perfusion-priors <config.yaml>
-    python -m routines.perfusion_priors.cli <config.yaml>
+    vena-prior-maps-perfusion <config.yaml>
+    python -m routines.prior_maps.perfusion_priors.cli <config.yaml>
 """
 
 from __future__ import annotations
@@ -14,10 +14,10 @@ import sys
 from pathlib import Path
 
 from rich.logging import RichHandler
-
-from routines.perfusion_priors.engine.perfusion_priors_engine import (
+from routines.prior_maps.perfusion_priors.engine.perfusion_priors_engine import (
     PerfusionPriorsRoutineEngine,
 )
+
 from vena.prior_maps.perfusion_priors import PerfusionPriorsRoutineConfig
 
 
@@ -31,7 +31,7 @@ def _configure_logging(level: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="vena-perfusion-priors")
+    parser = argparse.ArgumentParser(prog="vena-prior-maps-perfusion")
     parser.add_argument("config", type=Path, help="Path to YAML routine config")
     parser.add_argument(
         "--figures-only",

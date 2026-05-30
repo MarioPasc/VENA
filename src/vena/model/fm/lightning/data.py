@@ -164,118 +164,13 @@ class LatentH5Dataset(Dataset):
         return state
 
 
-class LatentH5DataModule(pl.LightningDataModule):
-    """LightningDataModule reading the UCSF-PDGM latents H5.
-
-    Splits come directly from the H5: ``splits/cv/fold_<k>/{train,val}`` for
-    cross-validation, and ``splits/test`` for the held-out test set.
-
-    Parameters
-    ----------
-    h5_path : Path | str
-    fold : int
-        Cross-validation fold (0..4 in UCSFPDGM_latents.h5).
-    batch_size : int
-    num_workers : int
-    pin_memory : bool
-    max_train_subjects : int | None
-        If set, randomly subsamples the train split to this size with a
-        deterministic seed. Used for the S1 smoke (4 subjects).
-    seed : int
-    """
-
-    def __init__(
-        self,
-        h5_path: Path | str,
-        fold: int = 0,
-        batch_size: int = 1,
-        num_workers: int = 2,
-        pin_memory: bool = True,
-        max_train_subjects: int | None = None,
-        max_val_subjects: int | None = None,
-        seed: int = 42,
-        train_transform: AugmentationPipeline | None = None,
-    ) -> None:
-        super().__init__()
-        self.h5_path = Path(h5_path)
-        self.fold = int(fold)
-        self.batch_size = int(batch_size)
-        self.num_workers = int(num_workers)
-        self.pin_memory = bool(pin_memory)
-        self.max_train_subjects = max_train_subjects
-        self.max_val_subjects = max_val_subjects
-        self.seed = int(seed)
-        self.train_transform = train_transform
-        self._train_ids: list[str] = []
-        self._val_ids: list[str] = []
-        self._test_ids: list[str] = []
-
-    def _decode_ids(self, ds: h5py.Dataset) -> list[str]:
-        return [b.decode() if isinstance(b, bytes) else str(b) for b in ds[:]]
-
-    def setup(self, stage: str | None = None) -> None:
-        if not self.h5_path.is_file():
-            raise FileNotFoundError(f"latents H5 not found: {self.h5_path}")
-        with h5py.File(self.h5_path, "r", swmr=True) as f:
-            self._train_ids = self._decode_ids(f[f"splits/cv/fold_{self.fold}/train"])
-            self._val_ids = self._decode_ids(f[f"splits/cv/fold_{self.fold}/val"])
-            self._test_ids = self._decode_ids(f["splits/test"])
-        if self.max_train_subjects is not None and self.max_train_subjects < len(self._train_ids):
-            rng = np.random.default_rng(self.seed)
-            chosen = rng.choice(len(self._train_ids), size=self.max_train_subjects, replace=False)
-            self._train_ids = [self._train_ids[int(i)] for i in sorted(chosen)]
-            logger.info(
-                "LatentH5DataModule: subsampled train to %d subjects (seed=%d)",
-                len(self._train_ids),
-                self.seed,
-            )
-        if self.max_val_subjects is not None and self.max_val_subjects < len(self._val_ids):
-            rng = np.random.default_rng(self.seed + 1)
-            chosen = rng.choice(len(self._val_ids), size=self.max_val_subjects, replace=False)
-            self._val_ids = [self._val_ids[int(i)] for i in sorted(chosen)]
-            logger.info(
-                "LatentH5DataModule: subsampled val to %d subjects (seed=%d)",
-                len(self._val_ids),
-                self.seed + 1,
-            )
-        logger.info(
-            "LatentH5DataModule.setup: fold=%d train=%d val=%d test=%d",
-            self.fold,
-            len(self._train_ids),
-            len(self._val_ids),
-            len(self._test_ids),
-        )
-
-    def _make_dataset(self, ids: list[str], *, with_transform: bool = False) -> LatentH5Dataset:
-        return LatentH5Dataset(
-            self.h5_path,
-            ids,
-            transform=self.train_transform if with_transform else None,
-        )
-
-    def _make_loader(self, ids: list[str], shuffle: bool) -> DataLoader:
-        # Augmentation is gated to the train loader so val/test metrics stay
-        # reproducible across runs (shuffle flag doubles as the train marker).
-        dataset = self._make_dataset(ids, with_transform=shuffle)
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=shuffle,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            drop_last=shuffle,
-            persistent_workers=self.num_workers > 0,
-            worker_init_fn=_seed_worker if self.num_workers > 0 else None,
-        )
-
-    def train_dataloader(self) -> DataLoader:
-        return self._make_loader(self._train_ids, shuffle=True)
-
-    def val_dataloader(self) -> DataLoader:
-        return self._make_loader(self._val_ids, shuffle=False)
-
-    def test_dataloader(self) -> DataLoader:
-        return self._make_loader(self._test_ids, shuffle=False)
+# NOTE: ``LatentH5DataModule`` was removed in the pre-long-run hardening pass.
+# All training now flows through :class:`MultiCohortLatentDataModule`. To run
+# a single-cohort experiment, point ``data.corpus_registry`` at a registry
+# JSON listing only that cohort (see ``routines/fm/train/configs/corpus/``).
+# Old YAML configs carrying ``data.latents_h5`` raise a clear
+# ``DataConfigError`` at config load time — see ``_DataCfg`` in
+# ``routines/fm/train/engine.py``.
 
 
 # ---------------------------------------------------------------------------

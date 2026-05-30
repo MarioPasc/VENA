@@ -104,10 +104,10 @@ docs = []
 # Naming convention: vena-<bucket>-<name>  (see .claude/rules/preflight-pattern.md item 5)
 # ----------------------------------------------------------------------------
 [project.scripts]
-vena-vessel-priors = "routines.vessel_priors.cli:main"
-vena-perfusion-priors = "routines.perfusion_priors.cli:main"
-vena-cellularity-priors = "routines.cellularity_priors.cli:main"
-vena-susceptibility-priors = "routines.susceptibility_priors.cli:main"
+vena-prior-maps-vessel = "routines.prior_maps.vessel_priors.cli:main"
+vena-prior-maps-perfusion = "routines.prior_maps.perfusion_priors.cli:main"
+vena-prior-maps-cellularity = "routines.prior_maps.cellularity_priors.cli:main"
+vena-prior-maps-susceptibility = "routines.prior_maps.susceptibility_priors.cli:main"
 vena-preflight-vessel-mask = "routines.preflights.vessel_mask.cli:main"
 vena-preflight-priors-validation = "routines.preflights.priors_validation.cli:main"
 vena-preflight-venous-atlas-build = "routines.preflights.venous_atlas_build.cli:main"

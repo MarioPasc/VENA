@@ -22,8 +22,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +67,7 @@ class RFlowEngine:
         )
 
     @property
-    def scheduler(self):  # noqa: ANN201 — opaque MONAI handle
+    def scheduler(self) -> RFlowScheduler:
         """Underlying MONAI scheduler (for inference samplers later)."""
         return self._scheduler
 
@@ -83,9 +87,7 @@ class RFlowEngine:
         ``x_t = (1 - t/T) * x_clean + (t/T) * noise`` (continuous), discretised
         through the integer ``timesteps`` codes.
         """
-        return self._scheduler.add_noise(
-            original_samples=x_clean, noise=noise, timesteps=timesteps
-        )
+        return self._scheduler.add_noise(original_samples=x_clean, noise=noise, timesteps=timesteps)
 
     @staticmethod
     def target_velocity(x_clean: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:

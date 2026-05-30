@@ -2,8 +2,8 @@
 
 Usage
 -----
-    vena-vessel-priors <config.yaml>
-    python -m routines.vessel_priors.cli <config.yaml>
+    vena-prior-maps-vessel <config.yaml>
+    python -m routines.prior_maps.vessel_priors.cli <config.yaml>
 """
 
 from __future__ import annotations
@@ -14,10 +14,10 @@ import sys
 from pathlib import Path
 
 from rich.logging import RichHandler
-
-from routines.vessel_priors.engine.vessel_priors_engine import (
+from routines.prior_maps.vessel_priors.engine.vessel_priors_engine import (
     VesselPriorsRoutineEngine,
 )
+
 from vena.prior_maps.vessel_priors import VesselPriorsRoutineConfig
 
 
@@ -31,7 +31,7 @@ def _configure_logging(level: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="vena-vessel-priors")
+    parser = argparse.ArgumentParser(prog="vena-prior-maps-vessel")
     parser.add_argument("config", type=Path, help="Path to YAML routine config")
     parser.add_argument(
         "--figures-only",

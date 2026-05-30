@@ -19,8 +19,11 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+from vena.data.cohort import register_cohort
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +42,27 @@ class BraTSGLISession:
         Patient-level identifier with timepoint stripped, e.g. ``BraTS-GLI-00001``.
     root : Path
         Absolute path to the session directory.
+    metadata : dict[str, Any]
+        Optional metadata; empty by default. Present for
+        :class:`vena.data.cohort.CohortPatient` protocol conformance.
     """
 
     session_id: str
     patient_id: str
     root: Path
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@register_cohort(
+    "brats_gli",
+    pathology="glioma",
+    metadata={"release": "BraTS-GLI pre-op", "spacing_mm": (1.0, 1.0, 1.0)},
+)
 class BraTSGLIDataset:
     """Index of the BraTS-GLI pre-operative source cohort.
+
+    Implements :class:`vena.data.cohort.CohortProtocol` structurally
+    (registered via :func:`vena.data.cohort.register_cohort`).
 
     Parameters
     ----------
@@ -107,7 +122,9 @@ class BraTSGLIDataset:
         current_indices: list[int] = []
 
         for i, (patient_id, session_id, path) in enumerate(raw):
-            sessions.append(BraTSGLISession(session_id=session_id, patient_id=patient_id, root=path))
+            sessions.append(
+                BraTSGLISession(session_id=session_id, patient_id=patient_id, root=path)
+            )
             if patient_id != current_patient:
                 if current_patient is not None:
                     patient_groups.append((current_patient, current_indices))

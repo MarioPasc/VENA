@@ -2,8 +2,8 @@
 
 Usage
 -----
-    vena-susceptibility-priors <config.yaml>
-    python -m routines.susceptibility_priors.cli <config.yaml>
+    vena-prior-maps-susceptibility <config.yaml>
+    python -m routines.prior_maps.susceptibility_priors.cli <config.yaml>
 """
 
 from __future__ import annotations
@@ -14,10 +14,10 @@ import sys
 from pathlib import Path
 
 from rich.logging import RichHandler
-
-from routines.susceptibility_priors.engine.susceptibility_priors_engine import (
+from routines.prior_maps.susceptibility_priors.engine.susceptibility_priors_engine import (
     SusceptibilityPriorsRoutineEngine,
 )
+
 from vena.prior_maps.susceptibility_priors import (
     SusceptibilityPriorsRoutineConfig,
 )
@@ -33,7 +33,7 @@ def _configure_logging(level: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="vena-susceptibility-priors")
+    parser = argparse.ArgumentParser(prog="vena-prior-maps-susceptibility")
     parser.add_argument("config", type=Path, help="Path to YAML routine config")
     parser.add_argument(
         "--figures-only",

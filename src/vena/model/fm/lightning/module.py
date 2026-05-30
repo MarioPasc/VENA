@@ -1,14 +1,25 @@
 """LightningModule wrapping trunk + ControlNet + RFlow + composite loss.
 
-By default the trunk and the VAE are frozen and only ControlNet parameters are
-trained; the optimiser is then constructed over ``self.controlnet.parameters()``
-only. When ``trunk_config.trainable`` is set (the unfrozen-trunk ablation, cf.
-TumorFlow) the trunk is unfrozen and its parameters join the optimiser in the
-same group. The trunk is held as an unregistered property, so when fine-tuning
-it is **not** EMA-tracked and **not** written into checkpoints — this path is a
-diagnostic for whether unfreezing helps, not a production resume-safe loop.
+The VAE is always frozen. The trunk is controlled by ``trunk_config.trainable``:
 
-The training step follows MAISI-v2's ControlNet recipe:
+* ``trainable=False`` (canonical frozen-backbone recipe): the optimiser is
+  constructed over ``self.controlnet.parameters()`` only and the trunk is held
+  as an unregistered property — trunk weights are not written into
+  checkpoints and the EMA shadow only tracks the ControlNet.
+
+* ``trainable=True`` (project default since multi-cohort + augmentations work):
+  the trunk is unfrozen and joins the same optimiser group as the ControlNet.
+  ``self._trunk_module`` is registered as a Lightning submodule so the
+  fine-tuned trunk weights round-trip through ``state_dict`` natively (PL 2.x
+  restores model weights *after* ``setup()``). A second EMA — ``self.trunk_ema``
+  — is built in ``setup()`` and updated in lockstep with the ControlNet EMA so
+  sampling uses an EMA-smoothed trunk. Caveat: ``trunk_ema`` is created in
+  ``setup()`` (after Lightning's checkpoint restore), so this path is
+  **single-shot, not resume-safe** as written. Do not rely on ``run.resume_from``
+  for unfrozen runs without first hardening the trunk-EMA restore path.
+
+The training step follows MAISI-v2's ControlNet recipe (see
+``.claude/rules/model-coding-standards.md``):
 
     down_residuals, mid_residual = controlnet(x_t, t, c_orig, class_labels)
     v = trunk(
@@ -505,6 +516,17 @@ class FMLightningModule(pl.LightningModule):
             return shadow
         return self.trunk
 
+    def compute_val_conditioning(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Build the validation conditioning tensor for ``batch`` and stash it.
+
+        Called from ``validation_step`` and from the external exhaustive-val
+        engine. The result is also written to ``self._val_cond`` so the closure
+        returned by :meth:`_make_ema_call` reads the same conditioning across
+        every NFE in the sweep.
+        """
+        self._val_cond = self.conditioning(batch)
+        return self._val_cond
+
     def _which_nfes(self, epoch: int) -> list[int]:
         vcfg = self.validation_cfg
         do_sweep = int(vcfg.get("full_sweep_every_epochs", 5)) > 0 and (
@@ -549,7 +571,10 @@ class FMLightningModule(pl.LightningModule):
         sampler = get_sampler(self.validation_cfg.get("integrator", "euler"))(
             scheduler=self.rflow.scheduler
         )
-        self._val_cond = self.conditioning(batch)
+        # Materialise the conditioning once per batch; the EMA closure
+        # constructed by ``_make_ema_call`` reads ``self._val_cond`` so the
+        # same conditioning is reused across NFE values.
+        self._val_cond = self.compute_val_conditioning(batch)
         B = int(z_target.shape[0])
 
         for nfe in nfes:
@@ -703,17 +728,10 @@ class FMLightningModule(pl.LightningModule):
         self, z_pred: torch.Tensor, z_target: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Best-effort decode — exceptions bubble up (validation OOM is caught upstream).
-        from vena.model.autoencoder.maisi.preprocessing import DepthPad
+        from vena.common.decode import decode_depth_identity
 
-        # The H5 stores latents already padded along the depth axis (image-space
-        # 155 → 160 → latent 40). For decode-from-latent we ask for an identity
-        # un-pad: ``before=after=0`` and ``original_depth == padded_depth ==
-        # latent_depth * 4`` (the VAE's 4× compression).
-        latent_d = int(z_pred.shape[-1])
-        depth = latent_d * 4
-        pad = DepthPad(before=0, after=0, original_depth=depth, padded_depth=depth)
-        out_pred = self.vae_decoder.decode(z_pred, pad)
-        out_target = self.vae_decoder.decode(z_target, pad)
+        out_pred = decode_depth_identity(self.vae_decoder, z_pred)
+        out_target = decode_depth_identity(self.vae_decoder, z_target)
         return out_pred.image, out_target.image
 
     # ------------------------------------------------------------------
@@ -755,26 +773,14 @@ class FMLightningModule(pl.LightningModule):
         rows: list[dict[str, Any]] = []
         for nfe in sorted(self._nfe_timing_accum):
             acc = self._nfe_timing_accum[nfe]
-
-            def _mean(xs: list[float]) -> float | None:
-                finite = [x for x in xs if not math.isnan(x)]
-                return sum(finite) / len(finite) if finite else None
-
-            def _std(xs: list[float]) -> float | None:
-                finite = [x for x in xs if not math.isnan(x)]
-                if len(finite) < 2:
-                    return 0.0 if finite else None
-                m = sum(finite) / len(finite)
-                return math.sqrt(sum((x - m) ** 2 for x in finite) / (len(finite) - 1))
-
             rows.append(
                 {
                     "nfe": int(nfe),
-                    "t_trunk_mean_sec": _mean(acc["t_trunk"]),
-                    "t_controlnet_mean_sec": _mean(acc["t_controlnet"]),
-                    "t_decode_sec": _mean(acc["t_decode"]),
-                    "t_total_mean_sec": _mean(acc["t_total"]),
-                    "t_total_std_sec": _std(acc["t_total"]),
+                    "t_trunk_mean_sec": _finite_mean(acc["t_trunk"]),
+                    "t_controlnet_mean_sec": _finite_mean(acc["t_controlnet"]),
+                    "t_decode_sec": _finite_mean(acc["t_decode"]),
+                    "t_total_mean_sec": _finite_mean(acc["t_total"]),
+                    "t_total_std_sec": _finite_std(acc["t_total"]),
                     "gpu_mem_peak_mb": acc["gpu_mem_peak_mb"],
                     "n_patients_measured": int(acc["n_patients"]),
                 }
@@ -910,6 +916,25 @@ def _new_timing_agg() -> dict[str, Any]:
         "gpu_mem_peak_mb": 0.0,
         "n_patients": 0,
     }
+
+
+def _finite_mean(xs: list[float]) -> float | None:
+    """Mean over the finite (non-NaN) entries; ``None`` if no finite samples."""
+    finite = [x for x in xs if not math.isnan(x)]
+    return sum(finite) / len(finite) if finite else None
+
+
+def _finite_std(xs: list[float]) -> float | None:
+    """Sample stddev (Bessel) over the finite entries.
+
+    Returns ``0.0`` for a single finite value and ``None`` when no finite
+    samples exist. Matches the legacy nested ``_std`` semantics.
+    """
+    finite = [x for x in xs if not math.isnan(x)]
+    if len(finite) < 2:
+        return 0.0 if finite else None
+    m = sum(finite) / len(finite)
+    return math.sqrt(sum((x - m) ** 2 for x in finite) / (len(finite) - 1))
 
 
 def _agg_to_stats(agg: dict[str, Any]) -> dict[str, Any]:

@@ -3,10 +3,9 @@
 Uses synthetic in-memory temp H5 files conforming to the schema 2.0.0 layout
 described in the spec. No GPU, no MAISI checkpoint.
 """
+
 from __future__ import annotations
 
-import json
-import tempfile
 from pathlib import Path
 
 import h5py
@@ -14,13 +13,14 @@ import numpy as np
 import pytest
 import torch
 
+pytestmark = pytest.mark.unit
+
 from vena.data.registry.models import CohortEntry, CorpusRegistry
 from vena.model.fm.lightning.data import (
     LatentH5Dataset,
     MultiCohortLatentDataModule,
     MultiCohortLatentDataset,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers to build synthetic H5s
@@ -74,15 +74,11 @@ def _build_h5(
 
         # latents
         for mod in ("t1pre", "t1c", "t2", "flair"):
-            data = rng.random((n_scans, *LATENT_SHAPE), dtype=np.float32).astype(
-                np.float16
-            )
+            data = rng.random((n_scans, *LATENT_SHAPE), dtype=np.float32).astype(np.float16)
             f.create_dataset(f"latents/{mod}", data=data, compression="gzip")
 
         # masks/tumor_latent
-        mask_data = rng.random(
-            (n_scans, MASK_CHANNELS, *LATENT_SHAPE[1:]), dtype=np.float32
-        )
+        mask_data = rng.random((n_scans, MASK_CHANNELS, *LATENT_SHAPE[1:]), dtype=np.float32)
         f.create_dataset("masks/tumor_latent", data=mask_data, compression="gzip")
 
         # CSR patient grouping
@@ -261,9 +257,7 @@ class TestMultiCohortLatentDataset:
         assert ranges["CohortB"] == (2, 1)
 
     def test_out_of_bounds_raises(self, two_cohort_registry) -> None:
-        ds_a = LatentH5Dataset(
-            two_cohort_registry.by_name("CohortA").latent_h5, ["PA0_s0"]
-        )
+        ds_a = LatentH5Dataset(two_cohort_registry.by_name("CohortA").latent_h5, ["PA0_s0"])
         multi = MultiCohortLatentDataset([("CohortA", ds_a)])
         with pytest.raises(IndexError):
             _ = multi[1]
@@ -427,6 +421,4 @@ def test_expand_patients_missing_key_raises() -> None:
     keys = ["P0"]
     ids = ["P0_s0"]
     with pytest.raises(KeyError, match="MISSING"):
-        MultiCohortLatentDataModule._expand_patients_to_scans(
-            offsets, keys, ids, ["MISSING"]
-        )
+        MultiCohortLatentDataModule._expand_patients_to_scans(offsets, keys, ids, ["MISSING"])

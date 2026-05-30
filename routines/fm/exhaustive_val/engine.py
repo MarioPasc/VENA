@@ -30,9 +30,8 @@ import torch
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from vena.model.autoencoder.maisi.decode.engine import MaisiDecoder
-from vena.model.autoencoder.maisi.loader import load_autoencoder
-from vena.model.autoencoder.maisi.preprocessing import CropPadSpec
+from vena.common import CropPadSpec, MaisiDecoder, load_autoencoder
+from vena.common.decode import decode_box
 from vena.model.fm.eval import (
     full_volume_psnr_ssim,
     render_comparison_figure,
@@ -227,9 +226,7 @@ class ExhaustiveValEngine:
         base, rem = divmod(int(total), int(n_cohorts))
         return [base + (1 if i < rem else 0) for i in range(n_cohorts)]
 
-    def _cohort_val_patients(
-        self, latents_h5: "Path", budget: int, seed: int
-    ) -> list[str]:
+    def _cohort_val_patients(self, latents_h5: Path, budget: int, seed: int) -> list[str]:
         """Return up to ``budget`` validation scan IDs from a cohort's latent H5.
 
         Reads patient keys from ``splits/cv/fold_<fold>/val`` (matching the
@@ -242,6 +239,7 @@ class ExhaustiveValEngine:
         import numpy as np
 
         with h5py.File(latents_h5, "r") as f:
+
             def _decode(ds) -> list[str]:  # type: ignore[no-untyped-def]
                 return [b.decode() if isinstance(b, bytes) else str(b) for b in ds[:]]
 
@@ -298,7 +296,7 @@ class ExhaustiveValEngine:
         ssim_by_pid: dict[str, list[float]] = {}
         gen_decode_time: dict[tuple[str, int], float] = {}
         # Maps each patient_id to its image H5 path for _render_best_worst.
-        pid_to_image_h5: dict[str, "Path"] = {}
+        pid_to_image_h5: dict[str, Path] = {}
 
         if cfg.corpus_registry is not None:
             self._run_multi_cohort(
@@ -357,7 +355,7 @@ class ExhaustiveValEngine:
         latents_by_pid_nfe: dict[tuple[str, int], torch.Tensor],
         ssim_by_pid: dict[str, list[float]],
         gen_decode_time: dict[tuple[str, int], float],
-        pid_to_image_h5: "dict[str, Path]",
+        pid_to_image_h5: dict[str, Path],
     ) -> None:
         """Legacy single-cohort path: one latents_h5 + one image_h5."""
         import h5py
@@ -411,7 +409,7 @@ class ExhaustiveValEngine:
         latents_by_pid_nfe: dict[tuple[str, int], torch.Tensor],
         ssim_by_pid: dict[str, list[float]],
         gen_decode_time: dict[tuple[str, int], float],
-        pid_to_image_h5: "dict[str, Path]",
+        pid_to_image_h5: dict[str, Path],
     ) -> None:
         """Multi-cohort path: split ``n_patients`` uniformly across cohorts.
 
@@ -438,9 +436,7 @@ class ExhaustiveValEngine:
             len(all_cohorts),
         )
 
-        for cohort_idx, (cohort, budget) in enumerate(
-            zip(all_cohorts, budgets, strict=True)
-        ):
+        for cohort_idx, (cohort, budget) in enumerate(zip(all_cohorts, budgets, strict=True)):
             if budget <= 0:
                 logger.info(
                     "exhaustive-val: cohort '%s' allocated 0 patients; skipping.",
@@ -493,10 +489,14 @@ class ExhaustiveValEngine:
                 except Exception as exc:
                     logger.warning(
                         "exhaustive-val: patient '%s' (cohort %s) failed (%s); skipping.",
-                        pid, cohort.name, exc,
+                        pid,
+                        cohort.name,
+                        exc,
                     )
                     continue
-                logger.info("  cohort=%s [%d/%d] %s done", cohort.name, i + 1, len(patient_ids), pid)
+                logger.info(
+                    "  cohort=%s [%d/%d] %s done", cohort.name, i + 1, len(patient_ids), pid
+                )
 
     def _process_patient(
         self,
@@ -514,7 +514,7 @@ class ExhaustiveValEngine:
         ssim_by_pid: dict[str, list[float]],
         gen_decode_time: dict[tuple[str, int], float],
         *,
-        image_h5: "Path",
+        image_h5: Path,
         cohort: str,
     ) -> None:
         """Process one patient: sample at each NFE, decode to box, compute metrics.
@@ -536,7 +536,7 @@ class ExhaustiveValEngine:
         crop_spec = build_crop_spec_from_h5(image_h5, pid)
         real_box = load_real_t1c_box(image_h5, pid, crop_spec).to(self.device)
 
-        module._val_cond = module.conditioning(batch)
+        module.compute_val_conditioning(batch)
 
         for nfe in cfg.nfe_levels:
             z_pred, gen_t = self._sample(module, sampler, z_target, int(nfe))
@@ -597,17 +597,10 @@ class ExhaustiveValEngine:
     ) -> tuple[torch.Tensor, float]:
         """Decode latent to the box volume using the crop_spec path.
 
-        The decoder returns ``(B, 1, *target_shape)``; we return the ``[0,1]``
-        clamped spatial volume ``(*target_shape,)`` for metric computation.
+        Delegates to :func:`vena.common.decode.decode_box` with CUDA-synced
+        timing and ``[0, 1]`` clamp so the returned volume is metric-ready.
         """
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            out = vae.decode(z_pred, crop_spec=crop_spec)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-        return out.image[0, 0].float().clamp(0.0, 1.0), time.perf_counter() - t0
+        return decode_box(vae, z_pred, crop_spec, return_seconds=True)
 
     def _render_best_worst(
         self,
@@ -616,7 +609,7 @@ class ExhaustiveValEngine:
         ssim_by_pid: dict[str, list[float]],
         latents_by_pid_nfe: dict[tuple[str, int], torch.Tensor],
         gen_decode_time: dict[tuple[str, int], float],
-        pid_to_image_h5: "dict[str, Path]",
+        pid_to_image_h5: dict[str, Path],
         out_dir: Path,
     ) -> None:
         mean_ssim = {pid: (sum(v) / len(v)) for pid, v in ssim_by_pid.items() if v}

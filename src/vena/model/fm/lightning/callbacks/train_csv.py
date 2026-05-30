@@ -78,8 +78,12 @@ class TrainMetricsCSV(pl.Callback):
         if ema is not None:
             try:
                 scalars["ema_decay"] = float(ema.get_current_decay())
-            except Exception:
-                pass
+            except (AttributeError, RuntimeError) as exc:
+                # ema-pytorch raises RuntimeError before any update_after_step
+                # has been reached; AttributeError covers a hypothetical EMA
+                # implementation without the helper. Log so an unexpected
+                # failure is visible instead of silently dropping the column.
+                logger.debug("ema_decay unavailable: %s", exc)
 
         if self._step_header is None:
             self._step_header = ["epoch", "step", "lr", *sorted(scalars.keys() - {"lr"})]

@@ -115,10 +115,40 @@ A downstream consumer never reads `report.md` programmatically. It loads `decisi
 
 ## Hard rules
 
-- **Pre-flights are gating.** A training routine in Phase 3 must, at startup, load each pre-flight's `decision.json` and assert the conditions it depends on (e.g. `vesselness_method != null` for `fm_mask`, `swan_ood_flag == false` if a config encodes SWAN through the VAE). If a pre-flight has not run, the routine fails fast with a clear message naming the missing artifact.
+- **Pre-flights are gating, enforced at engine startup.** A Phase-3 (and later) routine calls a `_assert_preflight_gates(cfg)` helper at the top of `Engine.run()`, *before* any side effect. The helper loads each pre-flight's `decision.json` and raises a routine-specific `PreflightGateError` (e.g. `routines/fm/train/exceptions.py::PreflightGateError`) on any unmet condition. The canonical reference is `routines.fm.train.engine._assert_preflight_gates`: it requires `data.preflight_decision_path` when `data.augmentation_config_path` is set and checks that every requested augmentation appears in `decision.json["latent_safe_augmentations"]`.
 - **Pre-flight outputs are immutable once written.** A re-run produces a new timestamped directory under `artifacts/<routine>/`. Never overwrite.
 - **Latest pointer.** `artifacts/<routine>/LATEST` is a symlink to the most-recent timestamped directory. Consumers default to following the symlink and can be pinned to a specific timestamp via the YAML config (`preflight_artifact_path: artifacts/preflights/maisi_vae/2026-05-20T14-32-00Z/`).
 
+## `decision.json` for training routines
+
+Phase-3 routines also emit `decision.json` so external-validation and reader-study routines can verify exactly which weights and gates produced a given run. The canonical schema (`routines.fm.train` v0.3.0) is:
+
+```json
+{
+  "schema_version": "0.3.0",
+  "produced_at": "<ISO-8601-UTC>",
+  "producer": "routines.fm.train:0.3.0",
+  "run_id": "<UTC>_<stage>_<short-sha>",
+  "run_dir": "/abs/path/to/experiments/<run_id>",
+  "stage": "s1|s2|s3",
+  "seed": 1337,
+  "corpus_registry": "routines/fm/train/configs/corpus/corpus_<host>.json",
+  "cohorts_used": ["UCSF-PDGM", "BraTS-GLI"],
+  "trunk_checkpoint": "/abs/path/to/diff_unet_3d_rflow-mr.pt",
+  "trunk_checkpoint_sha256": "<sha256>",
+  "trunk_trainable": true,
+  "vae_checkpoint": "/abs/path/to/autoencoder_v2.pt",
+  "vae_checkpoint_sha256": "<sha256>",
+  "loss_stage": "s1",
+  "ema_decay": 0.9999,
+  "augmentation_config_path": "routines/fm/train/configs/augmentations/<name>.yaml",
+  "augmentation_preflight_path": "/abs/path/to/.../decision.json",
+  "exhaustive_val_enabled": true
+}
+```
+
+Bump `schema_version` on any breaking change. Add fields freely; never repurpose an existing key.
+
 ## Reference
 
-The first routine to land — likely `routines/preflights/maisi_vae/` or `routines/data/ucsf_pdgm_h5/` — becomes the canonical example of this pattern. New routines copy its layout.
+The first routine to land — likely `routines/preflights/maisi_vae/` or `routines/data/ucsf_pdgm_h5/` — becomes the canonical example of this pattern. New routines copy its layout. The current canonical examples are `routines/fm/train/` (engine + preflight gate + decision payload) and `routines/preflights/latent_aug_equivariance/` (preflight that emits `latent_safe_augmentations`).

@@ -34,6 +34,8 @@ from typing import Any, Literal
 
 import pandas as pd
 
+from vena.data.cohort import register_cohort
+
 from .shared.exceptions import ModalityNotFoundError, PatientNotFoundError
 from .shared.io import NiftiVolume, load_nii
 
@@ -98,8 +100,19 @@ class UCSFPDGMPatient:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@register_cohort(
+    "ucsf_pdgm",
+    pathology="glioma",
+    metadata={"release": "UCSF-PDGM v5", "spacing_mm": (1.0, 1.0, 1.0)},
+)
 class UCSFPDGMDataset:
     """Index of the UCSF-PDGM source cohort.
+
+    Implements :class:`vena.data.cohort.CohortProtocol` structurally
+    (registered via :func:`vena.data.cohort.register_cohort`). Use the
+    registry to instantiate by name when a generic cohort consumer is the
+    right pattern; instantiate this class directly when the cohort-specific
+    accessors (modality paths, metadata CSV join) are needed.
 
     Parameters
     ----------

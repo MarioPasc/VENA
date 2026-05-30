@@ -22,13 +22,14 @@ proposal wins.
      fine-tuned jointly with the ControlNet (cf. TumorFlow). The optimiser is
      built over `self.controlnet.parameters()` **plus** `self.trunk.parameters()`
      in one group; a second `WarmupEMA` (`self.trunk_ema`) tracks the trunk and
-     sampling uses the EMA trunk shadow. The trunk is still held via a property
-     (not a registered submodule), so its fine-tuned weights are persisted via
-     explicit `on_save_checkpoint` keys (`trunk_finetuned_state`,
-     `trunk_ema_state`) and the exhaustive job reloads the trunk EMA snapshot.
-     This path is **single-shot — not resume-safe** (the trunk EMA is built in
-     `setup()`, after Lightning's checkpoint load): do not rely on `resume_from`
-     for unfrozen runs without first hardening trunk-EMA restore.
+     sampling uses the EMA trunk shadow. The fine-tuned trunk is registered as
+     `self._trunk_module` so its weights round-trip through Lightning's native
+     `state_dict` (PL 2.x restores model weights *after* `setup()`); the trunk
+     EMA shadow is reloaded from a separate `trunk_ema_snapshot.pt` by the
+     exhaustive job. This path is **single-shot — not resume-safe** (the trunk
+     EMA is built in `setup()`, after Lightning's checkpoint load): do not rely
+     on `resume_from` for unfrozen runs without first hardening trunk-EMA
+     restore.
    - **`trainable=False`.** Canonical frozen-backbone recipe: optimiser over
      `self.controlnet.parameters()` only, no trunk EMA, trunk never written to
      checkpoints. Byte-identical to the original frozen path.
@@ -138,10 +139,41 @@ proposal wins.
     `init_from_trunk` + zero-init output projections). Log the resolved checkpoint
     SHA-256 at first load.
 
+## Cross-cutting helpers (mandatory imports)
+
+20. **MAISI primitives come from `vena.common`**, not from
+    `vena.model.autoencoder.maisi.*`. Decoding goes through
+    `vena.common.decode.decode_box` (exhaustive val / external eval) or
+    `vena.common.decode.decode_depth_identity` (in-process training proxy).
+    Never inline `MaisiDecoder.decode` in a routine engine — see
+    `.claude/rules/extensibility.md`.
+21. **`MultiCohortLatentDataModule` is the only training DataModule.** The
+    legacy single-cohort `LatentH5DataModule` was removed; a guard test
+    (`tests/model/fm/test_legacy_dataset_removed.py`) fails if it returns.
+    Engines build the DataModule from `cfg.data.corpus_registry` only.
+22. **External code never writes to `LightningModule` private attrs.** The
+    exhaustive-val engine calls `module.compute_val_conditioning(batch)`; do
+    not regress to `module._val_cond = module.conditioning(batch)`.
+23. **TF32 matmul precision is set once at engine entry**:
+    `torch.set_float32_matmul_precision("high")` early in `Engine.run()`,
+    before any model is built. ~10% step-time gain on A100/RTX-4090 at no
+    measured cost to FM training numerics.
+24. **Aggregation helpers** (`_finite_mean`, `_finite_std` in `module.py`) are
+    module-level. Do not redefine inside `collapse_*` loops (per
+    `coding-standards.md` rule 16).
+
 ## Testing
 
-20. Co-locate `tests/model/fm/test_<area>.py`. Pure helpers (metric math, slice
+25. Co-locate `tests/model/fm/test_<area>.py`. Pure helpers (metric math, slice
     selection, CSV writers, H5 round-trip, normalisation parity) must be tested
     without checkpoints; mark checkpoint/GPU paths `gpu`/`slow`. When a callback's
     contract changes (e.g. reads a `collapse_*()` method), update its test to the
     new contract in the same change.
+26. **Every test file declares its marker explicitly.** Either
+    `pytestmark = pytest.mark.unit` at module level or `@pytest.mark.<marker>`
+    per test. Tests with no marker are invisible to the marker-filtered fast
+    suite (`-m "not slow and not gpu"`) — that has burned us before.
+27. **Removal of a public symbol gets a guard test.** When deleting a class or
+    function that lived in `__all__` (e.g. `LatentH5DataModule`), add a test
+    that asserts the name is no longer importable. The guard makes a
+    re-introduction a one-line CI failure.

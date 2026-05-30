@@ -11,8 +11,9 @@ Implements the full training_routine.md spec:
 
 The engine is a thin orchestrator: it wires Lightning's Trainer to the
 :class:`vena.model.fm.lightning.module.FMLightningModule`, the
-:class:`vena.model.fm.lightning.data.LatentH5DataModule`, the VAE decoder, and
-the suite of custom callbacks in :mod:`vena.model.fm.lightning.callbacks`.
+:class:`vena.model.fm.lightning.data.MultiCohortLatentDataModule`, the VAE
+decoder, and the suite of custom callbacks in
+:mod:`vena.model.fm.lightning.callbacks`.
 """
 
 from __future__ import annotations
@@ -24,13 +25,14 @@ from pathlib import Path
 from typing import Any
 
 import pytorch_lightning as pl
+import torch
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from vena.data.augment import AugmentationTracker, build_pipeline_from_yaml
-from vena.data.h5.shared import now_iso_utc
+from vena.data.h5.shared import now_iso_utc, sha256_file
 from vena.data.registry import load_registry
-from vena.model.fm.lightning import FMLightningModule, LatentH5DataModule
+from vena.model.fm.lightning import FMLightningModule, MultiCohortLatentDataModule
 from vena.model.fm.lightning.callbacks import (
     BestCheckpointCallback,
     ExhaustiveValLauncher,
@@ -42,6 +44,7 @@ from vena.model.fm.lightning.data import MultiCohortLatentDataModule
 from vena.model.fm.maisi.config import TrunkConfig
 from vena.model.fm.metrics import RegionSpec
 
+from .exceptions import PreflightGateError
 from .runner import generate_run_id, write_provenance
 
 logger = logging.getLogger(__name__)
@@ -63,9 +66,16 @@ class _RunCfg(BaseModel):
 
 
 class _DataCfg(BaseModel):
+    """Training data configuration.
+
+    The legacy ``latents_h5`` single-cohort key was removed in the pre-long-run
+    hardening pass; every run flows through ``corpus_registry``. To run a
+    single-cohort experiment, write a registry JSON listing only that cohort
+    (see ``routines/fm/train/configs/corpus/``).
+    """
+
     model_config = ConfigDict(extra="forbid")
-    latents_h5: Path | None = None
-    corpus_registry: Path | None = None
+    corpus_registry: Path
     tau: float = 0.5
     max_train_patients_per_cohort: int | None = None
     fold: int = 0
@@ -85,16 +95,16 @@ class _DataCfg(BaseModel):
     augmentation_config_path: Path | None = None
     preflight_decision_path: Path | None = None
 
-    @model_validator(mode="after")
-    def _exactly_one_source(self) -> _DataCfg:
-        has_h5 = self.latents_h5 is not None
-        has_reg = self.corpus_registry is not None
-        if has_h5 == has_reg:  # both set or neither set
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_latents_h5(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "latents_h5" in data:
             raise ValueError(
-                "_DataCfg: exactly one of 'latents_h5' or 'corpus_registry' must be set "
-                f"(latents_h5={self.latents_h5!r}, corpus_registry={self.corpus_registry!r})"
+                "data.latents_h5 was removed in the pre-long-run hardening pass. "
+                "Use data.corpus_registry pointing at a registry JSON with the "
+                "single cohort entry instead. See routines/fm/train/configs/corpus/."
             )
-        return self
+        return data
 
 
 class _ControlNetCfg(BaseModel):
@@ -200,7 +210,6 @@ class _ExhaustiveValCfg(BaseModel):
     integrator: str = (
         "euler"  # ODE integrator for sampling (registry: vena...inference.get_sampler)
     )
-    image_h5: Path | None = None
     corpus_registry: Path | None = None
     device: str = "cuda:1"
     # Python used to launch the subprocess; defaults to the running interpreter.
@@ -208,6 +217,17 @@ class _ExhaustiveValCfg(BaseModel):
     # Join each validation before training continues (one completed exhaustive
     # pass per cadence epoch). Default False = production async/skip-if-busy.
     block_until_complete: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_image_h5(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "image_h5" in data:
+            raise ValueError(
+                "exhaustive_val.image_h5 was removed in the pre-long-run hardening pass. "
+                "Use exhaustive_val.corpus_registry instead (same registry as "
+                "data.corpus_registry)."
+            )
+        return data
 
 
 class _OutputCfg(BaseModel):
@@ -249,6 +269,78 @@ class FMTrainRoutineConfig(BaseModel):
         with path.open("r") as f:
             raw = yaml.safe_load(f)
         return cls.model_validate(raw)
+
+
+# =============================================================================
+# Pre-flight gates
+# =============================================================================
+
+
+def _safe_sha256(path: Path | None) -> str | None:
+    """Best-effort SHA-256 of ``path``; ``None`` if the file is missing.
+
+    Logged-and-skipped rather than raised so a misconfigured experiments-root
+    does not block training on its own — the SHAs are provenance, not gating.
+    """
+    if path is None:
+        return None
+    try:
+        return sha256_file(Path(path))
+    except FileNotFoundError:
+        logger.warning("checkpoint not found at %s; provenance SHA will be null", path)
+        return None
+
+
+def _load_preflight_decision(path: Path) -> dict[str, Any]:
+    """Load a pre-flight ``decision.json``; raise ``PreflightGateError`` on miss."""
+    if not path.exists():
+        raise PreflightGateError(
+            f"Pre-flight decision missing at {path}. "
+            f"Run the corresponding pre-flight routine first and "
+            f"point data.preflight_decision_path at its artifact."
+        )
+    return json.loads(path.read_text())
+
+
+def _assert_preflight_gates(cfg: FMTrainRoutineConfig) -> None:
+    """Validate that every pre-flight required by ``cfg`` is present.
+
+    Gates enforced:
+
+    * Augmentation: when ``data.augmentation_config_path`` is set, the
+      referenced pre-flight (``data.preflight_decision_path``) must exist and
+      must declare every augmentation in the runtime YAML inside its
+      ``latent_safe_augmentations`` allowlist. The pipeline builder
+      (``vena.data.augment.build_pipeline_from_yaml``) re-checks this, but
+      catching it up-front yields a clearer message and avoids partial setup.
+
+    Raises
+    ------
+    PreflightGateError
+        If any gate fails.
+    """
+    if cfg.data.augmentation_config_path is None:
+        return  # nothing to gate
+
+    if cfg.data.preflight_decision_path is None:
+        raise PreflightGateError(
+            "data.augmentation_config_path is set but data.preflight_decision_path "
+            "is None. Augmentations must be gated by the latent_aug_equivariance "
+            "pre-flight — see .claude/rules/preflight-pattern.md."
+        )
+
+    decision = _load_preflight_decision(cfg.data.preflight_decision_path)
+    allowlist = set(decision.get("latent_safe_augmentations") or [])
+    aug_yaml = yaml.safe_load(Path(cfg.data.augmentation_config_path).read_text()) or {}
+    requested = {entry["name"] for entry in (aug_yaml.get("augmentations") or [])}
+    forbidden = requested - allowlist
+    if forbidden:
+        raise PreflightGateError(
+            f"Augmentations {sorted(forbidden)} requested in "
+            f"{cfg.data.augmentation_config_path} are not on the pre-flight "
+            f"allowlist {sorted(allowlist)} from {cfg.data.preflight_decision_path}. "
+            f"Either drop the augmentation or rerun the equivariance pre-flight."
+        )
 
 
 # =============================================================================
@@ -330,24 +422,58 @@ class FMTrainRoutineEngine:
             (run_dir / "config.original.yaml").write_text(yaml.safe_dump(merged, sort_keys=False))
         write_provenance(run_dir, repo=Path(__file__).resolve().parents[3])
 
+    def _build_decision_payload(self, run_id: str, run_dir: Path) -> dict[str, Any]:
+        """Schema-0.3.0 decision JSON written once at run creation.
+
+        Carries enough provenance for a downstream consumer to reproduce the
+        run end-to-end: data registry, trunk + VAE SHA-256, loss stage,
+        optimiser/EMA hyperparameters, augmentation gate path, and the list
+        of cohort names actually wired in.
+        """
+        cfg = self.cfg
+        registry = load_registry(cfg.data.corpus_registry)
+        return {
+            "schema_version": "0.3.0",
+            "produced_at": now_iso_utc(),
+            "producer": "routines.fm.train:0.3.0",
+            "run_id": run_id,
+            "run_dir": str(run_dir),
+            "stage": cfg.run.stage,
+            "seed": cfg.run.seed,
+            "corpus_registry": str(cfg.data.corpus_registry),
+            "cohorts_used": [c.name for c in registry.cohorts],
+            "trunk_checkpoint": str(cfg.model.trunk.checkpoint),
+            "trunk_checkpoint_sha256": _safe_sha256(cfg.model.trunk.checkpoint),
+            "trunk_trainable": cfg.model.trunk.trainable,
+            "vae_checkpoint": (str(cfg.model.vae_checkpoint) if cfg.model.vae_checkpoint else None),
+            "vae_checkpoint_sha256": _safe_sha256(cfg.model.vae_checkpoint),
+            "loss_stage": cfg.run.stage,
+            "ema_decay": cfg.ema.decay,
+            "augmentation_config_path": (
+                str(cfg.data.augmentation_config_path)
+                if cfg.data.augmentation_config_path
+                else None
+            ),
+            "augmentation_preflight_path": (
+                str(cfg.data.preflight_decision_path) if cfg.data.preflight_decision_path else None
+            ),
+            "exhaustive_val_enabled": cfg.exhaustive_val.enabled,
+        }
+
     def _build_exhaustive_job_base(self, cfg: FMTrainRoutineConfig) -> dict[str, Any]:
         """Static fields for the exhaustive-val job YAML (epoch/snapshot added later).
 
         All paths are stringified so the launcher can ``yaml.safe_dump`` them.
-        Supports both the single-cohort path (``image_h5`` + ``latents_h5``) and
-        the multi-cohort path (``corpus_registry``).
+        Multi-cohort only — single-cohort ``image_h5`` was removed in the
+        pre-long-run hardening pass.
         """
         ev = cfg.exhaustive_val
         if cfg.model.vae_checkpoint is None:
             raise ValueError("exhaustive_val.enabled is true but model.vae_checkpoint is null")
 
-        # Validate source: one of corpus_registry or image_h5 must be set.
-        has_registry = ev.corpus_registry is not None
-        has_single = ev.image_h5 is not None
-        if not has_registry and not has_single:
+        if ev.corpus_registry is None:
             raise ValueError(
-                "exhaustive_val.enabled is true but neither exhaustive_val.corpus_registry "
-                "nor exhaustive_val.image_h5 is set"
+                "exhaustive_val.enabled is true but exhaustive_val.corpus_registry is not set"
             )
 
         job: dict[str, Any] = {
@@ -373,12 +499,7 @@ class FMTrainRoutineEngine:
             "integrator": ev.integrator,
             "n_patients": ev.n_patients,
         }
-        if has_registry:
-            job["corpus_registry"] = str(ev.corpus_registry)
-        else:
-            # Legacy single-cohort path.
-            job["latents_h5"] = str(cfg.data.latents_h5)
-            job["image_h5"] = str(ev.image_h5)
+        job["corpus_registry"] = str(ev.corpus_registry)
         return job
 
     def _resolve_resume_ckpt(self, exclude_dir: Path | None = None) -> str | None:
@@ -428,6 +549,16 @@ class FMTrainRoutineEngine:
         cfg = self.cfg
         pl.seed_everything(cfg.run.seed, workers=True)
 
+        # Pre-flight gate. Raises ``PreflightGateError`` before anything else
+        # has been done so the failure message names exactly which artifact is
+        # missing or non-conformant. See ``.claude/rules/preflight-pattern.md``.
+        _assert_preflight_gates(cfg)
+
+        # TF32 matmul: ~10% speed-up on A100/RTX-4090 at no measured cost to
+        # FM training numerics. Set before any model is built; ignored on CPU
+        # and on GPUs that do not advertise TF32 capability.
+        torch.set_float32_matmul_precision("high")
+
         # Resolve the resume checkpoint *before* choosing the run dir so we can
         # continue in place (same dir) instead of forking a new empty run.
         resume_ckpt = self._resolve_resume_ckpt()
@@ -445,18 +576,9 @@ class FMTrainRoutineEngine:
         # left intact on in-place resume.
         decision_path = run_dir / "decision.json"
         if not decision_path.exists():
-            provenance: dict[str, Any] = {
-                "schema_version": "0.2.0",
-                "produced_at": now_iso_utc(),
-                "producer": "routines.fm.train:0.2.0",
-                "run_id": run_id,
-                "stage": cfg.run.stage,
-            }
-            if cfg.data.latents_h5 is not None:
-                provenance["latents_h5"] = str(cfg.data.latents_h5)
-            if cfg.data.corpus_registry is not None:
-                provenance["corpus_registry"] = str(cfg.data.corpus_registry)
-            decision_path.write_text(json.dumps(provenance, indent=2))
+            decision_path.write_text(
+                json.dumps(self._build_decision_payload(run_id, run_dir), indent=2)
+            )
 
         # Augmentation pipeline (optional). Built once on the main process
         # before fork so every DataLoader worker inherits the same operator
@@ -478,36 +600,23 @@ class FMTrainRoutineEngine:
         # (see ExhaustiveValLauncher), so the training process runs *only*
         # training on the primary GPU; ``region_resolver``/``vae_decoder`` are
         # not needed here.
-        if cfg.data.corpus_registry is not None:
-            registry = load_registry(cfg.data.corpus_registry)
-            dm = MultiCohortLatentDataModule(
-                registry=registry,
-                fold=cfg.data.fold,
-                batch_size=cfg.data.batch_size,
-                tau=cfg.data.tau,
-                num_workers=cfg.data.num_workers,
-                pin_memory=cfg.data.pin_memory,
-                seed=cfg.run.seed,
-                max_train_patients_per_cohort=cfg.data.max_train_patients_per_cohort,
-                train_transform=train_transform,
-            )
-            logger.info(
-                "Using MultiCohortLatentDataModule (registry=%s, tau=%.2f)",
-                cfg.data.corpus_registry,
-                cfg.data.tau,
-            )
-        else:
-            dm = LatentH5DataModule(
-                h5_path=cfg.data.latents_h5,
-                fold=cfg.data.fold,
-                batch_size=cfg.data.batch_size,
-                num_workers=cfg.data.num_workers,
-                pin_memory=cfg.data.pin_memory,
-                max_train_subjects=cfg.data.max_train_subjects,
-                max_val_subjects=cfg.data.max_val_subjects,
-                seed=cfg.run.seed,
-                train_transform=train_transform,
-            )
+        registry = load_registry(cfg.data.corpus_registry)
+        dm = MultiCohortLatentDataModule(
+            registry=registry,
+            fold=cfg.data.fold,
+            batch_size=cfg.data.batch_size,
+            tau=cfg.data.tau,
+            num_workers=cfg.data.num_workers,
+            pin_memory=cfg.data.pin_memory,
+            seed=cfg.run.seed,
+            max_train_patients_per_cohort=cfg.data.max_train_patients_per_cohort,
+            train_transform=train_transform,
+        )
+        logger.info(
+            "Using MultiCohortLatentDataModule (registry=%s, tau=%.2f)",
+            cfg.data.corpus_registry,
+            cfg.data.tau,
+        )
 
         # LightningModule (training-only: region_resolver/vae_decoder = None).
         trunk_cfg = TrunkConfig(

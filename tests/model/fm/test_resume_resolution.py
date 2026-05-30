@@ -10,17 +10,19 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from routines.fm.train.engine import FMTrainRoutineConfig, FMTrainRoutineEngine
 
 pytestmark = pytest.mark.unit
 
 
 def _cfg(experiments_root: Path, resume_from: str) -> FMTrainRoutineConfig:
+    # The single-cohort ``data.latents_h5`` key was retired in the pre-long-run
+    # hardening pass. The resume-resolver does not touch the registry, so any
+    # placeholder path passes config validation.
     return FMTrainRoutineConfig.model_validate(
         {
             "run": {"resume_from": resume_from},
-            "data": {"latents_h5": "/nonexistent/latents.h5"},
+            "data": {"corpus_registry": "/nonexistent/registry.json"},
             "model": {
                 "trunk": {"checkpoint": "/nonexistent/trunk.pt"},
                 "controlnet": {"conditioning_inputs": ["latent:t1pre"]},
@@ -56,7 +58,9 @@ def test_latest_returns_none_when_no_ckpt_anywhere(tmp_path: Path) -> None:
 
 def test_latest_falls_back_to_ema_epoch(tmp_path: Path) -> None:
     root = tmp_path / "experiments"
-    prior = _make_run(root, "2026-01-01_00-00-00_s1_aaa", ["ema_epoch_003.ckpt", "ema_epoch_007.ckpt"])
+    prior = _make_run(
+        root, "2026-01-01_00-00-00_s1_aaa", ["ema_epoch_003.ckpt", "ema_epoch_007.ckpt"]
+    )
     eng = FMTrainRoutineEngine(_cfg(root, "latest"))
     resolved = eng._resolve_resume_ckpt(exclude_dir=None)
     assert resolved == str(prior / "checkpoints" / "ema_epoch_007.ckpt")
