@@ -207,13 +207,36 @@ class ExhaustiveValEngine:
             ]
         return ids[: self.cfg.n_patients]
 
-    def _cohort_val_patients(
-        self, latents_h5: "Path"
-    ) -> list[str]:
-        """Return validation patient IDs from a cohort's latent H5.
+    @staticmethod
+    def _split_n_patients(total: int, n_cohorts: int) -> list[int]:
+        """Distribute a total patient budget uniformly across cohorts.
 
-        Expands the test-patient keys via the CSR layout so each returned ID
-        is a scan-level ID that maps 1-to-1 with a row in the H5.
+        The remainder ``total % n_cohorts`` is allocated one-extra-each to the
+        first cohorts in registry order, so allocations are deterministic and
+        stable across epochs / re-runs.
+
+        Examples
+        --------
+        >>> ExhaustiveValEngine._split_n_patients(10, 2)
+        [5, 5]
+        >>> ExhaustiveValEngine._split_n_patients(10, 3)
+        [4, 3, 3]
+        """
+        if n_cohorts <= 0:
+            return []
+        base, rem = divmod(int(total), int(n_cohorts))
+        return [base + (1 if i < rem else 0) for i in range(n_cohorts)]
+
+    def _cohort_val_patients(
+        self, latents_h5: "Path", budget: int, seed: int
+    ) -> list[str]:
+        """Return up to ``budget`` validation scan IDs from a cohort's latent H5.
+
+        Reads patient keys from ``splits/cv/fold_<fold>/val`` (matching the
+        training data module's validation split), draws
+        ``min(budget, |val|)`` keys with a seeded RNG, then expands each
+        patient to its scan-level IDs via the CSR layout — so longitudinal
+        cohorts contribute every scan of a selected patient.
         """
         import h5py
         import numpy as np
@@ -222,23 +245,31 @@ class ExhaustiveValEngine:
             def _decode(ds) -> list[str]:  # type: ignore[no-untyped-def]
                 return [b.decode() if isinstance(b, bytes) else str(b) for b in ds[:]]
 
-            # Use the test split (patient keys) for validation in the exhaustive job.
-            test_patient_keys = _decode(f["splits/test"])
+            val_patient_keys = _decode(f[f"splits/cv/fold_{self.cfg.fold}/val"])
             offsets = f["patients/offsets"][:]
             csr_keys = _decode(f["patients/keys"])
             all_ids = _decode(f["ids"])
 
+        n_pick = min(int(budget), len(val_patient_keys))
+        if n_pick <= 0:
+            return []
+
+        rng = np.random.default_rng(int(seed))
+        chosen_idx = sorted(
+            int(i) for i in rng.choice(len(val_patient_keys), size=n_pick, replace=False)
+        )
+        chosen_patients = [val_patient_keys[i] for i in chosen_idx]
+
         key_to_pos = {k: i for i, k in enumerate(csr_keys)}
         scan_ids: list[str] = []
-        for pk in test_patient_keys:
+        for pk in chosen_patients:
             if pk not in key_to_pos:
                 continue
             pos = key_to_pos[pk]
             start, end = int(offsets[pos]), int(offsets[pos + 1])
             for row in range(start, end):
                 scan_ids.append(all_ids[row])
-
-        return scan_ids[: self.cfg.n_patients]
+        return scan_ids
 
     # ------------------------------------------------------------------
 
@@ -382,7 +413,16 @@ class ExhaustiveValEngine:
         gen_decode_time: dict[tuple[str, int], float],
         pid_to_image_h5: "dict[str, Path]",
     ) -> None:
-        """Multi-cohort path: iterate all cohorts in the registry."""
+        """Multi-cohort path: split ``n_patients`` uniformly across cohorts.
+
+        ``cfg.n_patients`` is the TOTAL budget for this epoch. It is
+        partitioned across all registered cohorts (cv + test-only) via
+        :meth:`_split_n_patients` so that the total exhaustive-val cost stays
+        constant as cohorts are added to the corpus. Each cohort's slice is
+        drawn from its CV-fold validation split with a deterministic seed
+        derived from ``cfg.seed + cohort_idx`` — so the same patients are
+        re-evaluated every epoch and the metrics traces are comparable.
+        """
         from vena.data.registry import load_registry
 
         cfg = self.cfg
@@ -390,20 +430,51 @@ class ExhaustiveValEngine:
 
         registry = load_registry(cfg.corpus_registry)
         all_cohorts = registry.cv_cohorts() + registry.test_cohorts()
+        budgets = self._split_n_patients(int(cfg.n_patients), len(all_cohorts))
+        logger.info(
+            "exhaustive-val: cohort budgets %s (total=%d, n_cohorts=%d)",
+            {c.name: b for c, b in zip(all_cohorts, budgets, strict=True)},
+            cfg.n_patients,
+            len(all_cohorts),
+        )
 
-        global_patient_count = 0
-        for cohort in all_cohorts:
-            logger.info("exhaustive-val: cohort '%s'", cohort.name)
-            patient_ids = self._cohort_val_patients(cohort.latent_h5)
+        for cohort_idx, (cohort, budget) in enumerate(
+            zip(all_cohorts, budgets, strict=True)
+        ):
+            if budget <= 0:
+                logger.info(
+                    "exhaustive-val: cohort '%s' allocated 0 patients; skipping.",
+                    cohort.name,
+                )
+                continue
+            logger.info(
+                "exhaustive-val: cohort '%s' budget=%d (seed=%d)",
+                cohort.name,
+                budget,
+                int(cfg.seed) + cohort_idx,
+            )
+            patient_ids = self._cohort_val_patients(
+                cohort.latent_h5, budget=budget, seed=int(cfg.seed) + cohort_idx
+            )
+            if not patient_ids:
+                logger.warning(
+                    "exhaustive-val: cohort '%s' yielded no patients; skipping.",
+                    cohort.name,
+                )
+                continue
             dataset = LatentH5Dataset(cohort.latent_h5, patient_ids)
             ssim_by_pid.update({pid: [] for pid in patient_ids})
             pid_to_image_h5.update({pid: cohort.image_h5 for pid in patient_ids})
 
+            # ``i`` indexes ``dataset`` (per-cohort, 0-based) so that
+            # ``dataset[i]`` returns the row for ``pid``. The previous
+            # implementation passed a global running counter here, which both
+            # mislabelled the first cross-cohort patient and raised
+            # ``IndexError`` on every subsequent one.
             for i, pid in enumerate(patient_ids):
-                overall_idx = global_patient_count + i
                 try:
                     self._process_patient(
-                        overall_idx,
+                        i,
                         pid,
                         dataset,
                         module,
@@ -426,8 +497,6 @@ class ExhaustiveValEngine:
                     )
                     continue
                 logger.info("  cohort=%s [%d/%d] %s done", cohort.name, i + 1, len(patient_ids), pid)
-
-            global_patient_count += len(patient_ids)
 
     def _process_patient(
         self,

@@ -1,12 +1,19 @@
-# Multi-cohort unfrozen-trunk run (server3) — DUAL RTX 4090 24 GB.
+# Multi-cohort 4-epoch end-to-end smoke (server3) — DUAL RTX 4090 24 GB.
 # Pools UCSF-PDGM (n=495) and BraTS-GLI (n=1133 patients / 1251 scans) via
 # CorpusRegistry + MultiCohortLatentDataModule with TemperatureBalancedSampler.
+# Corpus catalogue: routines/fm/train/configs/corpus/corpus_server3.json.
 #
 # batch_size=4 is CRITICAL: with exactly 2 cohorts and batch_size=2 the
 # diversity constraint forces every batch to be 1+1 and τ is INERT — the
 # temperature-weighted fill slots never fire because n_distinct==batch_size.
 # batch_size>n_cohorts so the fill slots (batch_size - n_distinct = 2) carry
 # the τ=0.5 signal and the sampler can up-weight the larger BraTS-GLI cohort.
+#
+# Exhaustive validation: n_patients=10 is the TOTAL budget, split uniformly
+# across the registered cohorts (5 + 5 here), sampled from each cohort's CV
+# val split with a deterministic seed so the same patients are scored every
+# epoch. block_until_complete=true so every one of the 4 epochs gets a
+# completed exhaustive pass (training cycles faster than one validation here).
 #
 # Training on cuda:0; exhaustive validation on cuda:1
 # (launch with BOTH GPUs visible — do not set CUDA_VISIBLE_DEVICES).
@@ -20,7 +27,7 @@ run:
   full_determinism: false
 
 data:
-  corpus_registry: routines/fm/train/configs/corpus/glioma_preop_v1.json
+  corpus_registry: routines/fm/train/configs/corpus/corpus_server3.json
   tau: 0.5
   fold: 0
   batch_size: 4
@@ -95,9 +102,10 @@ validation:
 exhaustive_val:
   enabled: true
   every_epochs: 1
-  n_patients: 10
+  block_until_complete: true       # 4-epoch diagnostic: every epoch gets a completed pass
+  n_patients: 10                   # TOTAL budget split uniformly across cohorts (5 UCSF + 5 BraTS-GLI)
   nfe_levels: [1, 10, 50]
-  corpus_registry: routines/fm/train/configs/corpus/glioma_preop_v1.json
+  corpus_registry: routines/fm/train/configs/corpus/corpus_server3.json
   device: cuda:1
 
 output:

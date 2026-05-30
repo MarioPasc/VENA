@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.0.0",
+  "name": "vena_dataset_corpus",
+  "cohorts": [
+    {
+      "name": "UCSF-PDGM",
+      "pathology": "preoperative_glioma",
+      "label_system": "BraTS2021",
+      "role": "cv",
+      "longitudinal": false,
+      "image_h5": "/media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_image.h5",
+      "latent_h5": "/media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_latents.h5",
+      "n_patients": 495,
+      "n_scans": 495,
+      "modalities": ["t1pre", "t1c", "t2", "flair"],
+      "has_swan": false
+    },
+    {
+      "name": "BraTS-GLI",
+      "pathology": "preoperative_glioma",
+      "label_system": "BraTS2023",
+      "role": "cv",
+      "longitudinal": true,
+      "image_h5": "/media/mpascual/MeningD2/GLIOMA/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_image.h5",
+      "latent_h5": "/media/mpascual/MeningD2/GLIOMA/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_latents.h5",
+      "n_patients": 1133,
+      "n_scans": 1251,
+      "modalities": ["t1pre", "t1c", "t2", "flair"],
+      "has_swan": false
+    }
+  ]
+}
