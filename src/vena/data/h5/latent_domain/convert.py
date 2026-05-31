@@ -73,36 +73,96 @@ _PRODUCER = f"vena.data.h5.latent_domain.convert:{_PRODUCER_VERSION}"
 # UCSF-PDGM fallback metadata fields — used when the source H5 lacks
 # manifest_json and the cohort attr suggests UCSF-PDGM origin.
 _UCSF_PDGM_METADATA_FIELDS_FALLBACK: list[dict[str, str]] = [
-    {"path": "metadata/sex", "dtype": "vlen-str", "units": "dimensionless",
-     "description": "Biological sex (M/F)."},
-    {"path": "metadata/age", "dtype": "float32", "units": "years",
-     "description": "Age at MRI acquisition."},
-    {"path": "metadata/who_grade", "dtype": "int8", "units": "WHO_grade",
-     "description": "WHO CNS tumour grade (1-4); -1 if unknown."},
-    {"path": "metadata/diagnosis", "dtype": "vlen-str", "units": "dimensionless",
-     "description": "Final pathologic diagnosis (WHO 2021)."},
-    {"path": "metadata/mgmt_status", "dtype": "vlen-str", "units": "dimensionless",
-     "description": "MGMT methylation status."},
-    {"path": "metadata/mgmt_index", "dtype": "vlen-str", "units": "dimensionless",
-     "description": "MGMT methylation index as reported (string)."},
-    {"path": "metadata/codel_1p19q", "dtype": "vlen-str", "units": "dimensionless",
-     "description": "1p/19q codeletion status."},
-    {"path": "metadata/idh", "dtype": "vlen-str", "units": "dimensionless",
-     "description": "IDH mutation status."},
-    {"path": "metadata/dead", "dtype": "int8", "units": "boolean",
-     "description": "Vital status at last follow-up (1=dead, 0=alive); -1 if unknown."},
-    {"path": "metadata/os_days", "dtype": "float32", "units": "days",
-     "description": "Overall survival in days; NaN if unknown."},
-    {"path": "metadata/eor", "dtype": "vlen-str", "units": "dimensionless",
-     "description": "Extent of resection."},
-    {"path": "metadata/biopsy_prior_imaging", "dtype": "vlen-str", "units": "dimensionless",
-     "description": "Whether biopsy preceded MRI acquisition (Yes/No)."},
-    {"path": "metadata/brats21_id", "dtype": "vlen-str", "units": "dimensionless",
-     "description": "Corresponding BraTS-2021 case ID; empty if not present."},
-    {"path": "metadata/brats21_seg_cohort", "dtype": "vlen-str", "units": "dimensionless",
-     "description": "BraTS-2021 segmentation cohort assignment."},
-    {"path": "metadata/brats21_mgmt_cohort", "dtype": "vlen-str", "units": "dimensionless",
-     "description": "BraTS-2021 MGMT cohort assignment."},
+    {
+        "path": "metadata/sex",
+        "dtype": "vlen-str",
+        "units": "dimensionless",
+        "description": "Biological sex (M/F).",
+    },
+    {
+        "path": "metadata/age",
+        "dtype": "float32",
+        "units": "years",
+        "description": "Age at MRI acquisition.",
+    },
+    {
+        "path": "metadata/who_grade",
+        "dtype": "int8",
+        "units": "WHO_grade",
+        "description": "WHO CNS tumour grade (1-4); -1 if unknown.",
+    },
+    {
+        "path": "metadata/diagnosis",
+        "dtype": "vlen-str",
+        "units": "dimensionless",
+        "description": "Final pathologic diagnosis (WHO 2021).",
+    },
+    {
+        "path": "metadata/mgmt_status",
+        "dtype": "vlen-str",
+        "units": "dimensionless",
+        "description": "MGMT methylation status.",
+    },
+    {
+        "path": "metadata/mgmt_index",
+        "dtype": "vlen-str",
+        "units": "dimensionless",
+        "description": "MGMT methylation index as reported (string).",
+    },
+    {
+        "path": "metadata/codel_1p19q",
+        "dtype": "vlen-str",
+        "units": "dimensionless",
+        "description": "1p/19q codeletion status.",
+    },
+    {
+        "path": "metadata/idh",
+        "dtype": "vlen-str",
+        "units": "dimensionless",
+        "description": "IDH mutation status.",
+    },
+    {
+        "path": "metadata/dead",
+        "dtype": "int8",
+        "units": "boolean",
+        "description": "Vital status at last follow-up (1=dead, 0=alive); -1 if unknown.",
+    },
+    {
+        "path": "metadata/os_days",
+        "dtype": "float32",
+        "units": "days",
+        "description": "Overall survival in days; NaN if unknown.",
+    },
+    {
+        "path": "metadata/eor",
+        "dtype": "vlen-str",
+        "units": "dimensionless",
+        "description": "Extent of resection.",
+    },
+    {
+        "path": "metadata/biopsy_prior_imaging",
+        "dtype": "vlen-str",
+        "units": "dimensionless",
+        "description": "Whether biopsy preceded MRI acquisition (Yes/No).",
+    },
+    {
+        "path": "metadata/brats21_id",
+        "dtype": "vlen-str",
+        "units": "dimensionless",
+        "description": "Corresponding BraTS-2021 case ID; empty if not present.",
+    },
+    {
+        "path": "metadata/brats21_seg_cohort",
+        "dtype": "vlen-str",
+        "units": "dimensionless",
+        "description": "BraTS-2021 segmentation cohort assignment.",
+    },
+    {
+        "path": "metadata/brats21_mgmt_cohort",
+        "dtype": "vlen-str",
+        "units": "dimensionless",
+        "description": "BraTS-2021 MGMT cohort assignment.",
+    },
 ]
 
 
@@ -679,9 +739,7 @@ class LatentH5Converter:
             # apply_crop_pad requires float; cast, crop, cast back.
             seg_float = apply_crop_pad(seg_t.float(), spec)
             seg_cropped = seg_float.to(torch.int64)
-            mask_latent = self.mask_downsampler.downsample(
-                seg_cropped, target_shape=LATENT_SPATIAL
-            )
+            mask_latent = self.mask_downsampler.downsample(seg_cropped, target_shape=LATENT_SPATIAL)
             mask_np = mask_latent[0].detach().to("cpu").numpy()
             assign_row(tumor_dset, out_row, mask_np)
             del seg_t, mask_latent
@@ -758,8 +816,16 @@ class LatentH5Converter:
             return out
         if dtype == "int8":
             return np.asarray(raw, dtype=np.int8)
+        if dtype == "int16":
+            return np.asarray(raw, dtype=np.int16)
+        if dtype == "int32":
+            return np.asarray(raw, dtype=np.int32)
+        if dtype == "int64":
+            return np.asarray(raw, dtype=np.int64)
         if dtype == "float32":
             return np.asarray(raw, dtype=np.float32)
+        if dtype == "float64":
+            return np.asarray(raw, dtype=np.float64)
         raise ValueError(f"unhandled metadata dtype {dtype!r}")
 
     @staticmethod
@@ -768,8 +834,16 @@ class LatentH5Converter:
             return np.asarray([""] * n, dtype=object)
         if dtype == "int8":
             return np.full(n, -1, dtype=np.int8)
+        if dtype == "int16":
+            return np.full(n, -1, dtype=np.int16)
+        if dtype == "int32":
+            return np.full(n, -1, dtype=np.int32)
+        if dtype == "int64":
+            return np.full(n, -1, dtype=np.int64)
         if dtype == "float32":
             return np.full(n, np.nan, dtype=np.float32)
+        if dtype == "float64":
+            return np.full(n, np.nan, dtype=np.float64)
         raise ValueError(f"unhandled metadata dtype {dtype!r}")
 
     @staticmethod

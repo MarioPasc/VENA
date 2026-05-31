@@ -1,0 +1,20 @@
+# IvyGAP image-domain H5 cache — smoke run (schema 2.0.0).
+#
+# 4 patients with a 1/1/2 train/val/test partition: sanity-checks the converter
+# (reorient, registration-variant precedence, UPenn seg discovery, brain mask
+# derivation, crop/origin, CSR layout, three-way split) without scanning all
+# 34 patients.
+
+source_root: "/media/mpascual/MeningD2/GLIOMA/IVYGAP/PKG - IvyGAP-Radiomics-SRI/IvyGAP-Radiomics/Multi-Institutional Paired Expert Segmentations SRI images-atlas-annotations"
+output_path: /tmp/vena_smoke_h5/IvyGAP_image_smoke.h5
+
+n_jobs: 2
+crop_box: [192, 224, 192]
+n_val: 1
+n_test: 2
+seed: 0
+tumor_seg_source: upenn
+
+overwrite: true
+limit: 4
+log_level: INFO

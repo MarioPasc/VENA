@@ -1,0 +1,12 @@
+# BraTS-Africa OtherNeoplasms smoke run.
+
+cohort_name: brats_africa_other
+source_root: /media/mpascual/MeningD2/GLIOMA/BRATS_AFRICA/BraTS-Africa/51_OtherNeoplasms
+output_path: /tmp/vena_smoke_h5/BraTS_Africa_other_image_smoke.h5
+
+n_jobs: 2
+crop_box: [192, 224, 192]
+
+overwrite: true
+limit: 4
+log_level: INFO

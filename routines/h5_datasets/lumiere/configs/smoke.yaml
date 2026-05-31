@@ -1,0 +1,19 @@
+# LUMIERE image-domain H5 cache — smoke run (schema 2.0.0).
+#
+# 4 patients (all their sessions kept) at n_jobs=2: sanity-check the
+# converter (CSR contiguity, multi-session indexing, DeepBraTumIA paths,
+# brain-mask consumption) without scanning all 91 patients.
+
+source_root: /media/mpascual/MeningD2/GLIOMA/LUMIERE/Imaging-v202211/Imaging
+output_path: /tmp/vena_smoke_h5/LUMIERE_image_smoke.h5
+
+n_jobs: 2
+crop_box: [192, 224, 192]
+test_fraction: 0.5
+n_test_min: 1
+n_folds: 2
+seed: 0
+
+overwrite: true
+limit: 4
+log_level: INFO

@@ -1,0 +1,15 @@
+# BraTS-Africa OtherNeoplasms image-domain H5 cache — full conversion.
+#
+# 51 cross-sectional non-glioma patients (mixed NHL/meningioma/metastasis/...).
+# SRI24 1 mm iso (240, 240, 155), skull-stripped, BraTS-pipeline z-score
+# normalised. OOD test-only role.
+
+cohort_name: brats_africa_other
+source_root: /media/mpascual/MeningD2/GLIOMA/BRATS_AFRICA/BraTS-Africa/51_OtherNeoplasms
+output_path: /media/mpascual/MeningD2/GLIOMA/BRATS_AFRICA/h5/BraTS_Africa_other_image.h5
+
+n_jobs: 8
+crop_box: [192, 224, 192]
+
+overwrite: true
+log_level: INFO

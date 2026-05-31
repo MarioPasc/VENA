@@ -1,0 +1,25 @@
+# IvyGAP image-domain H5 cache — full conversion (schema 2.0.0).
+#
+# Output: native-LPS (N, 240, 240, 155) tensors for t1pre / t1c / t2 / flair +
+# UPenn tumour seg + brain mask (derived from t1pre foreground); per-scan
+# crop/origin for the common 192x224x192 box; trivial CSR (1:1) patient
+# grouping; metadata columns recording the chosen registration variant per
+# modality (_N4_r > _r3 > _r) and the optional CWRU annotation path.
+#
+# Splits: single random 24/5/5 train/val/test at the patient level (N=34
+# too small for nested K-fold CV per .claude/plans/...).
+#
+# Runtime estimate: ~3-5 min on 8 CPU cores (34 patients x 5 NIfTI loads).
+
+source_root: "/media/mpascual/MeningD2/GLIOMA/IVYGAP/PKG - IvyGAP-Radiomics-SRI/IvyGAP-Radiomics/Multi-Institutional Paired Expert Segmentations SRI images-atlas-annotations"
+output_path: /media/mpascual/MeningD2/GLIOMA/IVYGAP/h5/IvyGAP_image.h5
+
+n_jobs: 8
+crop_box: [192, 224, 192]
+n_val: 5
+n_test: 5
+seed: 42
+tumor_seg_source: upenn
+
+overwrite: true
+log_level: INFO

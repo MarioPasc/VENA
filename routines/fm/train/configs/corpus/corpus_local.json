@@ -27,6 +27,58 @@
       "n_scans": 1251,
       "modalities": ["t1pre", "t1c", "t2", "flair"],
       "has_swan": false
+    },
+    {
+      "name": "IvyGAP",
+      "pathology": "glioma",
+      "label_system": "BraTS2021",
+      "role": "cv",
+      "longitudinal": false,
+      "image_h5": "/media/mpascual/MeningD2/GLIOMA/IVYGAP/h5/IvyGAP_image.h5",
+      "latent_h5": "/media/mpascual/MeningD2/GLIOMA/IVYGAP/h5/IvyGAP_latents.h5",
+      "n_patients": 34,
+      "n_scans": 34,
+      "modalities": ["t1pre", "t1c", "t2", "flair"],
+      "has_swan": false
+    },
+    {
+      "name": "BraTS-Africa-Glioma",
+      "pathology": "glioma",
+      "label_system": "BraTS2023",
+      "role": "test_only",
+      "longitudinal": false,
+      "image_h5": "/media/mpascual/MeningD2/GLIOMA/BRATS_AFRICA/h5/BraTS_Africa_glioma_image.h5",
+      "latent_h5": "/media/mpascual/MeningD2/GLIOMA/BRATS_AFRICA/h5/BraTS_Africa_glioma_latents.h5",
+      "n_patients": 95,
+      "n_scans": 95,
+      "modalities": ["t1pre", "t1c", "t2", "flair"],
+      "has_swan": false
+    },
+    {
+      "name": "BraTS-Africa-Other",
+      "pathology": "other_neoplasm",
+      "label_system": "BraTS2023",
+      "role": "test_only",
+      "longitudinal": false,
+      "image_h5": "/media/mpascual/MeningD2/GLIOMA/BRATS_AFRICA/h5/BraTS_Africa_other_image.h5",
+      "latent_h5": "/media/mpascual/MeningD2/GLIOMA/BRATS_AFRICA/h5/BraTS_Africa_other_latents.h5",
+      "n_patients": 51,
+      "n_scans": 51,
+      "modalities": ["t1pre", "t1c", "t2", "flair"],
+      "has_swan": false
+    },
+    {
+      "name": "LUMIERE",
+      "pathology": "glioma",
+      "label_system": "BraTS2023",
+      "role": "cv",
+      "longitudinal": true,
+      "image_h5": "/media/mpascual/MeningD2/GLIOMA/LUMIERE/h5/LUMIERE_image.h5",
+      "latent_h5": "/media/mpascual/MeningD2/GLIOMA/LUMIERE/h5/LUMIERE_latents.h5",
+      "n_patients": 91,
+      "n_scans": 638,
+      "modalities": ["t1pre", "t1c", "t2", "flair"],
+      "has_swan": false
     }
   ]
 }

@@ -1,0 +1,12 @@
+# BraTS-Africa Glioma smoke run — 4 patients to sanity-check the pipeline.
+
+cohort_name: brats_africa_glioma
+source_root: /media/mpascual/MeningD2/GLIOMA/BRATS_AFRICA/BraTS-Africa/95_Glioma
+output_path: /tmp/vena_smoke_h5/BraTS_Africa_glioma_image_smoke.h5
+
+n_jobs: 2
+crop_box: [192, 224, 192]
+
+overwrite: true
+limit: 4
+log_level: INFO

@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from .brats_africa import (
+    BraTSAfricaGliomaDataset,
+    BraTSAfricaOtherDataset,
+    BraTSAfricaPatient,
+)
+from .ivy_gap import IvyGAPDataset, IvyGAPPatient
+from .lumiere import LUMIEREDataset, LUMIERESession
 from .shared import (
     ModalityNotFoundError,
     NiftiVolume,
@@ -17,6 +24,13 @@ from .shared import (
 from .ucsf_pdgm import UCSFPDGMDataset, UCSFPDGMPatient
 
 __all__ = [
+    "BraTSAfricaGliomaDataset",
+    "BraTSAfricaOtherDataset",
+    "BraTSAfricaPatient",
+    "IvyGAPDataset",
+    "IvyGAPPatient",
+    "LUMIEREDataset",
+    "LUMIERESession",
     "ModalityNotFoundError",
     "NiftiVolume",
     "NiigzLoadError",
