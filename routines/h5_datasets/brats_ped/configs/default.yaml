@@ -1,0 +1,15 @@
+# BraTS-PED 2024 image-domain H5 cache — full conversion (schema 2.0.0).
+#
+# ~261 cross-sectional pediatric HGG patients in SRI24 1 mm iso (240,240,155),
+# HD-BET skull-stripped (produced by routines/preprocess/brats_ped_skullstrip),
+# BraTS-2023 tumour labels {0,1,2,3}. OOD test-only role: splits/test contains
+# every patient; no CV folds.
+
+source_root: /media/mpascual/MeningD2/GLIOMA/BRATS_PED/skull_stripped
+output_path: /media/mpascual/MeningD2/GLIOMA/BRATS_PED/h5/BraTS_PED_image.h5
+
+n_jobs: 8
+crop_box: [192, 224, 192]
+
+overwrite: true
+log_level: INFO

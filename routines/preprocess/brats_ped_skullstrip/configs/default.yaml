@@ -1,0 +1,24 @@
+# HD-BET skull-strip of BraTS-PED 2024 (defaced → skull-stripped tree).
+#
+# The source tree is the unzip output of BraTS2024-PED-Challenge-TrainingData.
+# Each patient directory holds five NIfTI files: t1n, t1c, t2w, t2f, seg
+# in SRI24 1 mm iso LPS, but only defaced — the skull is still present.
+#
+# HD-BET v2 (isolated in ~/.conda/envs/hdbet) is run on t1n; the derived
+# brain mask is applied to t1c/t2w/t2f; seg is carried through unchanged.
+
+source_root: /media/mpascual/MeningD2/GLIOMA/BRATS_PED/BraTS2024-PED-Challenge-TrainingData/BraTS-PEDs2024_Training
+dest_root: /media/mpascual/MeningD2/GLIOMA/BRATS_PED/skull_stripped
+
+hdbet_python: /home/mpascual/.conda/envs/hdbet/bin/python
+hdbet_cli: /home/mpascual/.conda/envs/hdbet/bin/hd-bet
+
+device: cuda:0
+disable_tta: false
+
+reference_modality: t1pre
+also_apply_to: [t1c, t2, flair]
+
+n_jobs: 1
+overwrite: false
+log_level: INFO

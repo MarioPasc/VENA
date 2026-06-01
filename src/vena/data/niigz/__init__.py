@@ -7,6 +7,7 @@ from .brats_africa import (
     BraTSAfricaOtherDataset,
     BraTSAfricaPatient,
 )
+from .brats_ped import BraTSPedDataset, BraTSPedPatient
 from .ivy_gap import IvyGAPDataset, IvyGAPPatient
 from .lumiere import LUMIEREDataset, LUMIERESession
 from .shared import (
@@ -27,6 +28,8 @@ __all__ = [
     "BraTSAfricaGliomaDataset",
     "BraTSAfricaOtherDataset",
     "BraTSAfricaPatient",
+    "BraTSPedDataset",
+    "BraTSPedPatient",
     "IvyGAPDataset",
     "IvyGAPPatient",
     "LUMIEREDataset",

@@ -1,0 +1,54 @@
+# MAISI encode — BraTS-PED 2024 full cohort, server3 (icai-server).
+#
+# OOD cohort (role=test_only in corpus_server3.json). Normalisation/precision
+# identical to UCSF-PDGM + BraTS-GLI + BraTS-Africa for latent comparability.
+
+source_image_h5: /media/hddb/mario/data/GLIOMAS/brats_ped/h5/BraTS_PED_image.h5
+autoencoder_checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+output_dir: /media/hddb/mario/results/vena/encode_brats_ped_maisi
+output_h5_path: /media/hddb/mario/data/GLIOMAS/brats_ped/h5/BraTS_PED_latents.h5
+
+modalities: [t1pre, t1c, t2, flair]
+device: cuda
+
+precision_mode: fp32
+autoencoder_norm_float16: null
+
+inference_mode: auto
+depth_pad_base: 8
+
+sliding_window:
+  roi_size: [80, 80, 32]
+  overlap: 0.4
+  mode: gaussian
+
+percentile_lower: 0.0
+percentile_upper: 99.95
+percentile_foreground_only: true
+
+mask_downsampler:
+  name: per_class_avg_pool
+  params: {}
+
+limit: null
+encode_full_cohort: true
+checkpoint_every: 25
+resume_from_run_id: null
+overwrite: false
+log_level: INFO
+seed: 42
+
+roundtrip:
+  enabled: true
+  figure_filename: roundtrip.png
+  n_patients: 4
+  modalities: [t1pre, t1c, t2, flair]
+
+stabilization:
+  enabled: false
+
+pca:
+  enabled: true
+  figure_filename: pca.png
+  pooling: global_avg
+  n_components: 2

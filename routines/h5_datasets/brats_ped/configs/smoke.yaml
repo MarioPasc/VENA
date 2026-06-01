@@ -1,0 +1,11 @@
+# BraTS-PED smoke run — 4 patients to sanity-check the pipeline.
+
+source_root: /media/mpascual/MeningD2/GLIOMA/BRATS_PED/skull_stripped
+output_path: /tmp/vena_smoke_h5/BraTS_PED_image_smoke.h5
+
+n_jobs: 2
+crop_box: [192, 224, 192]
+
+overwrite: true
+limit: 4
+log_level: INFO

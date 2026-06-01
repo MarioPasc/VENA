@@ -1,0 +1,18 @@
+# 4-patient smoke check for the HD-BET skull-strip routine.
+
+source_root: /media/mpascual/MeningD2/GLIOMA/BRATS_PED/BraTS2024-PED-Challenge-TrainingData/BraTS-PEDs2024_Training
+dest_root: /tmp/vena_smoke_hdbet/brats_ped
+
+hdbet_python: /home/mpascual/.conda/envs/hdbet/bin/python
+hdbet_cli: /home/mpascual/.conda/envs/hdbet/bin/hd-bet
+
+device: cuda:0
+disable_tta: true
+
+reference_modality: t1pre
+also_apply_to: [t1c, t2, flair]
+
+n_jobs: 1
+overwrite: true
+limit: 4
+log_level: INFO
