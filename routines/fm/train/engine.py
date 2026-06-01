@@ -217,6 +217,15 @@ class _ExhaustiveValCfg(BaseModel):
     # Join each validation before training continues (one completed exhaustive
     # pass per cadence epoch). Default False = production async/skip-if-busy.
     block_until_complete: bool = False
+    # How many top-best / top-worst patients to render as qualitative panels per
+    # epoch (``figure_best_{1..k}.png`` + ``figure_worst_{1..k}.png``). Clamped
+    # at job runtime to ``len(scored_patients) // 2`` so the lists never overlap.
+    figure_top_k: int = 3
+    # Prune ``ema_snapshot.pt`` / ``trunk_ema_snapshot.pt`` from epoch dirs older
+    # than ``prune_snapshots_keep`` cadence epochs. ``latent_preds.h5`` and
+    # ``metrics.csv`` are NEVER pruned — they are the long-run diagnostic record.
+    # 0 disables pruning.
+    prune_snapshots_keep: int = 2
 
     @model_validator(mode="before")
     @classmethod
@@ -498,6 +507,7 @@ class FMTrainRoutineEngine:
             "nfe_levels": list(ev.nfe_levels),
             "integrator": ev.integrator,
             "n_patients": ev.n_patients,
+            "figure_top_k": ev.figure_top_k,
         }
         job["corpus_registry"] = str(ev.corpus_registry)
         return job
@@ -683,6 +693,7 @@ class FMTrainRoutineEngine:
                     cwd=Path(__file__).resolve().parents[3],
                     python_executable=cfg.exhaustive_val.python_executable,
                     block_until_complete=cfg.exhaustive_val.block_until_complete,
+                    prune_snapshots_keep=cfg.exhaustive_val.prune_snapshots_keep,
                 )
             )
 

@@ -48,6 +48,7 @@ class ExhaustiveValLauncher(pl.Callback):
         cwd: Path | str,
         python_executable: str | None = None,
         block_until_complete: bool = False,
+        prune_snapshots_keep: int = 0,
     ) -> None:
         super().__init__()
         self.run_dir = Path(run_dir)
@@ -61,6 +62,12 @@ class ExhaustiveValLauncher(pl.Callback):
         # would otherwise trip the skip-if-busy guard). Default False keeps the
         # production async, non-blocking behaviour.
         self.block_until_complete = bool(block_until_complete)
+        # Number of most-recent exhaustive epoch dirs whose EMA snapshots are
+        # kept on disk. 0 disables pruning (keep everything — useful for short
+        # diagnostic runs). The ``metrics.csv``, ``timing.csv`` and
+        # ``latent_preds.h5`` files are NEVER pruned; only the ~1 GB
+        # ``ema_snapshot.pt`` / ``trunk_ema_snapshot.pt`` files are.
+        self.prune_snapshots_keep = int(prune_snapshots_keep)
         self.cwd = Path(cwd)
         self.python = python_executable or sys.executable
         self.out_root = self.run_dir / "exhaustive_val"
@@ -156,6 +163,44 @@ class ExhaustiveValLauncher(pl.Callback):
             self.device,
             sublog,
         )
+        # Prune stale snapshots from older epoch dirs. We trigger at *launch*
+        # time so the just-launched subprocess is free to read its own snapshot;
+        # by construction the previous validation has finished by now (we
+        # checked ``self._proc.poll()`` before launching).
+        self._prune_old_snapshots(current_epoch=epoch)
+
+    def _prune_old_snapshots(self, current_epoch: int) -> None:
+        """Delete EMA snapshots from epoch dirs older than the keep window.
+
+        Keeps the ``prune_snapshots_keep`` most-recent epoch dirs (sorted by
+        epoch number, including the just-launched one). All older epoch dirs
+        keep their CSV/H5/figure artifacts but lose their snapshots.
+        """
+        if self.prune_snapshots_keep <= 0:
+            return
+        epoch_dirs = sorted(
+            (d for d in self.out_root.glob("epoch_*") if d.is_dir()),
+            key=lambda p: p.name,
+        )
+        if len(epoch_dirs) <= self.prune_snapshots_keep:
+            return
+        to_prune = epoch_dirs[: -self.prune_snapshots_keep]
+        freed_mb = 0.0
+        for d in to_prune:
+            for name in ("ema_snapshot.pt", "trunk_ema_snapshot.pt"):
+                p = d / name
+                if p.exists():
+                    freed_mb += p.stat().st_size / (1024 * 1024)
+                    try:
+                        p.unlink()
+                    except OSError as exc:
+                        logger.warning("ExhaustiveValLauncher: could not prune %s (%s)", p, exc)
+        if freed_mb > 0:
+            logger.info(
+                "ExhaustiveValLauncher: pruned %d stale snapshot dir(s), freed %.1f MB.",
+                len(to_prune),
+                freed_mb,
+            )
 
     def _log_gpu_usage(self, epoch: int) -> None:
         ts = datetime.now(UTC).isoformat()

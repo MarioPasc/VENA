@@ -67,6 +67,10 @@ class TrainMetricsCSV(pl.Callback):
         # skips the pre-first-step accumulation micro-batches at global_step 0).
         self._last_step: int = 0
         self._epoch_accum: dict[str, list[float]] = {}
+        # Per-cohort cfm columns are discovered at runtime (P1.2): the order is
+        # frozen on first epoch-write so the CSV schema stays stable across
+        # subsequent epochs even if one cohort is absent from a particular epoch.
+        self._epoch_header: list[str] | None = None
 
     # ------------------------------------------------------------------
     # Per-step
@@ -114,6 +118,13 @@ class TrainMetricsCSV(pl.Callback):
         for k in _EPOCH_AGG_KEYS:
             if k in scalars:
                 self._epoch_accum.setdefault(k, []).append(scalars[k])
+        # P1.2 — also accumulate any per-cohort cfm key discovered at runtime.
+        # The module logs ``train/cfm_cohort_<sanitised-name>`` per step when
+        # the batch carries cohort tags; these keys are absent for
+        # single-cohort runs.
+        for k in scalars:
+            if k.startswith("cfm_cohort_"):
+                self._epoch_accum.setdefault(k, []).append(scalars[k])
 
     # ------------------------------------------------------------------
     # Per-epoch
@@ -123,15 +134,21 @@ class TrainMetricsCSV(pl.Callback):
         if not self._epoch_accum:
             return
         epoch = int(trainer.current_epoch)
+        # Freeze the per-cohort key order the first time we write — so the
+        # epoch CSV has a stable schema even if a cohort is missing from a
+        # later epoch's batches (unusual but possible with extreme sampling).
+        if self._epoch_header is None:
+            cohort_keys = sorted(k for k in self._epoch_accum if k.startswith("cfm_cohort_"))
+            self._epoch_header = list(_EPOCH_AGG_KEYS) + cohort_keys
         cols = ["epoch", "step", "n_steps"]
-        for k in _EPOCH_AGG_KEYS:
+        for k in self._epoch_header:
             cols += [f"{k}_mean", f"{k}_std"]
         if not self.epoch_path.exists():
             with self.epoch_path.open("w", newline="") as f:
                 csv.writer(f).writerow(cols)
         n_steps = max((len(v) for v in self._epoch_accum.values()), default=0)
         row: list[object] = [epoch, int(trainer.global_step), n_steps]
-        for k in _EPOCH_AGG_KEYS:
+        for k in self._epoch_header:
             xs = self._epoch_accum.get(k, [])
             m, s = _mean_std(xs)
             row += [_f(m), _f(s)]

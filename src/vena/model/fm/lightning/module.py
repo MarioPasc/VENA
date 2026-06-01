@@ -355,7 +355,35 @@ class FMLightningModule(pl.LightningModule):
             m_wt=m_wt,
             m_bg=m_bg,
         )
-        total, per_term = self.composite(inputs)
+        total_steps = self._estimated_total_steps()
+        total, per_term = self.composite(
+            inputs,
+            global_step=int(self.global_step),
+            total_steps=total_steps,
+        )
+        # Per-cohort CFM breakdown (P1.2). The multi-cohort dataset attaches a
+        # ``cohort`` string per sample; the DataLoader collates strings into a
+        # list. When all samples are from one cohort the .mean() across that
+        # cohort equals the global cfm; otherwise the per-cohort values diverge
+        # and reveal cohort-imbalanced drift.
+        cohort_tags = batch.get("cohort")
+        if cohort_tags is not None and v_orig.shape[0] > 1:
+            # CFM is MSE between v_orig and u_target; recompute per-sample then
+            # group by cohort (cheap: B≤8, mean is sub-microsecond).
+            per_sample = (v_orig.detach() - u_target).pow(2).flatten(1).mean(dim=1)
+            cohort_groups: dict[str, list[float]] = {}
+            for i, tag in enumerate(cohort_tags):
+                cohort_groups.setdefault(str(tag), []).append(float(per_sample[i].item()))
+            for tag, vals in cohort_groups.items():
+                # Sanitise cohort name for CSV column compatibility.
+                safe = tag.replace("/", "_").replace(" ", "_")
+                self.log(
+                    f"train/cfm_cohort_{safe}",
+                    sum(vals) / len(vals),
+                    on_step=True,
+                    on_epoch=False,
+                    batch_size=len(vals),
+                )
 
         # NaN guard.
         if not torch.isfinite(total):
@@ -436,6 +464,29 @@ class FMLightningModule(pl.LightningModule):
             on_step=True,
             on_epoch=False,
         )
+
+    def _estimated_total_steps(self) -> int | None:
+        """Total optimiser-step budget for this run, used by weight schedules.
+
+        Prefers Lightning's ``trainer.estimated_stepping_batches`` (available
+        once ``trainer.fit`` has computed the dataloader size), falling back to
+        ``optim_cfg["max_steps"]`` (read from the YAML's ``training.total_steps``
+        in the engine) when the trainer is not attached yet. Returns ``None``
+        when neither is known so schedules can no-op.
+        """
+        if getattr(self, "trainer", None) is not None:
+            try:
+                est = int(self.trainer.estimated_stepping_batches)
+                if est > 0:
+                    return est
+            except (AttributeError, ValueError, TypeError):
+                pass
+        ms = self.optim_cfg.get("max_steps")
+        try:
+            ms_int = int(ms) if ms is not None else None
+            return ms_int if ms_int and ms_int > 0 else None
+        except (TypeError, ValueError):
+            return None
 
     def _trainable_grad_norm(self) -> torch.Tensor:
         """Global L2 norm over all optimised parameters.

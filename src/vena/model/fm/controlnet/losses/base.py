@@ -22,6 +22,8 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from .schedule import StaticWeight, WeightSchedule
+
 
 @dataclass
 class LossInputs:
@@ -111,7 +113,7 @@ class CompositeLoss(nn.Module):
     def __init__(
         self,
         terms: dict[str, AbstractFMLoss],
-        weights: dict[str, float],
+        weights: dict[str, float | WeightSchedule],
         requires_perturbed_pass: bool,
         stage: str,
     ) -> None:
@@ -122,17 +124,35 @@ class CompositeLoss(nn.Module):
                 f"weights={list(weights)}"
             )
         self.terms = nn.ModuleDict(terms)
-        self.weights: dict[str, float] = dict(weights)
+        # Coerce raw floats into ``StaticWeight`` schedules so the inner loop is
+        # uniform. The legacy ``.weights`` dict is kept as a *snapshot of the
+        # initial constants* for back-compat with existing tests that read it;
+        # the live values come from ``self.schedules[name].at(step, total)``.
+        self.schedules: dict[str, WeightSchedule] = {
+            name: (w if isinstance(w, WeightSchedule) else StaticWeight(float(w)))
+            for name, w in weights.items()
+        }
+        self.weights: dict[str, float] = {
+            name: sched.at(None, None) for name, sched in self.schedules.items()
+        }
         self.requires_perturbed_pass = bool(requires_perturbed_pass)
         self.stage = str(stage)
 
-    def forward(self, inputs: LossInputs) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def forward(
+        self,
+        inputs: LossInputs,
+        *,
+        global_step: int | None = None,
+        total_steps: int | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         per_term: dict[str, torch.Tensor] = {}
         total = torch.zeros((), device=inputs.x_clean.device, dtype=inputs.x_clean.dtype)
         for name, term in self.terms.items():
             value = term(inputs)
             per_term[name] = value.detach()
-            total = total + self.weights[name] * value
+            w = self.schedules[name].at(global_step, total_steps)
+            per_term[f"{name}_weight"] = torch.tensor(w, device=value.device, dtype=value.dtype)
+            total = total + w * value
             for aux_key, aux_val in term.aux().items():
                 per_term[f"{name}/{aux_key}"] = aux_val.detach()
         per_term["total"] = total.detach()

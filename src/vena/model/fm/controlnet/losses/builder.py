@@ -20,6 +20,10 @@ from .base import AbstractFMLoss, CompositeLoss
 from .cfm import CFMLoss
 from .contrastive import ContrastiveTumourLoss
 from .reconstruction import CappedLpReconLoss
+from .schedule import (
+    WeightSchedule,
+    build_schedule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +66,9 @@ def build_loss(stage: str, cfg: dict[str, Any]) -> CompositeLoss:
             norm=_get(cfm_cfg, "norm", "l2"),
         )
     }
-    weights: dict[str, float] = {"cfm": float(_get(cfm_cfg, "weight", 1.0))}
+    weights: dict[str, WeightSchedule] = {
+        "cfm": build_schedule(_get(cfm_cfg, "weight", 1.0), _get(cfm_cfg, "schedule", None)),
+    }
     requires_perturb = False
 
     if stage_norm in {"S2", "S3", "skipS1"}:
@@ -73,7 +79,10 @@ def build_loss(stage: str, cfg: dict[str, Any]) -> CompositeLoss:
             p_t=float(_get(contrast_cfg, "p_t", 1.0)),
             p_b=float(_get(contrast_cfg, "p_b", 3.0)),
         )
-        weights["contrastive"] = float(_get(contrast_cfg, "weight", 0.01))
+        weights["contrastive"] = build_schedule(
+            _get(contrast_cfg, "weight", 0.01),
+            _get(contrast_cfg, "schedule", None),
+        )
         requires_perturb = True
 
     if stage_norm == "S3":
@@ -81,7 +90,10 @@ def build_loss(stage: str, cfg: dict[str, Any]) -> CompositeLoss:
             p=int(_get(recon_cfg, "p", 4)),
             delta=float(_get(recon_cfg, "delta", 2.0)),
         )
-        weights["reconstruction"] = float(_get(recon_cfg, "weight", 0.1))
+        weights["reconstruction"] = build_schedule(
+            _get(recon_cfg, "weight", 0.1),
+            _get(recon_cfg, "schedule", None),
+        )
 
     logger.info(
         "build_loss(stage=%s): terms=%s requires_perturbed_pass=%s",
