@@ -338,6 +338,12 @@ class FMLightningModule(pl.LightningModule):
                 spacing,
             )
 
+        m_wt = batch.get("m_wt")
+        m_bg = (
+            _bg_from_wt(m_wt)
+            if (m_wt is not None and self.composite.requires_perturbed_pass)
+            else None
+        )
         inputs = LossInputs(
             x_clean=x1,
             noise=x0,
@@ -346,7 +352,8 @@ class FMLightningModule(pl.LightningModule):
             u_target=u_target,
             v_orig=v_orig,
             v_perturb=v_perturb,
-            m_wt=batch.get("m_wt"),
+            m_wt=m_wt,
+            m_bg=m_bg,
         )
         total, per_term = self.composite(inputs)
 
@@ -446,6 +453,20 @@ class FMLightningModule(pl.LightningModule):
                 sq_sum = sq_sum + p.grad.detach().float().pow(2).sum()
         return sq_sum.sqrt()
 
+    def _trunk_grad_norm(self) -> torch.Tensor:
+        """Global L2 norm over the trunk parameters only (unfrozen-trunk run).
+
+        Returned independently so the train CSV can monitor the trunk's
+        gradient magnitude alongside the combined-norm and detect the case where
+        the trunk explodes while the ControlNet stays quiet (or vice versa).
+        Callers gate on ``self.trunk_config.trainable``.
+        """
+        sq_sum = torch.zeros((), device=self.device)
+        for p in self.trunk.parameters():
+            if p.grad is not None:
+                sq_sum = sq_sum + p.grad.detach().float().pow(2).sum()
+        return sq_sum.sqrt()
+
     def configure_gradient_clipping(
         self,
         optimizer: torch.optim.Optimizer,
@@ -461,14 +482,26 @@ class FMLightningModule(pl.LightningModule):
         clip was active this step.
         """
         pre = self._trainable_grad_norm()
+        trunk_pre: torch.Tensor | None = (
+            self._trunk_grad_norm() if self.trunk_config.trainable else None
+        )
         self.clip_gradients(
             optimizer,
             gradient_clip_val=gradient_clip_val,
             gradient_clip_algorithm=gradient_clip_algorithm,
         )
         post = self._trainable_grad_norm()
+        trunk_post: torch.Tensor | None = (
+            self._trunk_grad_norm() if self.trunk_config.trainable else None
+        )
+        # ``grad_norm_cn_*`` is misnamed historically — it is the combined
+        # ControlNet + (unfrozen) trunk norm. Kept as-is for CSV back-compat with
+        # earlier runs. The trunk-only keys below are the actual decomposition.
         self.log("train/grad_norm_cn_preclip", pre, on_step=True, on_epoch=False)
         self.log("train/grad_norm_cn_postclip", post, on_step=True, on_epoch=False)
+        if trunk_pre is not None and trunk_post is not None:
+            self.log("train/grad_norm_trunk_preclip", trunk_pre, on_step=True, on_epoch=False)
+            self.log("train/grad_norm_trunk_postclip", trunk_post, on_step=True, on_epoch=False)
         if gradient_clip_val:
             self.log(
                 "train/grad_clip_active",
@@ -893,6 +926,29 @@ class FMLightningModule(pl.LightningModule):
 # ----------------------------------------------------------------------
 # Aggregator helpers — kept module-level to be picklable for DataLoader workers.
 # ----------------------------------------------------------------------
+
+
+def _bg_from_wt(m_wt: torch.Tensor) -> torch.Tensor:
+    """Dilated-complement background mask in latent space.
+
+    ``m_bg = 1 - dilate3(m_wt)`` where ``dilate3`` is a 3×3×3 max-pool — the
+    same primitive used by ``RegionMasks._dilate_wt`` for the validation-time WT
+    dilation. The complement spans every voxel that is *not* within one latent
+    voxel of the tumour, matching proposal §5.3 step 1.
+
+    Parameters
+    ----------
+    m_wt : Tensor
+        Binary whole-tumour mask in latent space, shape ``(B, 1, h, w, d)``.
+
+    Returns
+    -------
+    Tensor
+        Background mask of the same shape, valued in ``{0, 1}``.
+    """
+    m = m_wt.to(dtype=torch.float32)
+    dilated = F.max_pool3d(m, kernel_size=3, stride=1, padding=1)
+    return (1.0 - dilated).clamp_(0.0, 1.0)
 
 
 def _new_agg() -> dict[str, Any]:

@@ -20,8 +20,12 @@ def _make_inputs(B: int = 1, C: int = 4, h: int = 4, w: int = 4, d: int = 4) -> 
     u = x1 - x0
     v = torch.randn(B, C, h, w, d)
     return LossInputs(
-        x_clean=x1, noise=x0, x_t=x_t, timesteps=torch.zeros(B, dtype=torch.long),
-        u_target=u, v_orig=v,
+        x_clean=x1,
+        noise=x0,
+        x_t=x_t,
+        timesteps=torch.zeros(B, dtype=torch.long),
+        u_target=u,
+        v_orig=v,
     )
 
 
@@ -39,8 +43,11 @@ def test_cfm_loss_zero_when_prediction_is_target() -> None:
     loss = CFMLoss()
     inputs = _make_inputs()
     inputs = LossInputs(
-        x_clean=inputs.x_clean, noise=inputs.noise, x_t=inputs.x_t,
-        timesteps=inputs.timesteps, u_target=inputs.u_target,
+        x_clean=inputs.x_clean,
+        noise=inputs.noise,
+        x_t=inputs.x_t,
+        timesteps=inputs.timesteps,
+        u_target=inputs.u_target,
         v_orig=inputs.u_target,  # perfect prediction
     )
     val = loss(inputs)
@@ -77,10 +84,29 @@ def test_build_loss_rejects_unknown_stage() -> None:
 
 
 @pytest.mark.unit
-def test_s2_contrastive_stub_raises_on_forward() -> None:
-    composite = build_loss("S2", {})
-    inputs = _make_inputs()
-    with pytest.raises(NotImplementedError, match="S2 commit"):
+def test_s3_reconstruction_stub_raises_on_forward() -> None:
+    """S3 still depends on the CappedLpReconLoss stub; confirm it raises until
+    that loss lands. (S2's contrastive is now implemented — see
+    ``tests/model/fm/test_losses_contrastive.py``.)
+    """
+    composite = build_loss("S3", {})
+    # Provide v_perturb + m_wt + m_bg so the (now-implemented) contrastive term
+    # is satisfied; the failure should come from the recon stub that runs next.
+    base = _make_inputs()
+    B, C, h, w, d = base.v_orig.shape
+    m = torch.zeros(B, 1, h, w, d)
+    inputs = LossInputs(
+        x_clean=base.x_clean,
+        noise=base.noise,
+        x_t=base.x_t,
+        timesteps=base.timesteps,
+        u_target=base.u_target,
+        v_orig=base.v_orig,
+        v_perturb=torch.zeros_like(base.v_orig),
+        m_wt=m,
+        m_bg=m,
+    )
+    with pytest.raises(NotImplementedError, match="S3 commit"):
         composite(inputs)
 
 

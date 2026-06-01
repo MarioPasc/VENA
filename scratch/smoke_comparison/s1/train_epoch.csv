@@ -1,0 +1,5 @@
+epoch,step,n_steps,cfm_mean,cfm_std,contrastive_mean,contrastive_std,reconstruction_mean,reconstruction_std,total_mean,total_std,samples_per_sec_mean,samples_per_sec_std,grad_norm_cn_preclip_mean,grad_norm_cn_preclip_std,grad_norm_cn_postclip_mean,grad_norm_cn_postclip_std,grad_norm_trunk_preclip_mean,grad_norm_trunk_preclip_std,grad_norm_trunk_postclip_mean,grad_norm_trunk_postclip_std,t_mean_mean,t_mean_std,gpu_mem_peak_mb_mean,gpu_mem_peak_mb_std
+0,850,850,1.87265,0.515324,,,,,1.87265,0.515324,29.7981,1.13725,82.2057,79.1666,1,8.58074e-08,82.1914,79.1636,0.999632,0.000835518,499.883,204.636,11461.3,100.183
+1,1700,850,1.47445,0.203561,,,,,1.47445,0.203561,29.9907,0.650928,19.4282,17.4398,0.999992,0.000224692,19.4083,17.4365,0.998009,0.00472441,487.621,202.708,11464.8,2.37677
+2,2550,850,1.4266,0.206331,,,,,1.4266,0.206331,30.0601,0.652291,8.77018,7.21288,0.999141,0.0139488,8.75212,7.2116,0.995041,0.0165757,499.573,208.487,11465.9,2.50431
+3,3400,850,1.42765,0.206305,,,,,1.42765,0.206305,30.0338,0.578538,6.93645,5.12716,0.998796,0.0123592,6.91812,5.12837,0.993328,0.0170913,494.86,202.635,11465.7,2.3996

@@ -2,7 +2,7 @@
 
 Stage names follow the proposal:
 
-* ``S1``      — :math:`\mathcal{L}_{\text{CFM}}` only.
+* ``S1``      — :math:`\\mathcal{L}_{\text{CFM}}` only.
 * ``S2``      — S1 + contrastive ROI + contrastive BG.
 * ``S3``      — S2 + capped :math:`L^p` background reconstruction.
 * ``skipS1``  — S2 from scratch (the curriculum-necessity ablation, proposal §5.5).
@@ -50,9 +50,7 @@ def build_loss(stage: str, cfg: dict[str, Any]) -> CompositeLoss:
     """
     stage_norm = stage.strip()
     if stage_norm not in {"S1", "S2", "S3", "skipS1"}:
-        raise ValueError(
-            f"unknown curriculum stage {stage!r}; choose from S1/S2/S3/skipS1"
-        )
+        raise ValueError(f"unknown curriculum stage {stage!r}; choose from S1/S2/S3/skipS1")
 
     cfm_cfg = cfg.get("cfm") or {}
     contrast_cfg = cfg.get("contrastive") or {}
@@ -72,6 +70,8 @@ def build_loss(stage: str, cfg: dict[str, Any]) -> CompositeLoss:
             lambda_roi=float(_get(contrast_cfg, "lambda_roi", 0.3)),
             lambda_bg=float(_get(contrast_cfg, "lambda_bg", 1.0)),
             delta=float(_get(contrast_cfg, "delta", 2.0)),
+            p_t=float(_get(contrast_cfg, "p_t", 1.0)),
+            p_b=float(_get(contrast_cfg, "p_b", 3.0)),
         )
         weights["contrastive"] = float(_get(contrast_cfg, "weight", 0.01))
         requires_perturb = True

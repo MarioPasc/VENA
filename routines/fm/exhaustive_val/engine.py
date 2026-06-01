@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -112,6 +113,11 @@ class ExhaustiveValJobConfig(BaseModel):
     output_dir: Path
     figure_n_slices: int = 10
     figure_slice_offset: int = 10
+    # How many top-best / top-worst patients to render per epoch. Default 3
+    # gives 6 panels: ``figure_best_{1,2,3}.png`` + ``figure_worst_{1,2,3}.png``.
+    # Capped at half the patient count so a tiny cohort cannot have its top-K
+    # and bottom-K overlap.
+    figure_top_k: int = 3
 
     @classmethod
     def from_yaml(cls, path: Path | str) -> ExhaustiveValJobConfig:
@@ -538,6 +544,11 @@ class ExhaustiveValEngine:
 
         module.compute_val_conditioning(batch)
 
+        # WT mask in image space (NN-upsampled from the latent mask the dataset
+        # already loaded). Used for region-masked PSNR/SSIM below — the decoded
+        # volume is already on the GPU, so the extra metric calls are near-free.
+        m_wt_img = self._wt_mask_in_image_space(batch, real_box.shape)
+
         for nfe in cfg.nfe_levels:
             z_pred, gen_t = self._sample(module, sampler, z_target, int(nfe))
             latents_by_pid_nfe[(pid, int(nfe))] = z_pred.detach().to("cpu")
@@ -545,6 +556,9 @@ class ExhaustiveValEngine:
 
             img_pred, dec_t = self._decode(vae, z_pred, crop_spec)
             psnr, ssim = full_volume_psnr_ssim(img_pred, real_box, image_metrics)
+            psnr_wt, ssim_wt, psnr_bg, ssim_bg = self._region_psnr_ssim(
+                img_pred, real_box, m_wt_img, image_metrics
+            )
 
             mask = torch.ones_like(z_target, dtype=torch.bool)
             lat_mse = float(latent_metrics.mse(z_pred, z_target, mask)[0].item())
@@ -555,11 +569,16 @@ class ExhaustiveValEngine:
             gen_decode_time[(pid, int(nfe))] = gen_t + dec_t
             metric_rows.append(
                 {
+                    "epoch": int(cfg.epoch),
                     "cohort": cohort,
                     "patient_id": pid,
                     "nfe": int(nfe),
                     "psnr_db": psnr,
                     "ssim": ssim,
+                    "psnr_db_wt": psnr_wt,
+                    "ssim_wt": ssim_wt,
+                    "psnr_db_bg": psnr_bg,
+                    "ssim_bg": ssim_bg,
                     "latent_mse": lat_mse,
                     "latent_l1": lat_l1,
                     "latent_cosine": lat_cos,
@@ -612,13 +631,34 @@ class ExhaustiveValEngine:
         pid_to_image_h5: dict[str, Path],
         out_dir: Path,
     ) -> None:
+        """Render ``figure_top_k`` best and worst patients by mean SSIM.
+
+        With the default ``figure_top_k=3`` the artifact directory gains six
+        panels per epoch (``figure_best_{1,2,3}.png`` and
+        ``figure_worst_{1,2,3}.png``), where rank 1 is the most-best /
+        most-worst case. ``k`` is clamped to half the number of scored patients
+        so that a small cohort cannot produce overlapping best/worst lists.
+        """
         mean_ssim = {pid: (sum(v) / len(v)) for pid, v in ssim_by_pid.items() if v}
         if not mean_ssim:
             logger.warning("no SSIM scores; skipping qualitative figures.")
             return
-        best = max(mean_ssim, key=mean_ssim.get)
-        worst = min(mean_ssim, key=mean_ssim.get)
-        for tag, pid in (("best", best), ("worst", worst)):
+        k = max(1, min(int(self.cfg.figure_top_k), len(mean_ssim) // 2))
+        if k < self.cfg.figure_top_k:
+            logger.info(
+                "figure_top_k clamped from %d to %d (only %d patients scored)",
+                self.cfg.figure_top_k,
+                k,
+                len(mean_ssim),
+            )
+        sorted_desc = sorted(mean_ssim.items(), key=lambda kv: kv[1], reverse=True)
+        best_picks = sorted_desc[:k]
+        worst_picks = list(reversed(sorted_desc[-k:]))
+
+        targets: list[tuple[str, str]] = [
+            (f"best_{rank + 1}", pid) for rank, (pid, _) in enumerate(best_picks)
+        ] + [(f"worst_{rank + 1}", pid) for rank, (pid, _) in enumerate(worst_picks)]
+        for tag, pid in targets:
             image_h5 = pid_to_image_h5.get(pid)
             if image_h5 is None:
                 logger.warning("_render_best_worst: no image_h5 for pid '%s'; skipping.", pid)
@@ -649,14 +689,80 @@ class ExhaustiveValEngine:
 
     # ------------------------------------------------------------------
 
+    def _wt_mask_in_image_space(
+        self, batch: dict[str, Any], image_shape: tuple[int, ...]
+    ) -> torch.Tensor | None:
+        """NN-upsample the latent WT mask to the image box.
+
+        Returns
+        -------
+        Tensor | None
+            ``(B, 1, *image_shape[-3:])`` boolean mask, or ``None`` when the
+            dataset did not supply ``m_wt`` for this patient. The boolean dtype
+            matches what :class:`ImageMetrics` expects.
+        """
+        m_wt = batch.get("m_wt")
+        if m_wt is None:
+            return None
+        if not isinstance(m_wt, torch.Tensor):
+            return None
+        if m_wt.dim() == 4:
+            # CSR datasets occasionally return (1,h,w,d); add the batch dim.
+            m_wt = m_wt.unsqueeze(0)
+        target_spatial = tuple(int(s) for s in image_shape[-3:])
+        m_up = F.interpolate(m_wt.float(), size=target_spatial, mode="nearest")
+        return m_up.bool()
+
+    @staticmethod
+    def _region_psnr_ssim(
+        img_pred: torch.Tensor,
+        real_box: torch.Tensor,
+        m_wt_img: torch.Tensor | None,
+        image_metrics: ImageMetrics,
+    ) -> tuple[float, float, float, float]:
+        """Region-masked PSNR/SSIM for WT and BG.
+
+        ``decode_box`` returns a 3-D ``(H, W, D)`` tensor and the whole-volume
+        helper adds two leading dims internally; the masked metric helpers
+        expect ``(B, C, H, W, D)``, so we promote both volume and mask here.
+        Empty regions or a missing mask return ``nan`` for that pair so the
+        CSV cell renders blank (downstream tooling reads ``""`` as NaN).
+        """
+        if m_wt_img is None or m_wt_img.numel() == 0:
+            return (float("nan"),) * 4
+        p = img_pred[None, None] if img_pred.ndim == 3 else img_pred
+        r = real_box[None, None] if real_box.ndim == 3 else real_box
+        wt = m_wt_img if m_wt_img.ndim == 5 else m_wt_img[None, None]
+        bg = ~wt
+        psnr_wt = image_metrics.psnr(p, r, wt)
+        ssim_wt = image_metrics.ssim(p, r, wt)
+        psnr_bg = image_metrics.psnr(p, r, bg)
+        ssim_bg = image_metrics.ssim(p, r, bg)
+
+        def _first_finite(t: torch.Tensor) -> float:
+            v = float(t[0].item()) if t.numel() else float("nan")
+            return v if v == v else float("nan")  # NaN-passthrough
+
+        return (
+            _first_finite(psnr_wt),
+            _first_finite(ssim_wt),
+            _first_finite(psnr_bg),
+            _first_finite(ssim_bg),
+        )
+
     @staticmethod
     def _write_metrics_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         cols = [
             "cohort",
+            "epoch",
             "patient_id",
             "nfe",
             "psnr_db",
             "ssim",
+            "psnr_db_wt",
+            "ssim_wt",
+            "psnr_db_bg",
+            "ssim_bg",
             "latent_mse",
             "latent_l1",
             "latent_cosine",

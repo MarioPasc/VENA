@@ -63,11 +63,32 @@ class LossInputs:
 
 
 class AbstractFMLoss(nn.Module, ABC):
-    """One curriculum term."""
+    """One curriculum term.
+
+    Subclasses may attach diagnostic scalars to ``self._aux`` after each
+    forward; :class:`CompositeLoss` merges them into the returned ``per_term``
+    dict under namespaced keys (e.g. ``"contrastive/delta_abs_mean_in"``) so
+    the LightningModule logs them through the existing ``train/*`` path
+    without a signature change.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._aux: dict[str, torch.Tensor] = {}
 
     @abstractmethod
     def forward(self, inputs: LossInputs) -> torch.Tensor:
         """Return a scalar loss for one batch."""
+
+    def aux(self) -> dict[str, torch.Tensor]:
+        """Return diagnostic scalars from the most recent ``forward`` call.
+
+        Default: empty dict. Loss terms with useful side-channel diagnostics
+        (e.g. the contrastive |Δ| statistics, cap-hit fractions) populate
+        ``self._aux`` inside ``forward`` and return it here. The values must be
+        detached scalar tensors.
+        """
+        return self._aux
 
 
 class CompositeLoss(nn.Module):
@@ -112,5 +133,7 @@ class CompositeLoss(nn.Module):
             value = term(inputs)
             per_term[name] = value.detach()
             total = total + self.weights[name] * value
+            for aux_key, aux_val in term.aux().items():
+                per_term[f"{name}/{aux_key}"] = aux_val.detach()
         per_term["total"] = total.detach()
         return total, per_term

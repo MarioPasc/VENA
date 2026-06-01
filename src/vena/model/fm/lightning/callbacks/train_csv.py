@@ -34,7 +34,22 @@ import pytorch_lightning as pl
 logger = logging.getLogger(__name__)
 
 # Losses accumulated for the per-epoch summary (column name without ``train/``).
-_EPOCH_AGG_KEYS: tuple[str, ...] = ("cfm", "total", "samples_per_sec", "grad_norm_cn_postclip")
+# The schema is the same across stages: keys absent from a given epoch (e.g.
+# ``contrastive`` during S1) appear as NaN columns rather than vanishing — so
+# train_epoch.csv has a fixed shape across S1 / S2 / S3 runs.
+_EPOCH_AGG_KEYS: tuple[str, ...] = (
+    "cfm",
+    "contrastive",
+    "reconstruction",
+    "total",
+    "samples_per_sec",
+    "grad_norm_cn_preclip",
+    "grad_norm_cn_postclip",
+    "grad_norm_trunk_preclip",
+    "grad_norm_trunk_postclip",
+    "t_mean",
+    "gpu_mem_peak_mb",
+)
 
 
 class TrainMetricsCSV(pl.Callback):
