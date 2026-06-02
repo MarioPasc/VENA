@@ -53,7 +53,8 @@ class HDBETError(RuntimeError):
     """Raised on any HD-BET subprocess or IO failure."""
 
 
-_PATIENT_DIR_RE = re.compile(r"^BraTS-(SSA|GLI|PED|MET|MEN)-\d+-\d+$")
+_DEFAULT_PATIENT_DIR_REGEX = r"^BraTS-(SSA|GLI|PED|MET|MEN)-\d+-\d+$"
+_PATIENT_DIR_RE = re.compile(_DEFAULT_PATIENT_DIR_REGEX)
 
 # Modality slug → BraTS file-suffix component.
 _DEFAULT_SUFFIX_MAP: dict[str, str] = {
@@ -63,6 +64,9 @@ _DEFAULT_SUFFIX_MAP: dict[str, str] = {
     "flair": "t2f",
 }
 _SEG_SUFFIX = "seg"
+_DEFAULT_MODALITY_FILENAME_TEMPLATE = "{pid}-{suffix}.nii.gz"
+_DEFAULT_SEG_FILENAME_TEMPLATE = "{pid}-{seg_suffix}.nii.gz"
+_DEFAULT_BRAIN_MASK_FILENAME_TEMPLATE = "{pid}-brain_mask.nii.gz"
 
 
 class HDBETSkullStripConfig(BaseModel):
@@ -108,6 +112,43 @@ class HDBETSkullStripConfig(BaseModel):
         default_factory=lambda: dict(_DEFAULT_SUFFIX_MAP),
         description="H5 modality slug → BraTS NIfTI file suffix.",
     )
+    patient_dir_regex: str = Field(
+        default=_DEFAULT_PATIENT_DIR_REGEX,
+        description=(
+            "Regex matching per-patient directory names under source_root. "
+            "Default matches BraTS-{SSA,GLI,PED,MET,MEN}-NNNNN-NNN; override "
+            "for cohorts with different ID conventions (e.g. REMBRANDT)."
+        ),
+    )
+    modality_filename_template: str = Field(
+        default=_DEFAULT_MODALITY_FILENAME_TEMPLATE,
+        description=(
+            "Format string for modality NIfTI filenames; {pid} and {suffix} "
+            "are substituted. Default '{pid}-{suffix}.nii.gz' matches BraTS; "
+            "REMBRANDT uses '{pid}_{suffix}_LPS_rSRI.nii.gz'."
+        ),
+    )
+    seg_filename_template: str = Field(
+        default=_DEFAULT_SEG_FILENAME_TEMPLATE,
+        description=(
+            "Format string for the tumour-seg filename; {pid} and {seg_suffix} "
+            "are substituted. Default '{pid}-{seg_suffix}.nii.gz'."
+        ),
+    )
+    seg_suffix: str = Field(
+        default=_SEG_SUFFIX,
+        description=(
+            "Token substituted into seg_filename_template's {seg_suffix} slot "
+            "(e.g. 'seg' for BraTS, 'GlistrBoost_out' for REMBRANDT)."
+        ),
+    )
+    brain_mask_filename_template: str = Field(
+        default=_DEFAULT_BRAIN_MASK_FILENAME_TEMPLATE,
+        description=(
+            "Format string for the persisted brain-mask filename; {pid} "
+            "is substituted. Default '{pid}-brain_mask.nii.gz'."
+        ),
+    )
 
     n_jobs: int = Field(
         default=1,
@@ -134,8 +175,22 @@ class HDBETSkullStripConfig(BaseModel):
 # ----------------------------------------------------------------------------
 
 
-def _patient_modality_path(patient_root: Path, pid: str, suffix: str) -> Path:
-    return patient_root / f"{pid}-{suffix}.nii.gz"
+def _patient_modality_path(
+    patient_root: Path,
+    pid: str,
+    suffix: str,
+    template: str = _DEFAULT_MODALITY_FILENAME_TEMPLATE,
+) -> Path:
+    return patient_root / template.format(pid=pid, suffix=suffix)
+
+
+def _patient_seg_path(
+    patient_root: Path,
+    pid: str,
+    seg_suffix: str,
+    template: str = _DEFAULT_SEG_FILENAME_TEMPLATE,
+) -> Path:
+    return patient_root / template.format(pid=pid, seg_suffix=seg_suffix)
 
 
 def _load_volume(path: Path) -> tuple[NDArray[Any], Any, Any]:
@@ -180,13 +235,13 @@ def _process_one(
     the derived mask to the remaining modalities and copies the segmentation.
     """
     ref_suffix = cfg.suffix_map[cfg.reference_modality]
-    src_ref = _patient_modality_path(src_root, pid, ref_suffix)
+    src_ref = _patient_modality_path(src_root, pid, ref_suffix, cfg.modality_filename_template)
     if not src_ref.exists():
         raise HDBETError(f"{pid}: missing reference modality {src_ref.name}")
 
     dst_dir = cfg.dest_root / pid
     dst_dir.mkdir(parents=True, exist_ok=True)
-    dst_ref = _patient_modality_path(dst_dir, pid, ref_suffix)
+    dst_ref = _patient_modality_path(dst_dir, pid, ref_suffix, cfg.modality_filename_template)
 
     if dst_ref.exists() and not cfg.overwrite:
         logger.info("skip %s (output present)", pid)
@@ -231,7 +286,7 @@ def _process_one(
         )
 
     # Persist the brain mask under a canonical name.
-    canonical_mask = dst_dir / f"{pid}-brain_mask.nii.gz"
+    canonical_mask = dst_dir / cfg.brain_mask_filename_template.format(pid=pid)
     if canonical_mask.exists():
         canonical_mask.unlink()
     mask_path.rename(canonical_mask)
@@ -248,7 +303,7 @@ def _process_one(
     # whole batch.
     for slug in cfg.also_apply_to:
         suffix = cfg.suffix_map[slug]
-        src_mod = _patient_modality_path(src_root, pid, suffix)
+        src_mod = _patient_modality_path(src_root, pid, suffix, cfg.modality_filename_template)
         if not src_mod.exists():
             raise HDBETError(f"{pid}: missing modality {src_mod.name}")
         try:
@@ -260,16 +315,16 @@ def _process_one(
         if arr.shape != brain.shape:
             raise HDBETError(f"{pid}: shape mismatch on {slug}: {arr.shape} vs mask {brain.shape}")
         stripped = np.asarray(arr) * brain
-        dst_mod = _patient_modality_path(dst_dir, pid, suffix)
+        dst_mod = _patient_modality_path(dst_dir, pid, suffix, cfg.modality_filename_template)
         try:
             _save_volume(dst_mod, stripped, affine, header, dtype=np.float32)
         except OSError as exc:
             raise HDBETError(f"{pid}: failed to write {dst_mod.name}: {exc}") from exc
 
-    # Carry tumour seg through (BraTS labels already lie inside brain).
-    src_seg = _patient_modality_path(src_root, pid, _SEG_SUFFIX)
+    # Carry tumour seg through (segmentation labels already lie inside brain).
+    src_seg = _patient_seg_path(src_root, pid, cfg.seg_suffix, cfg.seg_filename_template)
     if src_seg.exists():
-        dst_seg = _patient_modality_path(dst_dir, pid, _SEG_SUFFIX)
+        dst_seg = _patient_seg_path(dst_dir, pid, cfg.seg_suffix, cfg.seg_filename_template)
         shutil.copyfile(src_seg, dst_seg)
 
     # The HD-BET-stripped reference modality is already saved at dst_ref; ensure
@@ -299,11 +354,12 @@ class HDBETSkullStripRunner:
 
     def discover(self) -> list[tuple[str, Path]]:
         """Return ``[(patient_id, patient_root), ...]`` sorted by id."""
+        regex = re.compile(self.cfg.patient_dir_regex)
         out: list[tuple[str, Path]] = []
         for d in sorted(self.cfg.source_root.iterdir()):
             if not d.is_dir():
                 continue
-            if _PATIENT_DIR_RE.match(d.name) is None:
+            if regex.match(d.name) is None:
                 continue
             out.append((d.name, d))
         return out

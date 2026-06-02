@@ -92,6 +92,19 @@
       "n_scans": 261,
       "modalities": ["t1pre", "t1c", "t2", "flair"],
       "has_swan": false
+    },
+    {
+      "name": "REMBRANDT",
+      "pathology": "glioma",
+      "label_system": "BraTS2021",
+      "role": "cv",
+      "longitudinal": false,
+      "image_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/rembrandt/h5/REMBRANDT_image.h5",
+      "latent_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/rembrandt/h5/REMBRANDT_latents.h5",
+      "n_patients": 63,
+      "n_scans": 63,
+      "modalities": ["t1pre", "t1c", "t2", "flair"],
+      "has_swan": false
     }
   ]
 }

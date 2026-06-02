@@ -1,0 +1,17 @@
+# REMBRANDT image-domain H5 — smoke (first 4 patients).
+#
+# Runs against the smoke-skull-stripped output tree at /tmp; produces a 4-row
+# H5 in /tmp for end-to-end validation (manifest, splits floors, label check).
+
+source_root: /tmp/vena_smoke_skullstrip/rembrandt
+output_path: /tmp/vena_smoke_h5/rembrandt_image_smoke.h5
+
+n_jobs: 2
+crop_box: [192, 224, 192]
+n_val: 1
+n_test: 1
+seed: 42
+
+limit: 4
+overwrite: true
+log_level: INFO

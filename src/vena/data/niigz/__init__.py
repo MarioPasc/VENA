@@ -10,6 +10,7 @@ from .brats_africa import (
 from .brats_ped import BraTSPedDataset, BraTSPedPatient
 from .ivy_gap import IvyGAPDataset, IvyGAPPatient
 from .lumiere import LUMIEREDataset, LUMIERESession
+from .rembrandt import REMBRANDTDataset, REMBRANDTPatient
 from .shared import (
     ModalityNotFoundError,
     NiftiVolume,
@@ -38,6 +39,8 @@ __all__ = [
     "NiftiVolume",
     "NiigzLoadError",
     "PatientNotFoundError",
+    "REMBRANDTDataset",
+    "REMBRANDTPatient",
     "UCSFPDGMDataset",
     "UCSFPDGMPatient",
     "brain_z_extent",

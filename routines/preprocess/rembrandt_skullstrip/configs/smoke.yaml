@@ -1,0 +1,33 @@
+# Smoke HD-BET skull-strip for REMBRANDT (first 4 patients).
+#
+# Runs HD-BET on the first 4 sessions (alphabetical by directory name) of
+# the staged REMBRANDT tree into a /tmp output dir. Validates the runner +
+# template overrides before committing to the full run on the RTX 4060.
+
+source_root: /home/mpascual/rembrandt_staged
+dest_root: /tmp/vena_smoke_skullstrip/rembrandt
+
+hdbet_python: /home/mpascual/.conda/envs/hdbet/bin/python
+hdbet_cli: /home/mpascual/.conda/envs/hdbet/bin/hd-bet
+
+device: cuda:0
+disable_tta: false
+
+reference_modality: t1pre
+also_apply_to: [t1c, t2, flair]
+
+patient_dir_regex: '^(900-00-\d+|HF\d+)_\d{4}\.\d{2}\.\d{2}$'
+suffix_map:
+  t1pre: t1
+  t1c: t1ce
+  t2: t2
+  flair: flair
+modality_filename_template: '{pid}_{suffix}_LPS_rSRI.nii.gz'
+seg_filename_template: '{pid}_{seg_suffix}.nii.gz'
+seg_suffix: GlistrBoost_out
+brain_mask_filename_template: '{pid}-brain_mask.nii.gz'
+
+n_jobs: 1
+limit: 4
+overwrite: true
+log_level: INFO

@@ -1,0 +1,22 @@
+# REMBRANDT image-domain H5 cache — full conversion (schema 2.0.0).
+#
+# ~63 cross-sectional adult-glioma patients in SRI24 1 mm iso (240,240,155),
+# HD-BET skull-stripped (produced by routines/preprocess/rembrandt_skullstrip),
+# BraTS-2021 tumour labels {0,1,2,4} from the CBICA GlistrBoost pipeline.
+# CV role: single random 53/5/5 train/val/test split (N=63 too small for
+# nested K-fold CV; mirrors IvyGAP).
+
+# Source tree comes from routines/preprocess/rembrandt_skullstrip (default
+# config writes to ~/rembrandt_skull_stripped on the ext4 home FS); the H5
+# itself is single-file and lands on the canonical MeningD2 GLIOMA cohort dir.
+source_root: /home/mpascual/rembrandt_skull_stripped
+output_path: /media/mpascual/MeningD2/GLIOMA/REMBRANDT/h5/REMBRANDT_image.h5
+
+n_jobs: 8
+crop_box: [192, 224, 192]
+n_val: 5
+n_test: 5
+seed: 42
+
+overwrite: true
+log_level: INFO

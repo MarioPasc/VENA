@@ -1,0 +1,47 @@
+# HD-BET skull-strip of REMBRANDT (CBICA-preprocessed → skull-stripped tree).
+#
+# The source tree is a flat directory containing all REMBRANDT sessions,
+# produced by scripts/prepare_rembrandt_source.sh (symlinks every
+# Patients_X_Y/.../<pid>_<date>/ into one place and renames any incomplete
+# session aside, e.g. HF0920_1991.06.14 which is missing T1pre).
+#
+# Each session directory holds five NIfTI files:
+#   <pid>_<date>_{t1,t1ce,t2,flair}_LPS_rSRI.nii.gz
+#   <pid>_<date>_GlistrBoost_out.nii.gz
+# The data is registered to SRI24 1 mm iso LPS but the skull is still
+# present — HD-BET v2 (isolated in ~/.conda/envs/hdbet) is run on t1 (the
+# "t1pre" slug), the derived brain mask is applied to t1ce/t2/flair, and the
+# GlistrBoost seg is carried through unchanged.
+
+# NOTE: MeningD2 is an exFAT mount that does NOT support symlinks (or
+# permits-only writes), which breaks both the staging-symlink layout and any
+# HD-BET intermediate writes the runner does in-place. The HD-BET pipeline
+# therefore runs entirely on the ext4 home filesystem; the final image-H5
+# (single file, plain write) ends up under /media/mpascual/.../REMBRANDT/h5.
+source_root: /home/mpascual/rembrandt_staged
+dest_root: /home/mpascual/rembrandt_skull_stripped
+
+hdbet_python: /home/mpascual/.conda/envs/hdbet/bin/python
+hdbet_cli: /home/mpascual/.conda/envs/hdbet/bin/hd-bet
+
+device: cuda:0
+disable_tta: false
+
+reference_modality: t1pre
+also_apply_to: [t1c, t2, flair]
+
+# REMBRANDT overrides to the HDBETSkullStripConfig defaults.
+patient_dir_regex: '^(900-00-\d+|HF\d+)_\d{4}\.\d{2}\.\d{2}$'
+suffix_map:
+  t1pre: t1
+  t1c: t1ce
+  t2: t2
+  flair: flair
+modality_filename_template: '{pid}_{suffix}_LPS_rSRI.nii.gz'
+seg_filename_template: '{pid}_{seg_suffix}.nii.gz'
+seg_suffix: GlistrBoost_out
+brain_mask_filename_template: '{pid}-brain_mask.nii.gz'
+
+n_jobs: 1
+overwrite: false
+log_level: INFO
