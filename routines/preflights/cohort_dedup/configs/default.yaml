@@ -1,0 +1,31 @@
+# Cohort deduplication preflight — default (local workstation).
+#
+# Direction (user-resolved 2026-06-02):
+#   priority [BraTS-GLI, UCSF-PDGM, IvyGAP, LUMIERE] → drop 293 UCSF-PDGM
+#   patients with non-empty `metadata/brats21_id`. BraTS-GLI kept whole; no
+#   external 2023↔2021 mapping required.
+#
+# IvyGAP has 21 xlsx rows whose portal IDs are numeric (do not match the
+# cohort's W<N> IDs). on_unresolvable=warn keeps IvyGAP whole and logs the
+# potential overlap — supply an external bridge file later to dedup IvyGAP.
+
+output_root: artifacts/preflights/cohort_dedup
+corpus_registry: routines/fm/train/configs/corpus/corpus_local.json
+mapping_xlsx: /media/mpascual/MeningD2/GLIOMA/BraTS2021_MappingToTCIA.xlsx
+
+priority:
+  - BraTS-GLI
+  - UCSF-PDGM
+  - IvyGAP
+  - LUMIERE
+  # test_only cohorts (BraTS-Africa-*, BraTS-PED) inherit lowest priority and
+  # are passed through unchanged because they carry no bridge field and are
+  # not in implicit_brats21_cohorts.
+
+on_unresolvable: warn
+
+bridge_fields:
+  UCSF-PDGM: metadata/brats21_id
+
+implicit_brats21_cohorts:
+  - BraTS-GLI

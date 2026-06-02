@@ -410,6 +410,7 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
         seed: int = 42,
         max_train_patients_per_cohort: int | None = None,
         train_transform: AugmentationPipeline | None = None,
+        dedup_allowlists: dict[str, set[str]] | None = None,
     ) -> None:
         super().__init__()
         self.registry = registry
@@ -423,6 +424,12 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
         # Augmentation runs on training samples only; validation / test never
         # see augmented data so metrics remain comparable across runs.
         self.train_transform = train_transform
+        # Per-cohort patient-ID allow-list produced by the cohort_dedup
+        # preflight (schema v1.0). When set, the DataModule intersects
+        # train/val/test patient keys with the cohort's allow-list before
+        # CSR-expansion to scan IDs, so the DataLoader never sees a
+        # dropped patient. ``None`` disables the filter entirely.
+        self._dedup_allowlists = dedup_allowlists
 
         self._train_ds: MultiCohortLatentDataset | None = None
         self._val_ds: MultiCohortLatentDataset | None = None
@@ -513,6 +520,35 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
                 val_patient_keys = self._decode_ids(f[f"splits/cv/fold_{self.fold}/val"])
                 test_patient_keys = self._decode_ids(f["splits/test"])
 
+            # Cohort deduplication. Keep only patient IDs in the preflight's
+            # allow-list. Applied BEFORE the CSR expansion so dropped patients
+            # never reach the per-cohort LatentH5Dataset nor the sampler.
+            if self._dedup_allowlists is not None:
+                allow = self._dedup_allowlists.get(cohort.name)
+                if allow is None:
+                    raise RuntimeError(
+                        f"dedup allow-list missing for cohort {cohort.name!r}; "
+                        f"the cohort_dedup preflight must cover every cv cohort "
+                        f"in the registry (got cohorts: "
+                        f"{sorted(self._dedup_allowlists)})"
+                    )
+                n_train_before = len(train_patient_keys)
+                n_val_before = len(val_patient_keys)
+                n_test_before = len(test_patient_keys)
+                train_patient_keys = [p for p in train_patient_keys if p in allow]
+                val_patient_keys = [p for p in val_patient_keys if p in allow]
+                test_patient_keys = [p for p in test_patient_keys if p in allow]
+                logger.info(
+                    "%s: dedup filter kept train=%d/%d, val=%d/%d, test=%d/%d",
+                    cohort.name,
+                    len(train_patient_keys),
+                    n_train_before,
+                    len(val_patient_keys),
+                    n_val_before,
+                    len(test_patient_keys),
+                    n_test_before,
+                )
+
             # Optional cap for smoke runs.
             if (
                 self.max_train_patients_per_cohort is not None
@@ -578,6 +614,21 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
                 keys = self._decode_ids(f["patients/keys"])
                 # Use all patients in the H5 (no train split for test-only).
                 all_patient_keys = list(keys)
+
+            # Forward-compatible: apply the dedup filter to test-only cohorts
+            # too when a per-cohort allow-list happens to be present. Missing
+            # entries are tolerated here (test-only cohorts are out of scope
+            # for the current preflight) — no warning needed.
+            if self._dedup_allowlists is not None and cohort.name in self._dedup_allowlists:
+                allow = self._dedup_allowlists[cohort.name]
+                n_before = len(all_patient_keys)
+                all_patient_keys = [p for p in all_patient_keys if p in allow]
+                logger.info(
+                    "%s (test-only): dedup filter kept %d/%d",
+                    cohort.name,
+                    len(all_patient_keys),
+                    n_before,
+                )
 
             all_scan_ids, _ = self._expand_patients_to_scans(offsets, keys, ids, all_patient_keys)
             logger.info(

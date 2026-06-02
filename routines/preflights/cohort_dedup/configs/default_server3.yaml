@@ -1,0 +1,24 @@
+# Cohort deduplication preflight — server3 paths.
+#
+# Same dedup policy as configs/default.yaml; differs only in:
+#   * output_root -> /media/hddb/mario/artifacts/preflights/cohort_dedup
+#   * corpus_registry -> corpus_server3.json
+#   * mapping_xlsx -> /media/hddb/mario/datasets/BraTS2021_MappingToTCIA.xlsx
+
+output_root: /media/hddb/mario/artifacts/preflights/cohort_dedup
+corpus_registry: routines/fm/train/configs/corpus/corpus_server3.json
+mapping_xlsx: /media/hddb/mario/datasets/BraTS2021_MappingToTCIA.xlsx
+
+priority:
+  - BraTS-GLI
+  - UCSF-PDGM
+  - IvyGAP
+  - LUMIERE
+
+on_unresolvable: warn
+
+bridge_fields:
+  UCSF-PDGM: metadata/brats21_id
+
+implicit_brats21_cohorts:
+  - BraTS-GLI

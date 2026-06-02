@@ -1,0 +1,21 @@
+# Smoke variant — same inputs as default; kept for symmetry with the project's
+# routine convention. There is no GPU work in this preflight, so the smoke run
+# is identical to default (parses xlsx, opens H5 metadata only, writes JSON).
+
+output_root: artifacts/preflights/cohort_dedup
+corpus_registry: routines/fm/train/configs/corpus/corpus_local.json
+mapping_xlsx: /media/mpascual/MeningD2/GLIOMA/BraTS2021_MappingToTCIA.xlsx
+
+priority:
+  - BraTS-GLI
+  - UCSF-PDGM
+  - IvyGAP
+  - LUMIERE
+
+on_unresolvable: warn
+
+bridge_fields:
+  UCSF-PDGM: metadata/brats21_id
+
+implicit_brats21_cohorts:
+  - BraTS-GLI

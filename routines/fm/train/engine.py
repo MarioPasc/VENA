@@ -43,6 +43,11 @@ from vena.model.fm.lightning.callbacks import (
 from vena.model.fm.lightning.data import MultiCohortLatentDataModule
 from vena.model.fm.maisi.config import TrunkConfig
 from vena.model.fm.metrics import RegionSpec
+from vena.preflight.cohort_dedup import (
+    DedupDecisionSchemaError,
+    assert_dedup_decision_valid,
+    build_allowlists,
+)
 
 from .exceptions import PreflightGateError
 from .runner import generate_run_id, write_provenance
@@ -94,6 +99,13 @@ class _DataCfg(BaseModel):
     # fast-fails if any requested augmentation is not safe.
     augmentation_config_path: Path | None = None
     preflight_decision_path: Path | None = None
+    # Cohort-deduplication gate. Points at the ``decision.json`` produced by
+    # ``routines.preflights.cohort_dedup`` (schema v1.0). When set, the
+    # gate ``_assert_preflight_gates`` validates the file, checks the corpus
+    # registry SHA-256 matches, and the engine passes per-cohort allow-lists
+    # into ``MultiCohortLatentDataModule`` so train/val/test scan IDs are
+    # filtered before sampling. Mandatory when supplied.
+    dedup_decisions_path: Path | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -322,33 +334,90 @@ def _assert_preflight_gates(cfg: FMTrainRoutineConfig) -> None:
       ``latent_safe_augmentations`` allowlist. The pipeline builder
       (``vena.data.augment.build_pipeline_from_yaml``) re-checks this, but
       catching it up-front yields a clearer message and avoids partial setup.
+    * Cohort deduplication: when ``data.dedup_decisions_path`` is set, the
+      referenced ``decision.json`` (schema v1.0) must validate; the corpus
+      registry SHA-256 inside the decision must match the SHA-256 of the
+      currently-loaded ``data.corpus_registry``; every cv cohort listed in
+      the registry must have an entry in ``decision["cohorts"]``; and the
+      decision must not carry unresolvable overlaps (these would mean some
+      cross-cohort duplicates are still in the training corpus).
 
     Raises
     ------
     PreflightGateError
         If any gate fails.
     """
-    if cfg.data.augmentation_config_path is None:
-        return  # nothing to gate
+    if cfg.data.augmentation_config_path is not None:
+        if cfg.data.preflight_decision_path is None:
+            raise PreflightGateError(
+                "data.augmentation_config_path is set but data.preflight_decision_path "
+                "is None. Augmentations must be gated by the latent_aug_equivariance "
+                "pre-flight — see .claude/rules/preflight-pattern.md."
+            )
 
-    if cfg.data.preflight_decision_path is None:
+        decision = _load_preflight_decision(cfg.data.preflight_decision_path)
+        allowlist = set(decision.get("latent_safe_augmentations") or [])
+        aug_yaml = yaml.safe_load(Path(cfg.data.augmentation_config_path).read_text()) or {}
+        requested = {entry["name"] for entry in (aug_yaml.get("augmentations") or [])}
+        forbidden = requested - allowlist
+        if forbidden:
+            raise PreflightGateError(
+                f"Augmentations {sorted(forbidden)} requested in "
+                f"{cfg.data.augmentation_config_path} are not on the pre-flight "
+                f"allowlist {sorted(allowlist)} from {cfg.data.preflight_decision_path}. "
+                f"Either drop the augmentation or rerun the equivariance pre-flight."
+            )
+
+    if cfg.data.dedup_decisions_path is not None:
+        _assert_dedup_gate(cfg)
+
+
+def _assert_dedup_gate(cfg: FMTrainRoutineConfig) -> None:
+    """Validate the cohort-dedup ``decision.json`` and cross-check against cfg."""
+    path = Path(cfg.data.dedup_decisions_path)
+    if not path.exists():
         raise PreflightGateError(
-            "data.augmentation_config_path is set but data.preflight_decision_path "
-            "is None. Augmentations must be gated by the latent_aug_equivariance "
-            "pre-flight — see .claude/rules/preflight-pattern.md."
+            f"data.dedup_decisions_path={path} does not exist. Run "
+            f"`vena-preflight-cohort-dedup` first."
+        )
+    try:
+        decision = assert_dedup_decision_valid(path)
+    except DedupDecisionSchemaError as exc:
+        raise PreflightGateError(str(exc)) from exc
+
+    # Cross-check: the corpus registry the decision was built against must
+    # match the one this run uses (SHA-256 over the JSON file bytes).
+    current_sha = sha256_file(Path(cfg.data.corpus_registry))
+    if decision["corpus_registry_sha256"] != current_sha:
+        raise PreflightGateError(
+            f"dedup decision was built against corpus registry SHA-256 "
+            f"{decision['corpus_registry_sha256']} "
+            f"({decision['corpus_registry_path']}), but cfg.data.corpus_registry "
+            f"({cfg.data.corpus_registry}) currently hashes to {current_sha}. "
+            f"Re-run `vena-preflight-cohort-dedup` to refresh the decision."
         )
 
-    decision = _load_preflight_decision(cfg.data.preflight_decision_path)
-    allowlist = set(decision.get("latent_safe_augmentations") or [])
-    aug_yaml = yaml.safe_load(Path(cfg.data.augmentation_config_path).read_text()) or {}
-    requested = {entry["name"] for entry in (aug_yaml.get("augmentations") or [])}
-    forbidden = requested - allowlist
-    if forbidden:
+    # Every cv cohort must have an allow-list entry — a partial decision is a bug.
+    registry = load_registry(cfg.data.corpus_registry, require_latents=False)
+    missing = [c.name for c in registry.cv_cohorts() if c.name not in decision["cohorts"]]
+    if missing:
         raise PreflightGateError(
-            f"Augmentations {sorted(forbidden)} requested in "
-            f"{cfg.data.augmentation_config_path} are not on the pre-flight "
-            f"allowlist {sorted(allowlist)} from {cfg.data.preflight_decision_path}. "
-            f"Either drop the augmentation or rerun the equivariance pre-flight."
+            f"dedup decision {path} is missing cohorts {missing} that appear in "
+            f"the corpus registry. Re-run the preflight against the current registry."
+        )
+
+    # Unresolvable overlaps are a policy decision made at preflight time
+    # (`on_unresolvable: warn` keeps both cohorts whole). The gate surfaces
+    # them as a WARNING so the run log carries the residual-risk note;
+    # `on_unresolvable: error` would have already prevented the preflight
+    # from emitting a decision at all.
+    if decision.get("unresolvable_overlaps"):
+        logger.warning(
+            "dedup decision %s carries %d unresolvable overlap(s) "
+            "(accepted at preflight time). Residual cross-cohort duplicates "
+            "may remain. See decision.json.unresolvable_overlaps for details.",
+            path,
+            len(decision["unresolvable_overlaps"]),
         )
 
 
@@ -432,19 +501,20 @@ class FMTrainRoutineEngine:
         write_provenance(run_dir, repo=Path(__file__).resolve().parents[3])
 
     def _build_decision_payload(self, run_id: str, run_dir: Path) -> dict[str, Any]:
-        """Schema-0.3.0 decision JSON written once at run creation.
+        """Schema-0.4.0 decision JSON written once at run creation.
 
         Carries enough provenance for a downstream consumer to reproduce the
         run end-to-end: data registry, trunk + VAE SHA-256, loss stage,
-        optimiser/EMA hyperparameters, augmentation gate path, and the list
-        of cohort names actually wired in.
+        optimiser/EMA hyperparameters, augmentation gate path, the list of
+        cohort names actually wired in, and (from schema 0.4.0) the cohort
+        deduplication decision file + SHA-256 used to filter the corpus.
         """
         cfg = self.cfg
         registry = load_registry(cfg.data.corpus_registry)
         return {
-            "schema_version": "0.3.0",
+            "schema_version": "0.4.0",
             "produced_at": now_iso_utc(),
-            "producer": "routines.fm.train:0.3.0",
+            "producer": "routines.fm.train:0.4.0",
             "run_id": run_id,
             "run_dir": str(run_dir),
             "stage": cfg.run.stage,
@@ -466,6 +536,10 @@ class FMTrainRoutineEngine:
             "augmentation_preflight_path": (
                 str(cfg.data.preflight_decision_path) if cfg.data.preflight_decision_path else None
             ),
+            "dedup_decision_path": (
+                str(cfg.data.dedup_decisions_path) if cfg.data.dedup_decisions_path else None
+            ),
+            "dedup_decision_sha256": _safe_sha256(cfg.data.dedup_decisions_path),
             "exhaustive_val_enabled": cfg.exhaustive_val.enabled,
         }
 
@@ -611,6 +685,20 @@ class FMTrainRoutineEngine:
         # training on the primary GPU; ``region_resolver``/``vae_decoder`` are
         # not needed here.
         registry = load_registry(cfg.data.corpus_registry)
+
+        # Load the cohort-dedup decision (already validated by the gate above)
+        # and turn it into a per-cohort allow-list — pure in-memory sets, no
+        # I/O during training.
+        dedup_allowlists: dict[str, set[str]] | None = None
+        if cfg.data.dedup_decisions_path is not None:
+            dedup_payload = assert_dedup_decision_valid(cfg.data.dedup_decisions_path)
+            dedup_allowlists = build_allowlists(dedup_payload)
+            logger.info(
+                "cohort_dedup ENABLED from %s — per-cohort kept: %s",
+                cfg.data.dedup_decisions_path,
+                {k: len(v) for k, v in dedup_allowlists.items()},
+            )
+
         dm = MultiCohortLatentDataModule(
             registry=registry,
             fold=cfg.data.fold,
@@ -621,6 +709,7 @@ class FMTrainRoutineEngine:
             seed=cfg.run.seed,
             max_train_patients_per_cohort=cfg.data.max_train_patients_per_cohort,
             train_transform=train_transform,
+            dedup_allowlists=dedup_allowlists,
         )
         logger.info(
             "Using MultiCohortLatentDataModule (registry=%s, tau=%.2f)",
