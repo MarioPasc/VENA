@@ -1,0 +1,21 @@
+# UPENN-GBM full image-domain H5 conversion (611 patients post seg-filter).
+#
+# Source: UPENN-GBM v2.0 NIfTI release, images_structural/ subdir.
+# Skull-stripped at source (SRI24 1 mm iso, LPS, 240x240x155).
+# Tumour labels: BraTS-2021 {0, 1, 2, 4}.
+# Splits: 5-fold CV + ~10% test (matches UCSF-PDGM / BraTS-GLI conventions).
+
+source_root: /media/mpascual/MeningD2/GLIOMA/UPENN_GBM/PKG - UPENN-GBM-NIfTI/UPENN-GBM/NIfTI-files/images_structural
+metadata_csv: /media/mpascual/MeningD2/GLIOMA/UPENN_GBM/metadata/UPENN-GBM_brats21_lookup_v1.csv
+output_path: /media/mpascual/MeningD2/GLIOMA/UPENN_GBM/h5/UPENN-GBM_image.h5
+
+n_jobs: 8
+shard_size: 32
+crop_box: [192, 224, 192]
+test_fraction: 0.10
+n_test_min: 25
+n_folds: 5
+seed: 42
+
+overwrite: false
+log_level: INFO

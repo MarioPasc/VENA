@@ -29,6 +29,19 @@
       "has_swan": false
     },
     {
+      "name": "UPENN-GBM",
+      "pathology": "preoperative_glioma",
+      "label_system": "BraTS2021",
+      "role": "cv",
+      "longitudinal": false,
+      "image_h5": "/media/hddb/mario/data/GLIOMAS/upenn_gbm/h5/UPENN-GBM_image.h5",
+      "latent_h5": "/media/hddb/mario/data/GLIOMAS/upenn_gbm/h5/UPENN-GBM_latents.h5",
+      "n_patients": 611,
+      "n_scans": 611,
+      "modalities": ["t1pre", "t1c", "t2", "flair"],
+      "has_swan": false
+    },
+    {
       "name": "IvyGAP",
       "pathology": "glioma",
       "label_system": "BraTS2021",

@@ -16,6 +16,7 @@ mapping_xlsx: /media/mpascual/MeningD2/GLIOMA/BraTS2021_MappingToTCIA.xlsx
 priority:
   - BraTS-GLI
   - UCSF-PDGM
+  - UPENN-GBM
   - IvyGAP
   - LUMIERE
   # test_only cohorts (BraTS-Africa-*, BraTS-PED) inherit lowest priority and
@@ -26,6 +27,12 @@ on_unresolvable: warn
 
 bridge_fields:
   UCSF-PDGM: metadata/brats21_id
+  # UPENN-GBM stores the BraTS-21 ID in the same metadata field, joined at H5
+  # write time from `UPENN-GBM_brats21_lookup_v1.csv` (built by
+  # scripts/preprocess/build_upenn_gbm_brats21_lookup.py from the xlsx). 447 of
+  # 611 trainable UPenn patients carry a non-empty bridge; the rest pass
+  # through (empty-bridge patients fall to the warn-only path).
+  UPENN-GBM: metadata/brats21_id
 
 implicit_brats21_cohorts:
   - BraTS-GLI

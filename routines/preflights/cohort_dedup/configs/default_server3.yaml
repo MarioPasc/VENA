@@ -12,6 +12,7 @@ mapping_xlsx: /media/hddb/mario/datasets/BraTS2021_MappingToTCIA.xlsx
 priority:
   - BraTS-GLI
   - UCSF-PDGM
+  - UPENN-GBM
   - IvyGAP
   - LUMIERE
 
@@ -19,6 +20,7 @@ on_unresolvable: warn
 
 bridge_fields:
   UCSF-PDGM: metadata/brats21_id
+  UPENN-GBM: metadata/brats21_id
 
 implicit_brats21_cohorts:
   - BraTS-GLI

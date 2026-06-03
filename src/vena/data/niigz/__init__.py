@@ -24,6 +24,7 @@ from .shared import (
     save_nii,
 )
 from .ucsf_pdgm import UCSFPDGMDataset, UCSFPDGMPatient
+from .upenn_gbm import UPENNGBMDataset, UPENNGBMPatient
 
 __all__ = [
     "BraTSAfricaGliomaDataset",
@@ -43,6 +44,8 @@ __all__ = [
     "REMBRANDTPatient",
     "UCSFPDGMDataset",
     "UCSFPDGMPatient",
+    "UPENNGBMDataset",
+    "UPENNGBMPatient",
     "brain_z_extent",
     "evenly_spaced_indices",
     "load_nii",

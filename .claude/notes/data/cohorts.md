@@ -1,4 +1,4 @@
-# VENA Training Cohort Registry — 2026-06-02
+# VENA Training Cohort Registry — 2026-06-03
 
 Single source of truth for the multi-cohort corpus VENA trains and evaluates
 on. Per-cohort markdown notes (e.g. `ivygap.md`, `lumiere.md`,
@@ -23,12 +23,9 @@ surviving the `cohort_dedup` preflight.
 | 6 | **BraTS-Africa-Other** | other_neoplasm | 51 | 51 | no | test_only | BraTS2023 | SRI24 | **HD-BET via VENA** | passthrough | Sub-Saharan Africa consortium |
 | 7 | **BraTS-PED** | pediatric_glioma | 261 → 260 | 261 | no | test_only | BraTS2023 | SRI24 | **HD-BET via VENA** (defaced source) | passthrough | CBTN / CHOP / DIPG-pBTC |
 | 8 | **REMBRANDT** | glioma | 63 (64 sessions – 1 missing T1pre) | 63 | no | cv (53/5/5) | BraTS2021 | SRI24 | **HD-BET via VENA** (CBICA-preprocessed source) | passthrough — not in BraTS21 mapping | NCI / Henry Ford Hospital |
+| 9 | **UPENN-GBM** | preoperative_glioma | 611 → **164 kept** | 611 | no | cv | BraTS2021 `{0,1,2,4}` | SRI24 | preprocessed (skull-stripped at source) | **447 dropped** via `metadata/brats21_id` (overlap with BraTS-GLI's implicit BraTS-21 claim) | UPenn (Hospital of the University of Pennsylvania) |
 
-**Totals**: 2222 patients in / 1929 kept after dedup (only UCSF-PDGM
-contributes the 293-patient drop). Across 8 cohorts, modalities are uniformly
-`{t1pre, t1c, t2, flair}`; no cohort carries SWAN/SWI (the conditioning prior
-the proposal's vessel branch needs — a known gap until the Málaga in-house
-cohort lands).
+**Totals (post-dedup, 2026-06-03)**: 2833 patients in across 9 cohorts → **2093 kept** (740 rejected: 293 UCSF-PDGM + 447 UPENN-GBM, both via `metadata/brats21_id` bridge against BraTS-GLI). Cross-verified between local `corpus_local.json` (SHA `621278...`) and server3 `corpus_server3.json` (SHA pinned in `/media/hddb/mario/artifacts/preflights/cohort_dedup/LATEST/decision.json`). Modalities are uniformly `{t1pre, t1c, t2, flair}`; no cohort carries SWAN/SWI (the conditioning prior the proposal's vessel branch needs — a known gap until the Málaga in-house cohort lands).
 
 ---
 
@@ -197,6 +194,69 @@ cohort lands).
   `/media/mpascual/MeningD2/GLIOMA/REMBRANDT/h5/REMBRANDT_image.h5`
   (image), `/media/mpascual/MeningD2/GLIOMA/REMBRANDT/source/` (raw).
 
+### 9. UPENN-GBM (University of Pennsylvania Glioblastoma — v2.0)
+
+* **What**: 611 preoperative GBM patients with manual or automated tumour
+  segmentation from the UPenn release (TCIA collection UPENN-GBM). The
+  source `images_structural/` tree carries 671 patients; the cohort reader
+  drops the 60 with **no** segmentation at discovery time (the converter
+  never sees them).
+* **Patients in corpus**: 611. **Post-dedup keep**: TBD (logged into
+  `decision.json`); expectation ≈164 unique post-dedup against BraTS-GLI's
+  implicit BraTS-2021 claim (447 of 611 carry a non-empty
+  `metadata/brats21_id`).
+* **Splits** (5-fold CV + ~10% test):
+  `splits/test = ~62`, `splits/cv/fold_{0..4}/{train,val}` 5-fold on the
+  remaining ~549. Identical signature to BraTS-GLI / UCSF-PDGM (calls
+  `make_cohort_splits(n_folds=5, test_fraction=0.10, n_test_min=25,
+  seed=42, role="cv")`).
+* **Preprocessing**: source ships skull-stripped (CBICA pipeline; co-registered
+  to SRI24 1 mm iso, LPS, `(240, 240, 155)`). No VENA-side HD-BET step needed.
+  Intensities are scanner-native inside the brain; the H5 stores raw
+  `float32`; percentile normalisation runs at encode time with
+  `percentile_upper=99.95, percentile_foreground_only=true`, identical to
+  UCSF-PDGM / BraTS-GLI on server3.
+* **Tumour seg policy**: **manual seg preferred** (`images_segm/` — 147
+  patients), automated fallback (`automated_segm/` — 611 patients, superset
+  of manual). The reader records the source per patient under
+  `metadata/seg_source ∈ {"manual", "automated"}` and the converter writes it
+  into the H5 for auditing. Labels follow BraTS-2021 `{0=bg, 1=NCR/NET, 2=ED,
+  4=ET}` (verified from seg headers).
+* **Brain mask**: derived as the union of nonzero voxels across the four
+  skull-stripped modalities (same pattern as BraTS-PED / REMBRANDT). Brain
+  voxel fraction is ~16% of the (240,240,155) volume on smoke samples.
+* **Dedup outcome (measured 2026-06-03)**:
+  `bridge_fields: {UPENN-GBM: metadata/brats21_id}` — same contract as
+  UCSF-PDGM. The lookup CSV
+  (`/media/mpascual/MeningD2/GLIOMA/UPENN_GBM/metadata/UPENN-GBM_brats21_lookup_v1.csv`)
+  was built once from `BraTS2021_MappingToTCIA.xlsx` by
+  `scripts/preprocess/build_upenn_gbm_brats21_lookup.py`: filters rows where
+  Data Collection ∈ {UPENN-GBM, UPENN-GBM_Additional} and `portal_id` matches
+  `UPENN-GBM-NNNNN_NN`. 447 of 562 candidate xlsx rows match (115 of the
+  "_Additional" rows carry `portal_id = "new-not-previously-in-TCIA"` — no
+  per-patient bridge available; they fall to the `on_unresolvable=warn`
+  path). The dedup `priority` slot is **3rd** (after BraTS-GLI, UCSF-PDGM),
+  i.e. UPenn cedes overlapping patients to the higher-priority cohorts.
+  **Final**: `n_total=611, n_kept=164, n_rejected=447`.
+* **Encode QC (2026-06-03)**: roundtrip MSE on 4 patients × 4 modalities:
+  t1pre 4.7–5.1e-4, t1c 1.9–2.6e-4, t2 3.1–4.2e-4, flair 4.2–4.8e-4 —
+  all comfortably below the 1e-3 acceptance bound (≈33–37 dB PSNR with
+  `data_range=1.0`).
+* **S2 smoke (2026-06-03)**: 4-epoch run
+  `2026-06-03_10-16-46_s2_81211dac` on server3 used all 9 cohorts incl.
+  UPENN-GBM (`cfm_cohort_UPENN-GBM` column present, loss 1.91 → 1.40
+  across epochs); exhaustive validation drew 10 UPENN-GBM patients per
+  epoch (same quota as IvyGAP/REMBRANDT). No PreflightGateError.
+* **Paper**: Bakas et al. (2022). *The University of Pennsylvania
+  Glioblastoma (UPenn-GBM) cohort: advanced MRI, clinical, genomics, &
+  radiomics.* Scientific Data 9, 453.
+  [DOI 10.1038/s41597-022-01560-7](https://doi.org/10.1038/s41597-022-01560-7).
+  TCIA release: [DOI 10.7937/TCIA.709X-DN49](https://doi.org/10.7937/TCIA.709X-DN49).
+* **Source on disk**:
+  `/media/mpascual/MeningD2/GLIOMA/UPENN_GBM/PKG - UPENN-GBM-NIfTI/UPENN-GBM/NIfTI-files/`
+  (raw); `/media/mpascual/MeningD2/GLIOMA/UPENN_GBM/h5/UPENN-GBM_image.h5`
+  (post-conversion).
+
 ---
 
 ## Cross-cohort invariants
@@ -216,21 +276,26 @@ cohort lands).
   encode time. Cross-cohort latent comparability requires every cohort to
   share these settings — change only in lockstep across `corpus_*.json`.
 
-## Dedup invariants (as of 2026-06-02)
+## Dedup invariants (as of 2026-06-03)
 
-* Priority list: `["BraTS-GLI", "UCSF-PDGM", "IvyGAP", "LUMIERE"]`. Cohorts
-  not in the list inherit lowest priority (passthrough, in
+* Priority list: `["BraTS-GLI", "UCSF-PDGM", "UPENN-GBM", "IvyGAP", "LUMIERE"]`.
+  Cohorts not in the list inherit lowest priority (passthrough, in
   insertion order) — currently `BraTS-Africa-{Glioma,Other}`, `BraTS-PED`,
   `REMBRANDT`.
 * `implicit_brats21_cohorts = ["BraTS-GLI"]` — only BraTS-GLI is treated as
   the umbrella for BraTS-2021 IDs.
-* `bridge_fields = {UCSF-PDGM: metadata/brats21_id}` — only UCSF-PDGM
-  carries an explicit cross-cohort bridge today. IvyGAP has 21 candidate
-  overlaps in the xlsx but no matching ID space; the warn-mode lets it
-  pass.
-* Decision file: `artifacts/preflights/cohort_dedup/LATEST/decision.json`
-  v1.0 — `n_kept=1929`, `n_rejected=293`. Trainer gates on
-  `data.dedup_decisions_path` when that key is set.
+* `bridge_fields = {UCSF-PDGM: metadata/brats21_id, UPENN-GBM: metadata/brats21_id}`
+  — two cohorts now carry an explicit cross-cohort bridge. IvyGAP has 21
+  candidate overlaps in the xlsx but no matching ID space; the warn-mode lets
+  it pass. UPenn's 115 "_Additional" rows with placeholder portal IDs also
+  fall to the warn path.
+* Decision file: `artifacts/preflights/cohort_dedup/LATEST/decision.json` v1.0.
+  Current: 9 cohorts, **2833 in / 2093 kept / 740 rejected**
+  (293 UCSF-PDGM + 447 UPENN-GBM). Trainer gates on
+  `data.dedup_decisions_path` when that key is set; both
+  `routes/preflights/cohort_dedup/configs/default.yaml` (local) and
+  `default_server3.yaml` (server3 paths) are SHA-distinct decisions because
+  the corpus registry paths differ.
 
 ## Useful related notes
 

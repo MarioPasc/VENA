@@ -3,10 +3,11 @@
 Cross-sectional cohort: one scan per patient, native SRI24 shape
 ``(240, 240, 155)`` at 1 mm isotropic, LPS. **HD-BET skull-stripped** by the
 upstream routine; tumour labels follow the BraTS-2021 convention
-``{0, 1, 2, 4}`` (GlistrBoost CBICA pipeline). Splits live under
-``splits/{train, val, test}`` as ``vlen-str`` lists of patient IDs — single
-random 53/5/5 partition (N=63 too small for stable nested K-fold CV; mirrors
-the IvyGAP design choice).
+``{0, 1, 2, 4}`` (GlistrBoost CBICA pipeline). Splits follow the canonical
+multi-cohort layout: ``splits/test`` (held-out) +
+``splits/cv/fold_0/{train, val}`` (single fold of the remaining patients).
+N=63 is too small for stable nested K-fold CV, so a single fold (53/5/5
+train/val/test, seed 42) is used.
 """
 
 from __future__ import annotations
@@ -147,9 +148,8 @@ def build_rembrandt_image_manifest(cohort_tag: str = "REMBRANDT") -> H5Manifest:
         expected_shape=REMBRANDT_IMAGE_EXPECTED_SHAPE,
         datasets=datasets,
         splits_spec={
-            "train": "splits/train  vlen-str  training patient IDs.",
-            "val": "splits/val    vlen-str  validation patient IDs.",
-            "test": "splits/test   vlen-str  held-out test patient IDs.",
+            "test": "splits/test               vlen-str  held-out test patient IDs.",
+            "cv": "splits/cv/fold_0/{train,val}  vlen-str  single-fold CV partition.",
         },
         extras={
             "intensity_policy": "Native scanner intensities post HD-BET skull-strip; brain-only percentile norm at encode time.",

@@ -367,12 +367,21 @@ class REMBRANDTImageH5Converter:
         return splits
 
     def _write_splits(self, w: H5Writer, splits: _Splits) -> None:
-        w.write_vlen_str_1d("splits/train", splits["train"])
-        w.write_vlen_str_1d("splits/val", splits["val"])
+        # Canonical layout (mirrors BraTS-GLI / UCSF-PDGM / LUMIERE):
+        #   splits/test                       — held-out test patient IDs
+        #   splits/cv/fold_0/{train,val}      — single-fold partition of the rest
+        # The trainer (vena.model.fm.lightning.data) reads
+        # ``splits/cv/fold_<fold>/{train,val}`` directly — without these keys
+        # the LatentH5DataModule raises a KeyError at setup. N=63 is too small
+        # for stable nested K-fold CV, hence a single fold (mirrors IvyGAP's
+        # 24/5/5 intent but in the canonical CV layout).
         w.write_vlen_str_1d("splits/test", splits["test"])
+        w.write_vlen_str_1d("splits/cv/fold_0/train", splits["train"])
+        w.write_vlen_str_1d("splits/cv/fold_0/val", splits["val"])
         grp = w.file["splits"]
         grp.attrs["description"] = (
-            "Single random patient-ID split into train/val/test. The cohort "
-            "(N=63) is too small for stable nested K-fold CV (mirrors IvyGAP)."
+            "Patient-ID-based single-fold split. splits/test is the held-out "
+            "set; splits/cv/fold_0/{train,val} is the single-fold partition "
+            "(N=63 too small for stable nested K-fold CV)."
         )
         grp.attrs["n_folds"] = 1
