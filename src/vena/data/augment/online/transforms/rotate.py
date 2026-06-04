@@ -26,7 +26,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from vena.data.augment.base import LatentAugmentation, LatentAugmentationError
+from vena.data.augment.online.base import LatentAugmentation, LatentAugmentationError
 
 
 def _rotation_matrix(plane: str, angle_rad: float, device, dtype) -> torch.Tensor:

@@ -7,7 +7,7 @@ import random
 import pytest
 import torch
 
-from vena.data.augment.transforms.flip import FlipLR
+from vena.data.augment.online.transforms.flip import FlipLR
 
 
 @pytest.fixture()

@@ -173,6 +173,174 @@ class LatentH5Dataset(Dataset):
 # ``routines/fm/train/engine.py``.
 
 
+class OfflineAugmentedLatentH5Dataset(Dataset):
+    """Train-only dataset that draws a variant per ``__getitem__``.
+
+    Wraps a clean :class:`LatentH5Dataset` (the v0 source) together with a
+    per-cohort aug-latent H5 (the v1..vK bank produced by
+    :mod:`routines.offline_aug.maisi`). Each ``__getitem__`` call:
+
+    1. Samples a variant tag from ``variant_weights`` (e.g. ``v0`` 20%,
+       ``v1`` 20%, ..., ``v4`` 20%).
+    2. For ``v0`` reads from the clean H5 via the wrapped
+       :class:`LatentH5Dataset` (so the online transform pipeline still
+       fires on top — flip/translate are still applied).
+    3. For ``v1``..``vK`` reads the row in the aug-latent H5 matching
+       ``(patient_id, variant)``; runs the same online transform on top.
+    4. Writes ``out["_aug_variant"] = variant`` so
+       :class:`vena.data.augment.online.VariantTracker` can count.
+
+    Val and test datasets are NOT wrapped: only the train DataLoader sees
+    augmented data, by construction.
+
+    Parameters
+    ----------
+    clean_h5_path : Path | str
+        Cohort's clean ``<COHORT>_latents.h5``.
+    aug_h5_path : Path | str
+        Cohort's augmented ``<COHORT>_latents_aug.h5``.
+    patient_ids : Sequence[str]
+        Train scan IDs for this cohort + fold.
+    variant_weights : dict[str, float]
+        Sampling probabilities for ``{"v0", "v1", ...}``. Normalised on
+        construction; missing variants get weight 0.
+    latents, wt_threshold, extra_priors, transform : forwarded to
+        :class:`LatentH5Dataset` for the v0 read.
+
+    Raises
+    ------
+    KeyError
+        If ``variant_weights`` references a non-``v0`` variant that the
+        aug-H5 does not provide.
+    """
+
+    def __init__(
+        self,
+        clean_h5_path: Path | str,
+        aug_h5_path: Path | str,
+        patient_ids: Sequence[str],
+        variant_weights: dict[str, float],
+        latents: Sequence[str] = LatentH5Dataset.DEFAULT_LATENTS,
+        wt_threshold: float = 0.5,
+        extra_priors: Sequence[str] | None = None,
+        transform=None,  # AugmentationPipeline | None — string-annotated to skip import
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        self.aug_h5_path = Path(aug_h5_path)
+        if not self.aug_h5_path.is_file():
+            raise FileNotFoundError(f"aug-latent H5 not found: {self.aug_h5_path}")
+        self.patient_ids: list[str] = list(patient_ids)
+        # Hot-path lookup for the fallback in _read_aug; avoids O(N) list.index.
+        self._pid_to_idx: dict[str, int] = {p: i for i, p in enumerate(self.patient_ids)}
+        # The clean reader handles v0 (and also owns the online transform).
+        self._clean = LatentH5Dataset(
+            clean_h5_path,
+            patient_ids,
+            latents=latents,
+            wt_threshold=wt_threshold,
+            extra_priors=extra_priors,
+            transform=transform,
+        )
+        # For v1..vK we still want the online transform; do it after the
+        # aug read via the *same* pipeline. We share self._clean.transform.
+        self._latents: tuple[str, ...] = tuple(latents)
+        self._wt_threshold = float(wt_threshold)
+        self._extra_priors: tuple[str, ...] = tuple(extra_priors or ())
+
+        # Normalise + validate variant weights.
+        if not variant_weights:
+            raise ValueError("variant_weights must be non-empty")
+        weights = {k: float(v) for k, v in variant_weights.items() if float(v) > 0}
+        total = sum(weights.values())
+        if total <= 0.0:
+            raise ValueError(f"all variant weights are zero: {variant_weights}")
+        self._variant_weights: dict[str, float] = {k: v / total for k, v in weights.items()}
+
+        # Lazy aug-H5 state, populated on first read.
+        self._aug_h5: h5py.File | None = None
+        self._aug_idx: dict[tuple[str, str], int] | None = None
+        self._seed = int(seed)
+
+    def _ensure_aug_open(self) -> h5py.File:
+        if self._aug_h5 is None:
+            self._aug_h5 = h5py.File(self.aug_h5_path, "r", swmr=True)
+            ids_arr = np.asarray(self._aug_h5["ids"][:], dtype=object)
+            variants_arr = np.asarray(self._aug_h5["variants"][:], dtype=object)
+            self._aug_idx = {}
+            for row, (pid_v, var_v) in enumerate(zip(ids_arr, variants_arr)):
+                pid_str = pid_v.decode() if isinstance(pid_v, (bytes, bytearray)) else str(pid_v)
+                var_str = var_v.decode() if isinstance(var_v, (bytes, bytearray)) else str(var_v)
+                self._aug_idx[(pid_str, var_str)] = row
+            # Sanity: every variant requested in weights (except v0) must
+            # appear in the aug-H5 for at least one patient.
+            seen_variants = {key[1] for key in self._aug_idx}
+            requested = set(self._variant_weights) - {"v0"}
+            missing = requested - seen_variants
+            if missing:
+                raise KeyError(
+                    f"variant_weights requested {missing!r} but aug-H5 "
+                    f"{self.aug_h5_path} has variants {sorted(seen_variants)}"
+                )
+        return self._aug_h5
+
+    def __len__(self) -> int:
+        return len(self.patient_ids)
+
+    def __getitem__(self, idx: int) -> dict:
+        pid = self.patient_ids[idx]
+        # Per-call deterministic seed. Python's built-in `hash()` is
+        # PYTHONHASHSEED-randomised, so it would give a different variant draw
+        # per process restart — kill that with a stable SHA-256-based digest.
+        digest = hashlib.sha256(f"{pid}:{idx}".encode()).digest()[:8]
+        seed_mix = int.from_bytes(digest, "big", signed=False)
+        rng = random.Random(self._seed ^ seed_mix)
+        variants = list(self._variant_weights)
+        weights = [self._variant_weights[v] for v in variants]
+        variant = rng.choices(variants, weights=weights, k=1)[0]
+        if variant == "v0":
+            out = self._clean[idx]
+        else:
+            out = self._read_aug(pid, variant)
+            if self._clean.transform is not None:
+                out, _ = self._clean.transform(out)
+        out["_aug_variant"] = variant
+        return out
+
+    def _read_aug(self, pid: str, variant: str) -> dict[str, torch.Tensor | str]:
+        h5 = self._ensure_aug_open()
+        assert self._aug_idx is not None
+        key = (pid, variant)
+        row = self._aug_idx.get(key)
+        if row is None:
+            # Fall back to v0 — this can happen if the dedup allowlist
+            # differs between bank-build and training. Log once.
+            logger.warning(
+                "aug-H5 %s has no row for (patient=%r, variant=%r); falling back to clean v0",
+                self.aug_h5_path,
+                pid,
+                variant,
+            )
+            return self._clean[self._pid_to_idx[pid]]
+
+        out: dict[str, torch.Tensor | str] = {"patient_id": pid}
+        for name in self._latents:
+            arr = h5[f"latents/{name}"][row]
+            out[f"z_{name}"] = torch.from_numpy(np.ascontiguousarray(arr)).float()
+        tumor_lat = h5["masks/tumor_latent"][row]
+        soft_union = np.clip(tumor_lat.sum(axis=0, keepdims=True), 0.0, 1.0)
+        m_wt = (soft_union >= self._wt_threshold).astype(np.float32)
+        out["m_wt"] = torch.from_numpy(np.ascontiguousarray(m_wt))
+        # extra_priors are not stored in the aug-H5 (no priors group); skip.
+        return out
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_aug_h5"] = None
+        state["_aug_idx"] = None
+        return state
+
+
 # ---------------------------------------------------------------------------
 # Multi-cohort pooling
 # ---------------------------------------------------------------------------
@@ -411,6 +579,8 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
         max_train_patients_per_cohort: int | None = None,
         train_transform: AugmentationPipeline | None = None,
         dedup_allowlists: dict[str, set[str]] | None = None,
+        use_offline_augmented_data: bool = False,
+        variant_weights: dict[str, float] | None = None,
     ) -> None:
         super().__init__()
         self.registry = registry
@@ -430,6 +600,22 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
         # CSR-expansion to scan IDs, so the DataLoader never sees a
         # dropped patient. ``None`` disables the filter entirely.
         self._dedup_allowlists = dedup_allowlists
+        # Offline-augmented data: when True the train dataset for each cv
+        # cohort is wrapped in OfflineAugmentedLatentH5Dataset, which draws
+        # variant ∈ {v0..vK} per __getitem__ with `variant_weights` and
+        # reads either from the clean latent H5 (v0) or from
+        # `cohort.latent_aug_h5` (v1..vK). Val and test never use augmented
+        # data — they stay on the clean H5.
+        self.use_offline_augmented_data = bool(use_offline_augmented_data)
+        if variant_weights is None:
+            variant_weights = {
+                "v0": 0.2,
+                "v1": 0.2,
+                "v2": 0.2,
+                "v3": 0.2,
+                "v4": 0.2,
+            }
+        self.variant_weights: dict[str, float] = dict(variant_weights)
 
         self._train_ds: MultiCohortLatentDataset | None = None
         self._val_ds: MultiCohortLatentDataset | None = None
@@ -588,11 +774,26 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
             # Build per-cohort datasets. Augmentation is attached to the
             # training dataset only — validation / test datasets always read
             # the raw latent so cross-run metrics stay comparable.
-            train_ds = LatentH5Dataset(
-                cohort.latent_h5,
-                train_scan_ids,
-                transform=self.train_transform,
-            )
+            if self.use_offline_augmented_data:
+                if cohort.latent_aug_h5 is None:
+                    raise RuntimeError(
+                        f"use_offline_augmented_data=True but cohort "
+                        f"{cohort.name!r} has no latent_aug_h5 in the registry"
+                    )
+                train_ds = OfflineAugmentedLatentH5Dataset(
+                    clean_h5_path=cohort.latent_h5,
+                    aug_h5_path=cohort.latent_aug_h5,
+                    patient_ids=train_scan_ids,
+                    variant_weights=self.variant_weights,
+                    transform=self.train_transform,
+                    seed=self.seed,
+                )
+            else:
+                train_ds = LatentH5Dataset(
+                    cohort.latent_h5,
+                    train_scan_ids,
+                    transform=self.train_transform,
+                )
             val_ds = LatentH5Dataset(cohort.latent_h5, val_scan_ids)
             test_ds = LatentH5Dataset(cohort.latent_h5, test_scan_ids)
 

@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vena.data.augment.base import LatentAugmentationError
-from vena.data.augment.transforms.gamma import Gamma
+from vena.data.augment.online.base import LatentAugmentationError
+from vena.data.augment.online.transforms.gamma import Gamma
 
 
 def test_invalid_range_rejected() -> None:

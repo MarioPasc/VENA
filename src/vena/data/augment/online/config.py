@@ -32,9 +32,9 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from vena.data.augment.base import LatentAugmentationError
-from vena.data.augment.pipeline import AugmentationPipeline
-from vena.data.augment.transforms import REGISTRY
+from vena.data.augment.online.base import LatentAugmentationError
+from vena.data.augment.online.pipeline import AugmentationPipeline
+from vena.data.augment.online.transforms import REGISTRY
 
 logger = logging.getLogger(__name__)
 

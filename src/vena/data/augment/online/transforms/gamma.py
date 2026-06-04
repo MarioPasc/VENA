@@ -20,7 +20,7 @@ from typing import Any
 
 import torch
 
-from vena.data.augment.base import LatentAugmentation, LatentAugmentationError
+from vena.data.augment.online.base import LatentAugmentation, LatentAugmentationError
 
 
 class Gamma(LatentAugmentation):

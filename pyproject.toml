@@ -50,6 +50,11 @@ dependencies = [
     "pandas>=2.1",
     "monai[einops]>=1.4,<2.0",
     "PyYAML>=6.0",
+    # TorchIO drives the offline image-domain augmentation bank
+    # (Subject-level joint spatial transforms + physics-grounded
+    # RandomBiasField / RandomMotion / RandomAnisotropy that MAISI's VAE
+    # is not equivariant to). See routines/offline_aug/maisi/.
+    "torchio>=0.19.6",
     # Optimally Oriented Flux (Law & Chung 2008) is consumed through ITK +
     # ITK-TubeTK Python bindings. ITK ships the Hessian / oriented-flux
     # primitives; ITK-TubeTK adds the curated vessel-enhancement filters
@@ -125,6 +130,8 @@ vena-h5-upenn-gbm = "routines.h5_datasets.upenn_gbm.cli:main"
 vena-preprocess-brats-ped-skullstrip = "routines.preprocess.brats_ped_skullstrip.cli:main"
 vena-preprocess-rembrandt-skullstrip = "routines.preprocess.rembrandt_skullstrip.cli:main"
 vena-encode-maisi = "routines.encode.maisi.cli:main"
+vena-offline-aug-maisi = "routines.offline_aug.maisi.cli:main"
+vena-merge-offline-aug = "scripts.merge_offline_aug_shards:main"
 vena-fm-train = "routines.fm.train.cli:main"
 vena-fm-exhaustive-val = "routines.fm.exhaustive_val.cli:main"
 

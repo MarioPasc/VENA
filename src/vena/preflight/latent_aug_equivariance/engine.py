@@ -32,8 +32,8 @@ import torch
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from vena.data.augment.base import LatentAugmentation
-from vena.data.augment.transforms import REGISTRY
+from vena.data.augment.online.base import LatentAugmentation
+from vena.data.augment.online.transforms import REGISTRY
 from vena.data.h5.shared import now_iso_utc
 from vena.model.autoencoder.maisi.decode.engine import MaisiDecoder
 from vena.model.autoencoder.maisi.loader import load_autoencoder

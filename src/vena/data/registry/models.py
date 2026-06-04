@@ -65,6 +65,16 @@ class CohortEntry(BaseModel):
     n_scans: int
     modalities: list[str]
     has_swan: bool
+    image_aug_h5: Path | None = None
+    """Optional augmented-image bank from :mod:`routines.offline_aug.maisi`.
+
+    Set after the offline bank-builder writes ``<COHORT>_image_aug.h5``.
+    Only ``role: cv`` cohorts may carry this — augmenting a test_only cohort
+    is by-construction not what we want.
+    """
+
+    latent_aug_h5: Path | None = None
+    """Optional augmented-latent bank produced by the same routine."""
 
     @field_validator("n_scans")
     @classmethod
@@ -119,3 +129,17 @@ class CorpusRegistry(BaseModel):
     def test_cohorts(self) -> list[CohortEntry]:
         """Cohorts whose patients are held out entirely for test."""
         return [c for c in self.cohorts if c.role == "test_only"]
+
+    def cv_cohorts_with_aug(self) -> list[CohortEntry]:
+        """CV cohorts with both ``image_aug_h5`` and ``latent_aug_h5`` populated.
+
+        Used by the training preflight gate
+        (``data.use_offline_augmented_data=True`` requires every cv cohort to
+        appear here) and by the FM data module to decide which cohorts to
+        wrap in :class:`OfflineAugmentedLatentH5Dataset`.
+        """
+        return [
+            c
+            for c in self.cohorts
+            if c.role == "cv" and c.image_aug_h5 is not None and c.latent_aug_h5 is not None
+        ]

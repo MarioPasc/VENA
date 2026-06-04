@@ -29,7 +29,7 @@ import torch
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from vena.data.augment import AugmentationTracker, build_pipeline_from_yaml
+from vena.data.augment import AugmentationTracker, VariantTracker, build_pipeline_from_yaml
 from vena.data.h5.shared import now_iso_utc, sha256_file
 from vena.data.registry import load_registry
 from vena.model.fm.lightning import FMLightningModule, MultiCohortLatentDataModule
@@ -106,6 +106,22 @@ class _DataCfg(BaseModel):
     # into ``MultiCohortLatentDataModule`` so train/val/test scan IDs are
     # filtered before sampling. Mandatory when supplied.
     dedup_decisions_path: Path | None = None
+    # Offline image-domain augmentation bank (per
+    # ``routines.offline_aug.maisi``). When True, every cv cohort in the
+    # registry must carry ``latent_aug_h5``; the DataModule wraps the train
+    # cohort dataset in ``OfflineAugmentedLatentH5Dataset`` and draws a
+    # variant ∈ {v0..vK} per ``__getitem__`` with ``variant_weights``.
+    # Val/test never see augmented data.
+    use_offline_augmented_data: bool = False
+    variant_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "v0": 0.2,
+            "v1": 0.2,
+            "v2": 0.2,
+            "v3": 0.2,
+            "v4": 0.2,
+        }
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -371,6 +387,51 @@ def _assert_preflight_gates(cfg: FMTrainRoutineConfig) -> None:
     if cfg.data.dedup_decisions_path is not None:
         _assert_dedup_gate(cfg)
 
+    if cfg.data.use_offline_augmented_data:
+        _assert_offline_aug_gate(cfg)
+
+
+def _assert_offline_aug_gate(cfg: FMTrainRoutineConfig) -> None:
+    """Validate that every cv cohort carries ``latent_aug_h5`` when the flag is on.
+
+    Variant-weight sanity is also enforced here: weights must be non-empty,
+    non-negative, and contain at least one non-``v0`` entry whose
+    corresponding aug-H5 row will be served.
+    """
+    from vena.data.registry import load_registry
+
+    registry = load_registry(cfg.data.corpus_registry)
+    cv_cohorts = registry.cv_cohorts()
+    missing = [c.name for c in cv_cohorts if c.latent_aug_h5 is None]
+    if missing:
+        raise PreflightGateError(
+            "data.use_offline_augmented_data=True but the following cv cohorts "
+            f"have no latent_aug_h5 in the registry: {missing}. Either "
+            "build their banks via `vena-offline-aug-maisi` and update the "
+            "registry, or remove them from the registry."
+        )
+    bad_paths = [
+        (c.name, c.latent_aug_h5) for c in cv_cohorts if not Path(c.latent_aug_h5).is_file()
+    ]
+    if bad_paths:
+        raise PreflightGateError(
+            "data.use_offline_augmented_data=True but these latent_aug_h5 "
+            f"paths do not exist on disk: {bad_paths}."
+        )
+    weights = cfg.data.variant_weights
+    if not weights:
+        raise PreflightGateError("data.variant_weights is empty")
+    if any(v < 0 for v in weights.values()):
+        raise PreflightGateError(f"data.variant_weights has negative entries: {weights}")
+    if sum(weights.values()) <= 0:
+        raise PreflightGateError(f"data.variant_weights sum to zero: {weights}")
+    if all(k == "v0" for k in weights if weights[k] > 0):
+        raise PreflightGateError(
+            "data.variant_weights only assigns probability to v0 — the offline "
+            "bank will never be sampled; either drop use_offline_augmented_data "
+            "or give v1..vN a non-zero weight."
+        )
+
 
 def _assert_dedup_gate(cfg: FMTrainRoutineConfig) -> None:
     """Validate the cohort-dedup ``decision.json`` and cross-check against cfg."""
@@ -501,20 +562,28 @@ class FMTrainRoutineEngine:
         write_provenance(run_dir, repo=Path(__file__).resolve().parents[3])
 
     def _build_decision_payload(self, run_id: str, run_dir: Path) -> dict[str, Any]:
-        """Schema-0.4.0 decision JSON written once at run creation.
+        """Schema-0.5.0 decision JSON written once at run creation.
 
         Carries enough provenance for a downstream consumer to reproduce the
         run end-to-end: data registry, trunk + VAE SHA-256, loss stage,
         optimiser/EMA hyperparameters, augmentation gate path, the list of
-        cohort names actually wired in, and (from schema 0.4.0) the cohort
-        deduplication decision file + SHA-256 used to filter the corpus.
+        cohort names actually wired in, the cohort deduplication decision
+        file + SHA-256 used to filter the corpus, and (from schema 0.5.0)
+        the offline-augmentation bank toggle + per-cohort latent_aug_h5
+        paths + variant_weights.
         """
         cfg = self.cfg
         registry = load_registry(cfg.data.corpus_registry)
+        aug_image_paths: dict[str, str] = {}
+        aug_latent_paths: dict[str, str] = {}
+        if cfg.data.use_offline_augmented_data:
+            for c in registry.cv_cohorts_with_aug():
+                aug_image_paths[c.name] = str(c.image_aug_h5)
+                aug_latent_paths[c.name] = str(c.latent_aug_h5)
         return {
-            "schema_version": "0.4.0",
+            "schema_version": "0.5.0",
             "produced_at": now_iso_utc(),
-            "producer": "routines.fm.train:0.4.0",
+            "producer": "routines.fm.train:0.5.0",
             "run_id": run_id,
             "run_dir": str(run_dir),
             "stage": cfg.run.stage,
@@ -541,6 +610,12 @@ class FMTrainRoutineEngine:
             ),
             "dedup_decision_sha256": _safe_sha256(cfg.data.dedup_decisions_path),
             "exhaustive_val_enabled": cfg.exhaustive_val.enabled,
+            "use_offline_augmented_data": cfg.data.use_offline_augmented_data,
+            "variant_weights": dict(cfg.data.variant_weights)
+            if cfg.data.use_offline_augmented_data
+            else None,
+            "aug_image_h5_paths": aug_image_paths or None,
+            "aug_latent_h5_paths": aug_latent_paths or None,
         }
 
     def _build_exhaustive_job_base(self, cfg: FMTrainRoutineConfig) -> dict[str, Any]:
@@ -710,7 +785,15 @@ class FMTrainRoutineEngine:
             max_train_patients_per_cohort=cfg.data.max_train_patients_per_cohort,
             train_transform=train_transform,
             dedup_allowlists=dedup_allowlists,
+            use_offline_augmented_data=cfg.data.use_offline_augmented_data,
+            variant_weights=cfg.data.variant_weights,
         )
+        if cfg.data.use_offline_augmented_data:
+            logger.info(
+                "offline augmentation ENABLED — variant_weights: %s; per-cohort aug paths: %s",
+                cfg.data.variant_weights,
+                {c.name: str(c.latent_aug_h5) for c in registry.cv_cohorts_with_aug()},
+            )
         logger.info(
             "Using MultiCohortLatentDataModule (registry=%s, tau=%.2f)",
             cfg.data.corpus_registry,
@@ -771,6 +854,8 @@ class FMTrainRoutineEngine:
         ]
         if train_transform is not None:
             callbacks.append(AugmentationTracker(out_dir=run_dir / "metrics"))
+        if cfg.data.use_offline_augmented_data:
+            callbacks.append(VariantTracker(out_dir=run_dir / "metrics"))
         if cfg.exhaustive_val.enabled:
             callbacks.append(
                 ExhaustiveValLauncher(

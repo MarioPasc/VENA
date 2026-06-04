@@ -1,0 +1,10 @@
+_note: merge is run via scripts/merge_offline_aug_shards.py (one call per cohort)
+cohort: REMBRANDT
+shards_image:
+- /media/hddb/mario/data/GLIOMAS/rembrandt/h5/rembrandt_image_aug_rank0.h5
+- /media/hddb/mario/data/GLIOMAS/rembrandt/h5/rembrandt_image_aug_rank1.h5
+shards_latent:
+- /media/hddb/mario/data/GLIOMAS/rembrandt/h5/rembrandt_latents_aug_rank0.h5
+- /media/hddb/mario/data/GLIOMAS/rembrandt/h5/rembrandt_latents_aug_rank1.h5
+merged_image_aug_h5: /media/hddb/mario/data/GLIOMAS/rembrandt/h5/rembrandt_image_aug.h5
+merged_latents_aug_h5: /media/hddb/mario/data/GLIOMAS/rembrandt/h5/rembrandt_latents_aug.h5

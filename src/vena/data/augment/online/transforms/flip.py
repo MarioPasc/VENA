@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from vena.data.augment.base import LatentAugmentation
+from vena.data.augment.online.base import LatentAugmentation
 
 # All VENA H5s store volumes reoriented to LPS (see
 # ``src/vena/data/h5/shared/crop.py:12``). LPS = (L, P, S), so axis 0 of

@@ -14,9 +14,9 @@ from vena.data.augment import (
     LatentAugmentationError,
     build_pipeline_from_yaml,
 )
-from vena.data.augment.pipeline import NO_AUG_TAG
-from vena.data.augment.transforms.flip import FlipLR
-from vena.data.augment.transforms.translate import Translate
+from vena.data.augment.online.pipeline import NO_AUG_TAG
+from vena.data.augment.online.transforms.flip import FlipLR
+from vena.data.augment.online.transforms.translate import Translate
 
 
 def _make_batch() -> dict[str, torch.Tensor]:

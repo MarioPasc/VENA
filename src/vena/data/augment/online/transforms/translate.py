@@ -8,7 +8,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from vena.data.augment.base import LatentAugmentation, LatentAugmentationError
+from vena.data.augment.online.base import LatentAugmentation, LatentAugmentationError
 
 # MAISI-V2 spatial compression factor: 4× per axis. An integer-voxel shift of
 # ``k`` voxels in image space corresponds to a shift of ``k // 4`` voxels in

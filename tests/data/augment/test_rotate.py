@@ -7,8 +7,8 @@ import random
 import pytest
 import torch
 
-from vena.data.augment.base import LatentAugmentationError
-from vena.data.augment.transforms.rotate import RotateRoll, RotateYaw
+from vena.data.augment.online.base import LatentAugmentationError
+from vena.data.augment.online.transforms.rotate import RotateRoll, RotateYaw
 
 
 @pytest.fixture()

@@ -213,6 +213,24 @@ class LatentH5Config(BaseModel):
             "in the source image H5 ``ids`` dataset."
         ),
     )
+    aug_mode: bool = Field(
+        default=False,
+        description=(
+            "When True, the source image H5 is an augmented bank "
+            "(``<COHORT>_image_aug.h5``) and the output uses the "
+            "aug-latent manifest from :mod:`vena.data.h5.augmented` — "
+            "no CSR, no splits, no metadata copy. Per-row aug provenance "
+            "(``source_row_index``, ``variants``, ``aug_params_json``) is "
+            "carried through verbatim."
+        ),
+    )
+    aug_config_sha256: str | None = Field(
+        default=None,
+        description=(
+            "SHA-256 of the augmentation YAML; copied into the aug-latent H5's "
+            "``aug_config_sha256`` root attr so the FM trainer can gate."
+        ),
+    )
 
     def to_json(self) -> str:
         # Paths serialise as strings via Pydantic v2 default.
@@ -246,14 +264,23 @@ class LatentH5Converter:
 
         with h5py.File(cfg.source_image_h5, "r") as src:
             cohort = str(src.attrs.get("cohort", "unknown"))
-            metadata_fields = self._detect_metadata_fields(src)
+            metadata_fields = [] if cfg.aug_mode else self._detect_metadata_fields(src)
 
-        manifest = build_latent_manifest(
-            modalities=cfg.modalities,
-            mask_output_channels=self.mask_downsampler.output_channels,
-            cohort=cohort,
-            metadata_fields=metadata_fields,
-        )
+        if cfg.aug_mode:
+            from vena.data.h5.augmented import build_aug_latent_manifest
+
+            manifest = build_aug_latent_manifest(
+                cohort=cohort,
+                modalities=cfg.modalities,
+                mask_output_channels=self.mask_downsampler.output_channels,
+            )
+        else:
+            manifest = build_latent_manifest(
+                modalities=cfg.modalities,
+                mask_output_channels=self.mask_downsampler.output_channels,
+                cohort=cohort,
+                metadata_fields=metadata_fields,
+            )
 
         if cfg.output_path.exists() and not cfg.overwrite:
             if not cfg.resume:
@@ -313,21 +340,29 @@ class LatentH5Converter:
 
                 # Copy non-encoded payload upfront so a partial file is
                 # structurally complete except for pending encoded rows.
-                self._copy_metadata(src, w, manifest, n, src_indices)
-                if is_full_cohort:
-                    self._copy_csr(src, w)
-                    self._copy_splits(src, w)
+                if cfg.aug_mode:
+                    # Aug-latent path: no clinical metadata, no CSR, no splits,
+                    # no priors. Per-row aug provenance (source_row_index,
+                    # variants, aug_params_json) IS still kind="metadata" in
+                    # the aug-latent manifest, so _copy_metadata carries it
+                    # through unchanged.
+                    self._copy_metadata(src, w, manifest, n, src_indices)
                 else:
-                    logger.warning(
-                        "Subset run (n=%d < n_all=%d): skipping CSR (patients/*) and "
-                        "splits copy — the subset patient grouping would be inconsistent.",
-                        n,
-                        n_all,
-                    )
-                    # Write empty placeholder CSR datasets so the manifest
-                    # validator finds the declared paths (structural completeness).
-                    self._write_empty_csr(w)
-                self._create_priors_placeholder(w)
+                    self._copy_metadata(src, w, manifest, n, src_indices)
+                    if is_full_cohort:
+                        self._copy_csr(src, w)
+                        self._copy_splits(src, w)
+                    else:
+                        logger.warning(
+                            "Subset run (n=%d < n_all=%d): skipping CSR (patients/*) and "
+                            "splits copy — the subset patient grouping would be inconsistent.",
+                            n,
+                            n_all,
+                        )
+                        # Write empty placeholder CSR datasets so the manifest
+                        # validator finds the declared paths (structural completeness).
+                        self._write_empty_csr(w)
+                    self._create_priors_placeholder(w)
                 w.file.flush()
 
                 self._encode_loop(
@@ -538,6 +573,14 @@ class LatentH5Converter:
         f.attrs["encode_runtime_attrs_json"] = json.dumps(self.encoder.to_attrs())
         f.attrs["mask_downsampler_attrs_json"] = json.dumps(self.mask_downsampler.to_attrs())
         f.attrs["scale_factor"] = "null"  # reserved; set by FM training when chosen.
+        if cfg.aug_mode:
+            # Aug-latent provenance: the "source image H5" attrs above already
+            # point at the aug-image H5 path; add the explicit aug aliases and
+            # the aug-config SHA so the FM trainer's gate has a direct read.
+            f.attrs["source_aug_image_h5_path"] = str(cfg.source_image_h5)
+            f.attrs["source_aug_image_h5_sha256"] = sha256_file(cfg.source_image_h5)
+            f.attrs["aug_config_sha256"] = cfg.aug_config_sha256 or "unknown"
+            f.attrs["variants_json"] = str(src.attrs.get("variants_json", "[]"))
 
     def _allocate_latents(
         self,

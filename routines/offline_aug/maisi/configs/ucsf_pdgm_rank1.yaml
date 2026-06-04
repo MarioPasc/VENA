@@ -1,0 +1,43 @@
+cohort: UCSF-PDGM
+source_image_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_image.h5
+autoencoder_checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+aug_pipeline_yaml: routines/offline_aug/maisi/configs/aug_pipelines/k4_v1.yaml
+output_dir: /media/hddb/mario/artifacts/offline_aug/maisi/ucsf_pdgm
+image_aug_h5_path: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/ucsf_pdgm_image_aug_rank1.h5
+latent_aug_h5_path: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/ucsf_pdgm_latents_aug_rank1.h5
+modalities:
+- t1pre
+- t1c
+- t2
+- flair
+variants:
+- v1
+- v2
+- v3
+- v4
+device: cuda
+precision_mode: autocast
+autoencoder_norm_float16: true
+inference_mode: auto
+depth_pad_base: 8
+percentile_lower: 0.0
+percentile_upper: 99.5
+percentile_foreground_only: true
+world_size: 2
+rank: 1
+seed: 42
+overwrite: false
+log_level: INFO
+dedup:
+  enabled: true
+  decisions_path: /media/hddb/mario/artifacts/preflights/cohort_dedup/LATEST/decision.json
+qc:
+  enabled: true
+  n_patients_per_variant: 3
+  figure_filename_template: roundtrip_{cohort}_{variant}.png
+  equivariance_decision_path: /media/hddb/mario/artifacts/latent_aug_equivariance/LATEST/decision.json
+  psnr_tolerance_db: 2.0
+  ssim_tolerance: 0.02
+merge:
+  enabled: false
+  shards: []

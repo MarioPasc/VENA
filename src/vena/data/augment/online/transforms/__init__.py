@@ -7,11 +7,11 @@ preflight (``vena.preflight.latent_aug_equivariance``).
 
 from __future__ import annotations
 
-from vena.data.augment.base import LatentAugmentation
-from vena.data.augment.transforms.flip import FlipLR
-from vena.data.augment.transforms.gamma import Gamma
-from vena.data.augment.transforms.rotate import RotateRoll, RotateYaw
-from vena.data.augment.transforms.translate import Translate
+from vena.data.augment.online.base import LatentAugmentation
+from vena.data.augment.online.transforms.flip import FlipLR
+from vena.data.augment.online.transforms.gamma import Gamma
+from vena.data.augment.online.transforms.rotate import RotateRoll, RotateYaw
+from vena.data.augment.online.transforms.translate import Translate
 
 REGISTRY: dict[str, type[LatentAugmentation]] = {
     FlipLR.name: FlipLR,
