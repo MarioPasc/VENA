@@ -1,52 +1,83 @@
 # Pre-launch Tasks — 7-day Picasso Training Run
 
-**Date:** 2026-06-01 (audit refreshed same day).
-**Status as of writing:** Lp-aware contrastive (S2) lands in code; smoke runs validated on icai-server (4 epochs each, ablation-clean cfm, Δ_WT/Δ_BG = 15.5× by epoch 3); see `scratch/2026-06-01_s2_smoke_results.md` for the numbers. The 4-epoch smoke is the floor for stability; nothing below blocks training mathematically.
+**Date:** 2026-06-05 (audit re-refreshed; 2026-06-01 entries marked historical).
+**Status:** Three 1000-epoch Picasso configurations (S1, S2+LoRA r=16, S2+FFT) are
+written and validated locally. SLURM scripts at `routines/fm/train/slurm/runs/`
+land cleanly with `bash launcher_picasso_<stage>.sh --dry-run`. All Picasso-side
+preflight artifacts have been (re-)synced. PEFT + transformers installed on
+Picasso vena env. 401 fast tests pass locally (398 + 3 new patience tests).
+Acceptance gate: the user runs `bash launcher_picasso_s1.sh`,
+`bash launcher_picasso_s2_lora.sh`, `bash launcher_picasso_s2_fft.sh` on the
+Picasso login node.
+
+**Historical context (2026-06-01):** Lp-aware contrastive (S2) lands in code; smoke runs validated on icai-server (4 epochs each, ablation-clean cfm, Δ_WT/Δ_BG = 15.5× by epoch 3); see `scratch/2026-06-01_s2_smoke_results.md` for the numbers. The 4-epoch smoke is the floor for stability; nothing below blocks training mathematically.
 
 **P1 (Diagnostic completeness) and P3 (Robustness niceties) IMPLEMENTED.** See the corresponding sections below for `[x]` markers. 334 fast tests pass locally and on server 3. Server-3 validation smoke (S2 + new logging) ran clean — see *Validation smoke* at the bottom of this file.
 
-## Picasso audit (live, refreshed 2026-06-01)
+## Picasso audit (live, refreshed 2026-06-05)
 
-Repo on Picasso: `/mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA` (synced).
+Repo on Picasso: `/mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA`
+(synced; `/mnt2/fscratch/users/tic_163_uma/mpascual/repos/VENA` is the same
+inode set seen from compute nodes).
 Data on Picasso: `/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/<cohort>/h5/`.
 
 ### Cohort H5 inventory
 
-| Cohort | image H5 | latent H5 | role | usable in S2 long run? |
-|---|---|---|---|---|
-| UCSF-PDGM | ✅ 9.5 G | ✅ 3.6 G | cv | yes |
-| BraTS-GLI (pre-op) | ✅ 15 G | ✅ 9.0 G | cv | yes |
-| IvyGAP | ✅ 452 M | ✅ 249 M | cv | yes |
-| BraTS-Africa-Glioma | ✅ 1.1 G | ✅ 694 M | test-only | yes |
-| BraTS-Africa-Other | ✅ 580 M | ✅ 372 M | test-only | yes |
-| LUMIERE | ✅ 12 G | ✅ 4.3 G | cv | yes |
-| BraTS-PED | ✅ 3.7 G | ❌ MISSING | cv (intended) | **no** — encode required, or drop from registry |
+| Cohort | image H5 | latent H5 | image_aug_h5 | latent_aug_h5 | role | usable? |
+|---|---|---|---|---|---|---|
+| UCSF-PDGM (495) | ✅ | ✅ | ✅ | ✅ | cv | yes |
+| BraTS-GLI pre-op (1133) | ✅ (under `BRATS_GLI/PRE_OPERATIVE/h5/`) | ✅ | ✅ | ✅ | cv | yes |
+| UPENN-GBM (611) | ✅ | ✅ | ✅ | ✅ | cv | yes |
+| IvyGAP (34) | ✅ | ✅ | ✅ | ✅ | cv | yes |
+| LUMIERE (91 pat, 599 scans) | ✅ | ✅ | ✅ | ✅ | cv | yes |
+| REMBRANDT (63) | ✅ | ✅ | ✅ | ✅ | cv | yes |
+| BraTS-Africa-Glioma (95) | ✅ | ✅ | — | — | test_only | yes |
+| BraTS-Africa-Other (51) | ✅ | ✅ | — | — | test_only | yes |
+| BraTS-PED (261) | ⚠️ truncated on Picasso (3.95 GB / 5.42 GB expected); **dropped from `corpus_picasso.json` 2026-06-05** | ✅ (2.0 GB intact) | — | — | test_only | deferred |
 
-### Other expected assets
+### Assets
 
-| Asset | Expected path | Present? | Action |
-|---|---|---|---|
-| MAISI VAE checkpoint | `/mnt/home/.../fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt` | ✅ | none |
-| MAISI FM trunk checkpoint | `/mnt/home/.../fscratch/checkpoints/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt` | ✅ | none |
-| Conda env `vena` | `/mnt/home/.../fscratch/conda_envs/vena` | ✅ exists (torch 2.12.0+cu130, monai 1.5.2, h5py, pydantic, einops, nibabel) | needs `pytorch_lightning` installed — see P0.6 |
-| `pytorch_lightning` in `vena` env | (above) | ❌ missing | `pip install pytorch_lightning==2.6.5` into the env |
-| `vena` package import | editable install from repo | ✅ resolves to `/mnt2/fscratch/.../repos/VENA/src/vena` | none |
-| Latent-aug equivariance preflight artifact | `/mnt/home/.../fscratch/artifacts/latent_aug_equivariance/LATEST/decision.json` | ❌ MISSING (artifacts dir empty) | rsync from icai-server — see P0.4 |
-| Per-run experiments root | `/mnt/home/.../fscratch/experiments/vena/` | (will be created on first run) | OK |
-| Per-run exec logs | `/mnt/home/.../execs/vena/logs/` | ✅ exists (used by `encode` routines) | none |
-| SLURM scripts for `routines/fm/train` | `routines/fm/train/slurm/{launcher,worker}_fm_train.sh` | ❌ not yet written | P0.1 |
-| SLURM scripts for `routines/fm/exhaustive_val` | not needed — spawned in-process by trainer | ✅ N/A | none |
-| Picasso training YAML | `routines/fm/train/configs/runs/picasso_*.yaml` | ❌ not yet written | P0.2 |
+| Asset | Status |
+|---|---|
+| MAISI VAE + FM trunk checkpoints | ✅ |
+| Conda env `vena` (torch, PL 2.6+, monai, h5py, pydantic, einops, nibabel) | ✅ |
+| `peft 0.19.1` + `transformers 4.57` installed in `vena` env | ✅ (installed 2026-06-05) |
+| `vena` package editable install | ✅ resolves to `src/vena` under `repos/VENA` |
+| `corpus_picasso.json` carries `image_aug_h5` + `latent_aug_h5` | ✅ (updated 2026-06-05) |
+| Latent-aug equivariance decision (`fscratch/artifacts/latent_aug_equivariance/LATEST/decision.json`) | ✅ (synced 2026-06-05 from server3 LATEST) |
+| Cohort-dedup decision (`fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json`) | ✅ (re-generated 2026-06-05 against `corpus_picasso.json` SHA) |
+| `BraTS2021_MappingToTCIA.xlsx` at `fscratch/datasets/` | ✅ (synced 2026-06-05 for dedup re-run) |
+| Per-run experiments root `execs/vena/experiments/` | created on first run |
+| Per-run logs `execs/vena/logs/` | created by launcher |
+| SLURM `routines/fm/train/slurm/runs/{worker,launcher_picasso_s1,launcher_picasso_s2_lora,launcher_picasso_s2_fft}.sh` | ✅ (added 2026-06-05) |
+| Picasso training YAMLs (`picasso_s1_1000ep.yaml`, `picasso_s2_1000ep_lora_r16.yaml`, `picasso_s2_1000ep_fft.yaml`) | ✅ (added 2026-06-05) |
 
-### Net blockers from the live audit
+### Net blockers — 2026-06-05
 
-1. `pytorch_lightning` is not installed in the `vena` env on Picasso (P0.6 partially done — env exists, deps incomplete).
-2. The latent-aug preflight `decision.json` is missing on Picasso — `_assert_preflight_gates` will hard-fail at trainer startup (P0.4).
-3. BraTS-PED has no latent H5 — either drop it from `corpus_picasso.json` or run the encode routine for it before launch (P0.5).
-4. SLURM launcher/worker for `routines/fm/train` does not exist (P0.1).
-5. No Picasso-paths YAML yet (P0.2).
+All blockers from the 2026-06-01 audit are resolved. The three Picasso YAMLs +
+the shared worker + three launchers are in place. `sbatch --test-only` on
+the worker accepts the 7-day / 2 × A100 / `--constraint=dgx` ask (verified
+2026-06-05: SLURM would start on `exa03`, queue wait depends on partition
+load).
 
-Items 1, 2, 4, 5 are the strict blockers for the 7-day run. Item 3 is a soft blocker — the registry can omit BraTS-PED and the run will still go.
+### Deferred — BraTS-PED H5 re-transfer
+
+The BraTS-PED `image_h5` on Picasso is truncated (3.95 GB / 5.42 GB; the
+`latent_h5` is intact). The cohort is `test_only` so it does not affect
+training; it has been removed from `corpus_picasso.json` for the production
+runs. When the user has time to re-transfer the file (server 3 → local →
+Picasso, ~5 GB at ~15 MB/s = ~5 minutes on a faster window), the procedure
+to re-add is:
+
+1. `rsync icai-server:/media/hddb/mario/data/GLIOMAS/brats_ped/h5/BraTS_PED_image.h5
+   /tmp/ && rsync /tmp/BraTS_PED_image.h5
+   picasso:/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/brats_ped/h5/`
+2. Re-add the BraTS-PED block to `corpus_picasso.json` (same shape as the
+   other test_only cohorts).
+3. Re-run `python -m routines.preflights.cohort_dedup.cli
+   routines/preflights/cohort_dedup/configs/default_picasso.yaml` on Picasso
+   to refresh the decision SHA against the new corpus JSON, then point
+   `LATEST` at the new dir.
 
 **Scope of this list.** Out of scope: model validation, reader study, paper writing. In scope: everything that (a) would block the 7-day SLURM job from running to completion, or (b) we need decided/wired *now* so the diagnostic + sampling data we want from the run is actually captured, instead of discovered missing on day 7.
 
@@ -54,7 +85,65 @@ Tasks are ordered by blocking-ness. Each names the file(s) and the acceptance ch
 
 ---
 
-## P0 — Hard blockers (must exist before sbatch)
+## 2026-06-05 — New production setup (superseding P0)
+
+Three configurations under `routines/fm/train/configs/runs/`:
+
+| File | Stage | Trunk regime | Loss | Notes |
+|---|---|---|---|---|
+| `picasso_s1_1000ep.yaml` | s1 | fft | cfm only | baseline |
+| `picasso_s2_1000ep_lora_r16.yaml` | s2 | peft (LoRA r=16, QKVO) | cfm + Lp-aware contrastive | recommended production arm |
+| `picasso_s2_1000ep_fft.yaml` | s2 | fft | cfm + Lp-aware contrastive | head-to-head FFT vs LoRA |
+
+Shared training settings (all three): `max_epochs=1000`, `patience=100` (new
+EarlyStopping wiring on `train/total_epoch`), `bs=4 × grad_accum=2` (effective
+batch 8 on A100 40 GB), `exhaustive_val every_epochs=50` async on cuda:1,
+`block_until_complete=false`, `n_patients=60` (10 / cohort × 6 cv cohorts),
+`nfe_levels=[1,5,20]`, `resume_from=latest`, `precision=bf16-mixed`. Offline
+aug bank with uniform variant weights `{v0..v4: 0.2}`. Online latent aug:
+flip_lr + translate (equivariant_v1).
+
+Three logging additions land in this push so the SLURM `.out` / `train.log`
+files actually surface useful state across the 7-day run:
+
+1. `TrainMetricsCSV.on_train_epoch_end` emits one INFO line per epoch with
+   total / cfm / contrastive / gpu_peak / samples_per_sec / elapsed_s.
+2. `ExhaustiveValLauncher` parses the child's `metrics.csv` after each async
+   pass and emits one INFO line per NFE with mean ± std PSNR / SSIM /
+   latent_mse / gen_sec.
+3. `EarlyStopping(monitor="train/total_epoch", mode="min", patience=100,
+   verbose=True)` emits Lightning's standard "best so far + epochs without
+   improvement" line, plus the engine logs `EarlyStopping ENABLED: ...` at
+   startup. If the loss plateaus, training releases the allocation early.
+
+SLURM (`routines/fm/train/slurm/runs/`):
+
+- Shared worker `worker_fm_train_picasso.sh`:
+  `--time=7-00:00:00`, `--gres=gpu:2`, `--constraint=dgx`,
+  `--partition=gpu_partition`, `--cpus-per-task=16`, `--mem=256G`,
+  `--output/--error=execs/vena/logs/%x_%j.{out,err}`. SIGTERM-aware
+  auto-resubmit (rc ∈ {124,137,143}) when the YAML has `resume_from: latest`.
+- Per-stage launchers `launcher_picasso_s1.sh`, `launcher_picasso_s2_lora.sh`,
+  `launcher_picasso_s2_fft.sh`. Each exports the appropriate `CONFIG_PATH` +
+  `JOB_NAME` and submits the shared worker. `--dry-run` mode prints the
+  resolved `sbatch` command without submitting.
+
+Acceptance — the user runs three commands from the Picasso login node:
+
+```bash
+bash routines/fm/train/slurm/runs/launcher_picasso_s1.sh
+bash routines/fm/train/slurm/runs/launcher_picasso_s2_lora.sh
+bash routines/fm/train/slurm/runs/launcher_picasso_s2_fft.sh
+```
+
+Each writes a job id; each lands in its own
+`execs/vena/experiments/<UTC>_<stage>_<sha>/` with self-contained
+`logs/train.log` + `metrics/{train_step,train_epoch}.csv` + per-50-epoch
+`exhaustive_val/epoch_NNN/{metrics,timing}.csv`.
+
+---
+
+## P0 — Hard blockers (must exist before sbatch)  **[historical — closed 2026-06-05]**
 
 ### P0.1  SLURM launcher + worker for `routines/fm/train`
 

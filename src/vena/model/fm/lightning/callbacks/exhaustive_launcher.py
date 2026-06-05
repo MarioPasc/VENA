@@ -75,6 +75,11 @@ class ExhaustiveValLauncher(pl.Callback):
         self.gpu_log = self.out_root / "gpu_usage.log"
         self._proc: subprocess.Popen | None = None
         self._proc_epoch: int | None = None
+        # Epochs whose metrics.csv has already been summarised into the parent
+        # ``train.log``; ensures the summary is logged exactly once per epoch
+        # even if both the blocking branch and the next-epoch poll see the
+        # completed process.
+        self._summarised_epochs: set[int] = set()
 
     # ------------------------------------------------------------------
 
@@ -92,6 +97,9 @@ class ExhaustiveValLauncher(pl.Callback):
                 epoch,
             )
             return
+        # Async mode: if the previous proc finished between cadences, surface
+        # its PSNR/SSIM into the parent log before launching the next one.
+        self._summarise_if_ready()
         self._launch(trainer, pl_module, epoch)
         if self.block_until_complete and self._proc is not None:
             logger.info(
@@ -99,6 +107,7 @@ class ExhaustiveValLauncher(pl.Callback):
             )
             rc = self._proc.wait()
             logger.info("ExhaustiveValLauncher: epoch %d validation exit code %s.", epoch, rc)
+            self._summarise_if_ready()
 
     def on_fit_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if self._proc is not None and self._proc.poll() is None:
@@ -107,6 +116,7 @@ class ExhaustiveValLauncher(pl.Callback):
                 self._proc_epoch,
             )
             self._proc.wait()
+        self._summarise_if_ready()
         if self._proc is not None:
             logger.info(
                 "ExhaustiveValLauncher: last validation (epoch %s) exit code %s.",
@@ -201,6 +211,92 @@ class ExhaustiveValLauncher(pl.Callback):
                 len(to_prune),
                 freed_mb,
             )
+
+    def _summarise_if_ready(self) -> None:
+        """Read the most-recent completed validation's ``metrics.csv`` and
+        emit one human-readable INFO line per NFE (mean ± std PSNR / SSIM /
+        latent_mse / gen_sec).
+
+        Idempotent: keyed on ``self._proc_epoch`` so the summary fires
+        exactly once even when both the next-epoch poll and ``on_fit_end``
+        see the completed process.
+
+        Failures (missing file, malformed CSV) are logged at WARNING and
+        swallowed — the summary is a convenience for the SLURM ``.out``
+        tail and must never bring down a 7-day training run.
+        """
+        if self._proc is None or self._proc_epoch is None:
+            return
+        if self._proc.poll() is None:
+            return  # still running
+        epoch = self._proc_epoch
+        if epoch in self._summarised_epochs:
+            return
+        rc = self._proc.returncode
+        if rc != 0:
+            logger.warning(
+                "ExhaustiveValLauncher: epoch %d validation exited non-zero (rc=%s); "
+                "no summary written.",
+                epoch,
+                rc,
+            )
+            self._summarised_epochs.add(epoch)
+            return
+
+        metrics_csv = self.out_root / f"epoch_{epoch:03d}" / "metrics.csv"
+        if not metrics_csv.exists():
+            logger.warning(
+                "ExhaustiveValLauncher: epoch %d completed but %s is missing; no summary.",
+                epoch,
+                metrics_csv,
+            )
+            self._summarised_epochs.add(epoch)
+            return
+
+        try:
+            import pandas as pd
+
+            df = pd.read_csv(metrics_csv)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "ExhaustiveValLauncher: epoch %d metrics.csv unreadable (%s); no summary.",
+                epoch,
+                exc,
+            )
+            self._summarised_epochs.add(epoch)
+            return
+
+        required = {"nfe", "psnr_db", "ssim", "latent_mse", "gen_sec"}
+        if not required.issubset(df.columns):
+            logger.warning(
+                "ExhaustiveValLauncher: epoch %d metrics.csv missing columns %s; no summary.",
+                epoch,
+                sorted(required - set(df.columns)),
+            )
+            self._summarised_epochs.add(epoch)
+            return
+
+        logger.info(
+            "exhaustive-val epoch %d summary (n_rows=%d, source=%s):",
+            epoch,
+            len(df),
+            metrics_csv,
+        )
+        for nfe in sorted(df["nfe"].unique().tolist()):
+            sub = df[df["nfe"] == nfe]
+            logger.info(
+                "  NFE=%d  PSNR=%.2f±%.2f dB  SSIM=%.3f±%.3f  "
+                "latent_mse=%.4g  gen_sec=%.2f  (n=%d)",
+                int(nfe),
+                float(sub["psnr_db"].mean()),
+                float(sub["psnr_db"].std()),
+                float(sub["ssim"].mean()),
+                float(sub["ssim"].std()),
+                float(sub["latent_mse"].mean()),
+                float(sub["gen_sec"].mean()),
+                len(sub),
+            )
+        self._summarised_epochs.add(epoch)
 
     def _log_gpu_usage(self, epoch: int) -> None:
         ts = datetime.now(UTC).isoformat()

@@ -226,6 +226,13 @@ class _TrainingCfg(BaseModel):
     best_metric_region: str = "bg"
     best_metric_nfe: int = 5
     gradient_clip_val: float = 1.0
+    # Epochs of plateau on ``train/total_epoch`` (mode=min) before Lightning
+    # halts training. ``None`` disables EarlyStopping. Set to e.g. 100 for the
+    # 1000-epoch Picasso runs so a converged + plateaued run releases the
+    # allocation early. Monitor key is the epoch-aggregated training loss
+    # because exhaustive-val PSNR/SSIM never enter ``trainer.callback_metrics``
+    # (the launcher writes them to CSV from a subprocess).
+    patience: int | None = None
 
 
 class _ValidationCfg(BaseModel):
@@ -904,6 +911,24 @@ class FMTrainRoutineEngine:
                     block_until_complete=cfg.exhaustive_val.block_until_complete,
                     prune_snapshots_keep=cfg.exhaustive_val.prune_snapshots_keep,
                 )
+            )
+        if cfg.training.patience is not None:
+            from pytorch_lightning.callbacks import EarlyStopping
+
+            callbacks.append(
+                EarlyStopping(
+                    monitor=ckpt_monitor,
+                    mode="min",
+                    patience=int(cfg.training.patience),
+                    check_on_train_epoch_end=True,
+                    verbose=True,
+                    strict=False,
+                )
+            )
+            logger.info(
+                "EarlyStopping ENABLED: monitor=%s mode=min patience=%d epochs",
+                ckpt_monitor,
+                int(cfg.training.patience),
             )
 
         # Trainer. We write our own clean metric CSVs, so Lightning's logger is

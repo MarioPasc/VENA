@@ -71,6 +71,17 @@ class TrainMetricsCSV(pl.Callback):
         # frozen on first epoch-write so the CSV schema stays stable across
         # subsequent epochs even if one cohort is absent from a particular epoch.
         self._epoch_header: list[str] | None = None
+        # Wall-clock start of the current epoch, set in ``on_train_epoch_start``
+        # so the per-epoch INFO summary line carries an elapsed-seconds field.
+        # That makes the SLURM ``.out`` tail show convergence pace at a glance.
+        self._epoch_t0: float | None = None
+
+    # ------------------------------------------------------------------
+    # Per-epoch start (timer)
+    # ------------------------------------------------------------------
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self._epoch_t0 = time.perf_counter()
 
     # ------------------------------------------------------------------
     # Per-step
@@ -154,7 +165,32 @@ class TrainMetricsCSV(pl.Callback):
             row += [_f(m), _f(s)]
         with self.epoch_path.open("a", newline="") as f:
             csv.writer(f).writerow(row)
+
+        # Per-epoch human-readable summary into both ``train.log`` and the
+        # SLURM ``.out``. Aggregates already in self._epoch_accum; pull the
+        # mean of the load-bearing keys, fall back to NaN-tolerant ``-``.
+        def _m(k: str) -> float:
+            m, _ = _mean_std(self._epoch_accum.get(k, []))
+            return float("nan") if m is None else float(m)
+
+        elapsed = (
+            time.perf_counter() - self._epoch_t0 if self._epoch_t0 is not None else float("nan")
+        )
+        logger.info(
+            "epoch %d done | step=%d total=%.4f cfm=%.4f contrastive=%.4f "
+            "gpu_peak_mb=%.0f samples_per_sec=%.2f elapsed=%.1fs",
+            epoch,
+            int(trainer.global_step),
+            _m("total"),
+            _m("cfm"),
+            _m("contrastive"),
+            _m("gpu_mem_peak_mb"),
+            _m("samples_per_sec"),
+            elapsed,
+        )
+
         self._epoch_accum.clear()
+        self._epoch_t0 = None
 
     # ------------------------------------------------------------------
     # Helpers

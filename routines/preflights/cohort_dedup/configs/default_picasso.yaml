@@ -1,0 +1,26 @@
+# Cohort deduplication preflight — Picasso paths.
+#
+# Same dedup policy as configs/default_server3.yaml; differs only in:
+#   * output_root -> fscratch/artifacts/preflights/cohort_dedup
+#   * corpus_registry -> corpus_picasso.json
+#   * mapping_xlsx -> fscratch/datasets/BraTS2021_MappingToTCIA.xlsx
+
+output_root: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup
+corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+mapping_xlsx: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/BraTS2021_MappingToTCIA.xlsx
+
+priority:
+  - BraTS-GLI
+  - UCSF-PDGM
+  - UPENN-GBM
+  - IvyGAP
+  - LUMIERE
+
+on_unresolvable: warn
+
+bridge_fields:
+  UCSF-PDGM: metadata/brats21_id
+  UPENN-GBM: metadata/brats21_id
+
+implicit_brats21_cohorts:
+  - BraTS-GLI
