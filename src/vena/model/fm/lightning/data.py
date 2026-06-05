@@ -25,6 +25,7 @@ dataset will produce the matching keys (``z_<name>`` / ``prior_<name>``).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import random

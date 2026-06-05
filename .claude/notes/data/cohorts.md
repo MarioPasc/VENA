@@ -27,6 +27,8 @@ surviving the `cohort_dedup` preflight.
 
 **Totals (post-dedup, 2026-06-03)**: 2833 patients in across 9 cohorts → **2093 kept** (740 rejected: 293 UCSF-PDGM + 447 UPENN-GBM, both via `metadata/brats21_id` bridge against BraTS-GLI). Cross-verified between local `corpus_local.json` (SHA `621278...`) and server3 `corpus_server3.json` (SHA pinned in `/media/hddb/mario/artifacts/preflights/cohort_dedup/LATEST/decision.json`). Modalities are uniformly `{t1pre, t1c, t2, flair}`; no cohort carries SWAN/SWI (the conditioning prior the proposal's vessel branch needs — a known gap until the Málaga in-house cohort lands).
 
+**Training pool at fold 0 (2026-06-05, post-dedup, post-split):** **1224 train patients / 1664 train scans, 290 val patients / 402 val scans, 173 test patients / 253 test scans** across the 6 cv cohorts. The 3 `test_only` cohorts (BraTS-Africa-Glioma, BraTS-Africa-Other, BraTS-PED) are excluded from training but available as held-out external evaluators (146 + 51 + 260 = 457 patients). Per-cohort split breakdown lives in the offline-augmentation table below.
+
 ---
 
 ## Per-cohort detail
@@ -296,6 +298,95 @@ surviving the `cohort_dedup` preflight.
   `routes/preflights/cohort_dedup/configs/default.yaml` (local) and
   `default_server3.yaml` (server3 paths) are SHA-distinct decisions because
   the corpus registry paths differ.
+
+---
+
+## Offline augmentation bank (2026-06-05)
+
+Bank produced by `routines/offline_aug/maisi/` over the 6 cv cohorts (test-only cohorts are not augmented by design). One image-domain H5 + one MAISI-encoded latent H5 per cohort, both schema-versioned (`vena.data.h5.augmented` v0.1.0). Each scan in scope is replicated as **K = 4 variants**:
+
+| variant | image-domain transform (TorchIO + MONAI) | applies to | per-transform `p` |
+|---|---|---|---|
+| `v1` field/scanner | `RandomBiasField(order=3, coeffs=±0.5)` + `RandomGamma(log_γ ∈ ±0.3)` | inputs only | bias `p=1.0`, gamma `p=1.0` |
+| `v2` contrast-shape | MONAI `RandHistogramShift(n_ctrl=(8,12))` + `RandomGamma` (tight) | inputs only | hist `p=1.0`, brightness `p=0.4` |
+| `v3` SNR/resolution | `RandomNoise(std ∈ [0, 0.05])` + `RandomAnisotropy` + `RandomBlur` + `RandomMotion(num_transforms ∈ [1,3])` (low-p) | inputs only | noise `p=1.0`, aniso `p=0.7`, blur `p=0.4`, motion `p=0.1` |
+| `v4` anatomy | `RandomElasticDeformation` + `RandomAffine(scale 0.9–1.1, rot ±10°, trans 8 vox)` | **inputs + target + WT mask** (joint) | elastic `p=1.0`, affine `p=1.0` |
+
+`v0` is the unaugmented clean latent (re-used from the per-cohort `*_latents.h5`, not stored a second time). At training time the trainer samples `v0..v4` per `__getitem__` with `variant_weights={v0:0.2, v1:0.2, v2:0.2, v3:0.2, v4:0.2}` (uniform), then runs the *online* latent flip + translate tier on top.
+
+### Per-cohort augmented-row counts (server 3)
+
+| Cohort | source scans in bank | aug rows per variant (× 4) | **total aug rows** | merged-bank size (image + latent) |
+|---|---:|---:|---:|---:|
+| **UCSF-PDGM** | 181 | 181 × 4 | **724** | 27.3 GB + 5.2 GB |
+| **BraTS-GLI** | 1124 | 1124 × 4 | **4496** | 155 GB + 32 GB |
+| **UPENN-GBM** | 147 | 147 × 4 | **588** | 20.0 GB + 4.2 GB |
+| **IvyGAP** | 29 | 29 × 4 | **116** | 4.0 GB + 0.83 GB |
+| **LUMIERE** | 527 | 527 × 4 | **2108** | 79.8 GB + 15.0 GB |
+| **REMBRANDT** | 58 | 58 × 4 | **232** | 7.8 GB + 1.65 GB |
+| **Totals** | **2066 unique source scans** | — | **8264 aug rows** | **294 GB image + 59 GB latent = 353 GB** |
+
+Bank coverage = "all non-`splits/test` patients × all CV folds" per cohort, written once and re-usable across every fold. The "source scans in bank" column therefore exceeds any single fold's `train_scans` count (which is itself a strict subset). The same bank is mirrored at `/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/<COHORT>/h5/` on Picasso (synced 2026-06-04T22:08 UTC).
+
+### Per-cohort fold-0 split sizes (post-dedup-allow-list × `splits/cv/fold_0`)
+
+| Cohort | train patients | train scans | val patients | val scans | test patients | test scans |
+|---|---:|---:|---:|---:|---:|---:|
+| UCSF-PDGM | 147 | 147 | 34 | 34 | 21 | 21 |
+| BraTS-GLI | 815 | 899 | 204 | 225 | 114 | 127 |
+| UPENN-GBM | 121 | 121 | 26 | 26 | 17 | 17 |
+| IvyGAP | 24 | 24 | 5 | 5 | 5 | 5 |
+| LUMIERE | 64 | 420 | 16 | 107 | 11 | 72 |
+| REMBRANDT | 53 | 53 | 5 | 5 | 5 | 5 |
+| **Totals (6 cv)** | **1224** | **1664** | **290** | **402** | **173** | **253** |
+
+### Leakage verification — *no augmented patient reaches val or test during training*
+
+Audited 2026-06-05 with `scripts/`-style probe against `corpus_server3.json` × `LATEST/decision.json`:
+
+- The bank-builder excludes `splits/test` patients at write time (`_resolve_rows` in `vena.data.augment.offline.bank_builder`) — verified: **`aug_ids ∩ test_scan_ids = ∅` for all 6 cohorts**.
+- `OfflineAugmentedLatentH5Dataset` is instantiated with `patient_ids=train_scan_ids` (line 784 in `vena/model/fm/lightning/data.py`). `__getitem__(idx)` reads `self.patient_ids[idx]`, so the train iterator never queries val patients — even though the bank file itself does store val-patient rows (this is by design so the same bank works for any fold).
+- The val and test DataLoaders are built from `LatentH5Dataset(cohort.latent_h5, ...)` against the **clean** H5 only (lines 798–799). They never open the aug bank.
+- The dedup allow-list is intersected with each of train / val / test patient keys before CSR expansion (lines 725–727), so dedup-rejected patients cannot reappear in any partition.
+
+**Conclusion:** at the data-flow level, no augmented patient is presented to the validation or test loaders. The aug-bank's storage scope (all non-test patients) is a superset of any single fold's train set — that is intentional for fold reuse, not a leak.
+
+### Batch composition strategy
+
+`TemperatureBalancedSampler` at `tau = 0.5` ("square-root sampling" on patient counts). At fold 0:
+
+- Cohort probabilities ∝ `N_c^0.5`: BraTS-GLI 0.40, UCSF-PDGM 0.17, UPENN-GBM 0.15, LUMIERE 0.11, REMBRANDT 0.10, IvyGAP 0.07.
+- Within a cohort: uniform patient → uniform scan within that patient (so a 6-session LUMIERE patient does not over-contribute relative to a 1-session UCSF-PDGM patient).
+- Per-batch diversity guarantee: first `min(batch_size, n_cohorts)` slots drawn **without replacement**, then remaining slots with replacement.
+
+The √N choice is the standard multi-domain compromise (uniform = over-represents the smallest cohort; proportional = drowns the smallest under the largest; with a 815:24 ≈ 34× max:min patient-count ratio here, `τ=0.5` shrinks the effective ratio to ≈ √34 ≈ 5.8×).
+
+**Literature support for `τ=0.5`** (Tier 1 — direct precedent):
+
+- **Conneau & Lample (2019)** *Cross-lingual Language Model Pretraining (XLM)*. NeurIPS 2019. arXiv:1901.07291. The seminal reference: $p_i \propto n_i^{\alpha}$ with α=0.5 on multilingual corpora; the heuristic VENA inherits.
+- **Arivazhagan et al. (2019)** *Massively Multilingual NMT in the Wild*. arXiv:1907.05019. Best $T = 5$ on 103 languages ($\tau = 1/T = 0.2$ in our parameterisation); shows the optimal exponent depends on imbalance severity.
+- **Salmani et al. (2025)** *Sampling and Loss Weights in Multi-Domain Training*. arXiv:2511.06913. Derives $p_i \propto \sqrt{n_i \sigma_i^2}$ from gradient-variance minimisation → $\tau = 0.5$ is variance-optimal **under the assumption that within-cohort gradient variance is uniform across cohorts**. Direct theoretical grounding for our choice.
+- **Patil et al. (2025)** *Temperature Sampling for Robot Learning on Imbalanced Datasets*. arXiv:2510.19373. The closest empirical analogue to VENA (5–20× imbalance, non-NLP): $\tau = 0.5$ is the most robust choice across two benchmarks vs $\tau \in \{0.25, 0.75, 1.0\}$.
+- **Glocker et al. (2019)** *Machine Learning with Multi-Site Imaging Data*. arXiv:1910.04597. Shows scanner-site effects dominate multi-site MRI representations after standard harmonisation — motivates cross-site mixing within each batch (= the force-distinct-cohort policy).
+
+**Open critique** (load-bearing):
+
+- **Wang et al. (2020)** *Balancing Training for Multilingual NMT*. ACL 2020, arXiv:2004.06748. **No fixed τ is universally optimal** — the best τ varies per experimental setting; the paper learns per-domain weights via min-max optimisation and consistently beats every fixed-τ baseline. For VENA this means: **ablate $\tau \in \{0.3, 0.5, 0.7, 1.0\}$ on held-out synthesis PSNR before fixing $\tau = 0.5$ in any paper submission**.
+- **LUMIERE longitudinal caveat.** Salmani's variance-optimality assumes within-cohort gradient variance ≈ proportional to cohort size. LUMIERE's 91 patients × ~7 scans/patient violate this (within-patient correlation drives the effective sample size below the scan count). VENA's two-stage uniform draw (patient-then-scan) partially compensates by treating each LUMIERE patient as one cohort unit, but the temperature exponent itself was derived under an i.i.d. assumption that does not hold for LUMIERE. Worth re-deriving the optimal $\tau$ for the longitudinal case, or running the ablation above.
+
+**Force-distinct-cohort batch policy:**
+
+- **Yu et al. (2020) PCGrad** *Gradient Surgery for Multi-Task Learning*. NeurIPS 2020, arXiv:2001.06782. Within-batch task diversity is necessary for detecting and resolving gradient conflicts between cohorts. VENA does not implement PCGrad, but the policy is consistent with it.
+- **Zhao et al. (2020)** *Training Confounder-Free Deep Learning Models for Medical Applications*. Nature Comms 11:6010. DOI 10.1038/s41467-020-19784-9. Balanced within-batch site representation directly reduces site-confounder leakage in brain MRI — closest medical-imaging precedent for our policy.
+- **Zhao & Feng (2025)** *Validation of FL Strategies for Multi-Contrast MRI Synthesis*. bioRxiv 2025.02.09.637305. Closest task analogue (multi-institutional brain MRI synthesis). Finds FedBN > FedAvg because per-batch BN statistics from a single dominant cohort degrade cross-cohort synthesis — directly relevant to VENA's policy of mixing cohort-specific BN statistics within each batch.
+
+**Patient-then-scan vs scan-uniform:**
+
+The patient-then-scan two-stage draw (instead of scan-uniform) is the correct call for the longitudinal cohorts: it gives each LUMIERE patient an equal voice rather than letting a single patient's seven sessions dominate the cohort's contribution to the loss. There is no direct paper on this in multilingual NLP (sentences ≠ documents distinction is not made), but the practitioner consensus in longitudinal medical imaging (Zhao 2020 above; nnU-Net's uniform case sampling — Isensee et al. 2021 Nature Methods 18:203 — although nnU-Net does not have multi-site batch balancing at all) is patient-level first.
+
+**Summary verdict** — $\tau = 0.5$ + force-distinct-cohort + patient-then-scan is a well-supported default with two open follow-ups: (i) the τ ablation, and (ii) if (i) shows τ-instability, the longitudinal-aware variant of the variance-optimal exponent.
+
+---
 
 ## Useful related notes
 

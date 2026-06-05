@@ -1,4 +1,5 @@
-# Server 3 — 4-epoch smoke with the offline augmentation bank wired in.
+# Server 3 — 2-epoch smoke with the offline augmentation bank wired in.
+# Match Picasso production conditions; only max_epochs is reduced.
 #
 # Clone of smoke_s2_4ep.yaml, plus:
 #   * data.use_offline_augmented_data: true
@@ -98,7 +99,7 @@ ema:
 
 training:
   total_steps: 50000
-  max_epochs: 4
+  max_epochs: 2
   batch_size: 2
   grad_accum: 1
   checkpoint_every_epochs: 1
