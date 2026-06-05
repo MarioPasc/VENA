@@ -22,7 +22,7 @@ import json
 import logging
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytorch_lightning as pl
 import torch
@@ -152,6 +152,29 @@ class _TrunkCfg(BaseModel):
     # Project default: fine-tune the trunk jointly with the ControlNet. Set
     # ``false`` for the frozen-backbone baseline arm of the A/B.
     trainable: bool = True
+    # How a trainable trunk is parameterised. ``'fft'`` (default) updates every
+    # trunk tensor; ``'peft'`` routes through ``vena.model.fm.maisi.peft`` to
+    # inject adapter tensors (LoRA / IA3 / DoRA / ...) on top of the frozen
+    # backbone. The ``peft`` block then selects variant + params.
+    regime: Literal["fft", "peft"] = "fft"
+    peft: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _validate_regime_peft(self) -> _TrunkCfg:
+        if self.regime == "peft":
+            if not self.trainable:
+                raise ValueError("trunk.regime='peft' requires trunk.trainable=true")
+            if not self.peft or "variant" not in self.peft:
+                raise ValueError(
+                    "trunk.regime='peft' requires a peft block of the form "
+                    "{variant: <name>, params: {...}}"
+                )
+        elif self.peft is not None:
+            raise ValueError(
+                "trunk.peft must be null when trunk.regime='fft' (got "
+                f"{self.peft!r}); set regime='peft' to enable adapter training"
+            )
+        return self
 
 
 class _ModelCfg(BaseModel):
@@ -562,15 +585,15 @@ class FMTrainRoutineEngine:
         write_provenance(run_dir, repo=Path(__file__).resolve().parents[3])
 
     def _build_decision_payload(self, run_id: str, run_dir: Path) -> dict[str, Any]:
-        """Schema-0.5.0 decision JSON written once at run creation.
+        """Schema-0.6.0 decision JSON written once at run creation.
 
         Carries enough provenance for a downstream consumer to reproduce the
         run end-to-end: data registry, trunk + VAE SHA-256, loss stage,
         optimiser/EMA hyperparameters, augmentation gate path, the list of
         cohort names actually wired in, the cohort deduplication decision
-        file + SHA-256 used to filter the corpus, and (from schema 0.5.0)
-        the offline-augmentation bank toggle + per-cohort latent_aug_h5
-        paths + variant_weights.
+        file + SHA-256 used to filter the corpus, the offline-augmentation
+        bank toggle + per-cohort latent_aug_h5 paths + variant_weights, and
+        (from schema 0.6.0) the trunk regime + PEFT variant + params.
         """
         cfg = self.cfg
         registry = load_registry(cfg.data.corpus_registry)
@@ -580,10 +603,15 @@ class FMTrainRoutineEngine:
             for c in registry.cv_cohorts_with_aug():
                 aug_image_paths[c.name] = str(c.image_aug_h5)
                 aug_latent_paths[c.name] = str(c.latent_aug_h5)
+        trunk_peft_variant: str | None = None
+        trunk_peft_params: dict[str, Any] | None = None
+        if cfg.model.trunk.regime == "peft" and cfg.model.trunk.peft is not None:
+            trunk_peft_variant = cfg.model.trunk.peft.get("variant")
+            trunk_peft_params = dict(cfg.model.trunk.peft.get("params", {}))
         return {
-            "schema_version": "0.5.0",
+            "schema_version": "0.6.0",
             "produced_at": now_iso_utc(),
-            "producer": "routines.fm.train:0.5.0",
+            "producer": "routines.fm.train:0.6.0",
             "run_id": run_id,
             "run_dir": str(run_dir),
             "stage": cfg.run.stage,
@@ -593,6 +621,9 @@ class FMTrainRoutineEngine:
             "trunk_checkpoint": str(cfg.model.trunk.checkpoint),
             "trunk_checkpoint_sha256": _safe_sha256(cfg.model.trunk.checkpoint),
             "trunk_trainable": cfg.model.trunk.trainable,
+            "trunk_regime": cfg.model.trunk.regime,
+            "trunk_peft_variant": trunk_peft_variant,
+            "trunk_peft_params": trunk_peft_params,
             "vae_checkpoint": (str(cfg.model.vae_checkpoint) if cfg.model.vae_checkpoint else None),
             "vae_checkpoint_sha256": _safe_sha256(cfg.model.vae_checkpoint),
             "loss_stage": cfg.run.stage,
@@ -644,6 +675,8 @@ class FMTrainRoutineEngine:
                 "class_token": cfg.model.trunk.class_token,
                 "spacing_mm": list(cfg.model.trunk.spacing_mm),
                 "trainable": cfg.model.trunk.trainable,
+                "regime": cfg.model.trunk.regime,
+                "peft": (dict(cfg.model.trunk.peft) if cfg.model.trunk.peft is not None else None),
             },
             "controlnet": {
                 "conditioning_inputs": list(cfg.model.controlnet.conditioning_inputs),
@@ -808,6 +841,8 @@ class FMTrainRoutineEngine:
             class_token=cfg.model.trunk.class_token,
             spacing_mm=cfg.model.trunk.spacing_mm,
             trainable=cfg.model.trunk.trainable,
+            regime=cfg.model.trunk.regime,
+            peft=cfg.model.trunk.peft,
         )
         optim_cfg = {
             "lr": cfg.optim.lr,

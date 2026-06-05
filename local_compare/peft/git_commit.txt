@@ -1,0 +1,45 @@
+sha: fc68720ddd8ef83496524b0f566cbf43bcbff274
+
+ .claude/rules/coding-standards.md                  |   6 +
+ .claude/rules/model-coding-standards.md            |  48 +-
+ .claude/rules/preflight-pattern.md                 |  34 +-
+ .claude/skills/server3/SKILL.md                    | 208 +++++-
+ .gitignore                                         | 225 ------
+ CLAUDE.md                                          |  58 +-
+ README.md                                          |   2 -
+ pyproject.toml                                     |  35 +-
+ routines/encode/maisi/engine.py                    |  15 +-
+ routines/fm/cli.py                                 |   0
+ routines/fm/exhaustive_val/engine.py               | 266 +++++--
+ .../fm/train/configs/corpus/glioma_preop_v1.json   |  32 -
+ .../fm/train/configs/runs/server3_multicohort.yaml |  16 +-
+ routines/fm/train/engine.py                        | 508 +++++++++++--
+ routines/prior_maps/cellularity_priors/cli.py      |  10 +-
+ routines/prior_maps/perfusion_priors/cli.py        |  10 +-
+ routines/prior_maps/susceptibility_priors/cli.py   |  10 +-
+ routines/prior_maps/vessel_priors/cli.py           |  10 +-
+ .../data/h5/ucsf_pdgm/latent_domain/__init__.py    |   2 +-
+ .../data/h5/ucsf_pdgm/latent_domain/convert.py     | 815 +--------------------
+ .../data/h5/ucsf_pdgm/latent_domain/manifest.py    | 271 +------
+ src/vena/data/niigz/__init__.py                    |  23 +
+ src/vena/data/niigz/brats_gli.py                   |  21 +-
+ src/vena/data/niigz/ucsf_pdgm.py                   |  13 +
+ src/vena/data/registry/models.py                   |  24 +
+ src/vena/model/fm/controlnet/losses/__init__.py    |   2 +
+ src/vena/model/fm/controlnet/losses/base.py        |  53 +-
+ src/vena/model/fm/controlnet/losses/builder.py     |  26 +-
+ src/vena/model/fm/controlnet/losses/contrastive.py | 119 ++-
+ src/vena/model/fm/lightning/__init__.py            |   4 +-
+ .../fm/lightning/callbacks/exhaustive_launcher.py  |  45 ++
+ src/vena/model/fm/lightning/callbacks/train_csv.py |  46 +-
+ src/vena/model/fm/lightning/data.py                | 417 +++++++----
+ src/vena/model/fm/lightning/module.py              | 288 ++++++--
+ src/vena/model/fm/maisi/__init__.py                |  12 +-
+ src/vena/model/fm/maisi/config.py                  |  42 +-
+ src/vena/model/fm/sampler/rflow.py                 |  10 +-
+ .../maisi/test_latent_convert_cohort_agnostic.py   |   4 +-
+ tests/model/fm/test_exhaustive_box_comparison.py   | 112 ++-
+ tests/model/fm/test_losses.py                      |  42 +-
+ tests/model/fm/test_multicohort_datamodule.py      |  22 +-
+ tests/model/fm/test_resume_resolution.py           |  10 +-
+ 42 files changed, 2146 insertions(+), 1770 deletions(-)

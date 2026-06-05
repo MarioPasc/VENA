@@ -87,6 +87,15 @@ dependencies = [
     # implementation by lucidrains; supports inv_gamma/power scheduling natively. We
     # install with --no-deps on CUDA-pinned hosts to avoid disturbing torch.
     "ema-pytorch>=0.5",
+    # PEFT (Hu et al. 2022, arXiv:2106.09685): LoRA / IA3 / DoRA adapters on the
+    # MAISI rectified-flow trunk via ``peft.inject_adapter_in_model``. Wraps
+    # nn.Linear in matched submodules with a low-rank update; zero-init B matrix
+    # gives identity-at-init so joint ControlNet + LoRA training is stable.
+    "peft>=0.10,<0.20",
+    # PEFT 0.19 pulls transformers transitively but imports
+    # ``transformers.BloomPreTrainedModel`` at import time, which was removed in
+    # transformers 5.x. Pin to the last 4.x line so the import path resolves.
+    "transformers>=4.40,<5",
 ]
 
 [project.optional-dependencies]

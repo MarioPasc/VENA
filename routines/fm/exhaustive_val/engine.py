@@ -24,7 +24,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -60,6 +60,10 @@ class _TrunkJobCfg(BaseModel):
     class_token: int = 9
     spacing_mm: tuple[float, float, float] = (1.0, 1.0, 1.0)
     trainable: bool = True
+    # Mirrors the train-time TrunkConfig fields so PEFT-trained runs can
+    # reconstruct the wrapped trunk before loading the EMA snapshot.
+    regime: Literal["fft", "peft"] = "fft"
+    peft: dict[str, Any] | None = None
 
 
 class _CNJobCfg(BaseModel):
@@ -159,6 +163,8 @@ class ExhaustiveValEngine:
             class_token=cfg.trunk.class_token,
             spacing_mm=cfg.trunk.spacing_mm,
             trainable=cfg.trunk.trainable,
+            regime=cfg.trunk.regime,
+            peft=cfg.trunk.peft,
         )
         module = FMLightningModule(
             trunk_config=trunk_cfg,

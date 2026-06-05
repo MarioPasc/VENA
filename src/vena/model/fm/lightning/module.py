@@ -1,22 +1,38 @@
 """LightningModule wrapping trunk + ControlNet + RFlow + composite loss.
 
-The VAE is always frozen. The trunk is controlled by ``trunk_config.trainable``:
+The VAE is always frozen. The trunk is controlled by ``trunk_config.trainable``
+combined with ``trunk_config.regime``:
 
 * ``trainable=False`` (canonical frozen-backbone recipe): the optimiser is
   constructed over ``self.controlnet.parameters()`` only and the trunk is held
   as an unregistered property — trunk weights are not written into
-  checkpoints and the EMA shadow only tracks the ControlNet.
+  checkpoints and the EMA shadow only tracks the ControlNet. ``regime`` must
+  be ``'fft'``.
 
-* ``trainable=True`` (project default since multi-cohort + augmentations work):
+* ``trainable=True`` + ``regime='fft'`` (joint full fine-tune, TumorFlow-style):
   the trunk is unfrozen and joins the same optimiser group as the ControlNet.
   ``self._trunk_module`` is registered as a Lightning submodule so the
   fine-tuned trunk weights round-trip through ``state_dict`` natively (PL 2.x
-  restores model weights *after* ``setup()``). A second EMA — ``self.trunk_ema``
-  — is built in ``setup()`` and updated in lockstep with the ControlNet EMA so
-  sampling uses an EMA-smoothed trunk. Caveat: ``trunk_ema`` is created in
-  ``setup()`` (after Lightning's checkpoint restore), so this path is
-  **single-shot, not resume-safe** as written. Do not rely on ``run.resume_from``
-  for unfrozen runs without first hardening the trunk-EMA restore path.
+  restores model weights *after* ``setup()``).
+
+* ``trainable=True`` + ``regime='peft'`` (parameter-efficient adapter, LoRA &
+  variants): the trunk's matched ``nn.Linear`` modules are replaced in place
+  by adapter-bearing subclasses via
+  :func:`vena.model.fm.maisi.peft.build_peft` and
+  :meth:`vena.model.fm.maisi.peft.BasePEFT.apply`. The optimiser sees only the
+  adapter tensors (filtered by ``requires_grad``); base trunk weights stay
+  frozen. ``self._trunk_module`` registration covers both base and adapter
+  tensors so the small adapter delta round-trips through ``state_dict``.
+  Joint training with ControlNet is stable from step 0 because both
+  components are identity-at-init (ControlNet zero-conv + LoRA zero-init B).
+
+A second EMA — ``self.trunk_ema`` — is built in ``setup()`` (after PEFT
+injection so it shadows adapter tensors too) and updated in lockstep with
+the ControlNet EMA so sampling uses an EMA-smoothed trunk. Caveat:
+``trunk_ema`` is created in ``setup()`` (after Lightning's checkpoint
+restore), so the trainable-trunk paths are **single-shot, not resume-safe**
+as written. Do not rely on ``run.resume_from`` for trainable runs without
+first hardening the trunk-EMA restore path.
 
 The training step follows MAISI-v2's ControlNet recipe (see
 ``.claude/rules/model-coding-standards.md``):
@@ -86,6 +102,7 @@ from ..controlnet.maisi_controlnet import MaisiControlNet
 from ..ema import WarmupEMA
 from ..inference import NFETimingProbe, get_sampler
 from ..maisi.config import TrunkConfig
+from ..maisi.peft import BasePEFT, build_peft
 from ..maisi.trunk import TrunkHandle, load_trunk
 from ..metrics import ImageMetrics, LatentMetrics, RegionMasks, RegionResolver
 from ..sampler.rflow import RFlowEngine
@@ -128,6 +145,22 @@ class FMLightningModule(pl.LightningModule):
         self.trunk_config = trunk_config
         self.stage = stage
         self.perturb_keys: set[str] = set(perturb_keys or ()) if perturb_keys else {"wt"}
+
+        # PEFT adapter handler. Built eagerly from ``trunk_config.peft`` so a
+        # malformed config fails at __init__ time, not deep inside setup() under
+        # DDP. Remains None for the FFT regime.
+        self.peft_handler: BasePEFT | None = None
+        if trunk_config.regime == "peft":
+            assert trunk_config.peft is not None  # enforced by TrunkConfig validator
+            self.peft_handler = build_peft(
+                variant=trunk_config.peft["variant"],
+                params=trunk_config.peft.get("params"),
+            )
+            logger.info(
+                "PEFT handler ready: variant=%s params=%s",
+                trunk_config.peft["variant"],
+                trunk_config.peft.get("params"),
+            )
 
         self._trunk_handle: TrunkHandle | None = None
         # Registered alias for the live trunk, set in setup() only when the trunk
@@ -216,21 +249,39 @@ class FMLightningModule(pl.LightningModule):
             arch_overrides=self.trunk_config.arch_overrides or None,
             trainable=self.trunk_config.trainable,
         )
-        if self.trunk_config.trainable:
-            # Register the trunk so its weights are checkpointed and restored
-            # natively. On resume, setup() reloads the *original* MAISI trunk here
-            # (harmless), then Lightning's post-setup state_dict restore overwrites
-            # it (and trunk_ema + optimiser state) with the fine-tuned values.
-            self._trunk_module = self._trunk_handle.model
+        # IMPORTANT: ``init_from_trunk`` must consume the trunk state_dict with
+        # its pretrained MAISI key paths (e.g. ``to_q.weight``). PEFT injection
+        # replaces those Linears with ``LoraLayer`` wrappers whose state_dict
+        # keys would be ``to_q.base_layer.weight`` + ``to_q.lora_A.default.weight``
+        # — so we MUST apply PEFT AFTER ``init_from_trunk``.
         trunk_sd = self._trunk_handle.model.state_dict()
         self.controlnet.init_from_trunk(trunk_sd)
         self.controlnet.zero_init_output_projections()
+        if self.peft_handler is not None:
+            self.peft_handler.apply(self._trunk_handle.model)
+            adapter_params = self.peft_handler.trainable_parameters(self._trunk_handle.model)
+            n_trainable = sum(p.numel() for p in adapter_params)
+            logger.info(
+                "PEFT injected on trunk (%s): %d adapter tensors, %d trainable params",
+                self.trunk_config.peft.get("variant") if self.trunk_config.peft else "?",
+                len(adapter_params),
+                n_trainable,
+            )
+        if self.trunk_config.trainable:
+            # Register the trunk so its weights (base + any PEFT adapter slots)
+            # are checkpointed and restored natively. On resume, setup() reloads
+            # the *original* MAISI trunk here (harmless), then Lightning's
+            # post-setup state_dict restore overwrites both base and adapter
+            # tensors (and trunk_ema + optimiser state) with the fine-tuned
+            # values.
+            self._trunk_module = self._trunk_handle.model
         self.controlnet = self.controlnet.to(self.device)
         logger.info(
-            "FMLightningModule.setup: trunk on %s (sha=%s) controlnet on %s",
+            "FMLightningModule.setup: trunk on %s (sha=%s) controlnet on %s regime=%s",
             self._trunk_handle.device,
             self._trunk_handle.checkpoint_sha256[:12],
             self.device,
+            self.trunk_config.regime,
         )
 
     @property
@@ -947,12 +998,17 @@ class FMLightningModule(pl.LightningModule):
 
         trainable = [p for p in self.controlnet.parameters() if p.requires_grad]
         if self.trunk_config.trainable:
-            # Unfrozen-trunk ablation: fine-tune the trunk jointly with the
-            # ControlNet under a single param group (matches TumorFlow's recipe).
+            # Unfrozen-trunk paths: fine-tune the trunk jointly with the
+            # ControlNet under a single param group (matches TumorFlow's recipe
+            # for FFT; matches Diffusers convention for PEFT — same LR for
+            # ControlNet and adapter). PEFT regime: ``requires_grad`` is True
+            # only on adapter tensors (``lora_A``/``lora_B``), so the same
+            # filter naturally yields the adapter-only param set.
             trunk_params = [p for p in self.trunk.parameters() if p.requires_grad]
             trainable += trunk_params
             logger.info(
-                "configure_optimizers: trunk UNFROZEN — optimising %d controlnet + %d trunk tensors",
+                "configure_optimizers: trunk UNFROZEN regime=%s — optimising %d controlnet + %d trunk tensors",
+                self.trunk_config.regime,
                 len(trainable) - len(trunk_params),
                 len(trunk_params),
             )

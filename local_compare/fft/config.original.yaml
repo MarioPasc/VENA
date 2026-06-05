@@ -1,0 +1,148 @@
+# Server 3 — 2-epoch smoke with the offline augmentation bank wired in.
+# Match Picasso production conditions; only max_epochs is reduced.
+#
+# Clone of smoke_s2_4ep.yaml, plus:
+#   * data.use_offline_augmented_data: true
+#     → train DataLoader draws v0..v4 per __getitem__ with the configured
+#       variant_weights.
+#   * data.variant_weights: uniform [v0=0.2, v1=0.2, v2=0.2, v3=0.2, v4=0.2]
+#     (per refined_proposal §Q2).
+#   * data.dedup_decisions_path is REQUIRED — the bank was built on the
+#     same allowlist and the FM trainer must honour it.
+#
+# Expected setup before launching this:
+#   1. `vena-offline-aug-maisi` has been run for every cv cohort
+#      (ucsf_pdgm, brats_gli, upenn_gbm, ivy_gap, lumiere) ranks 0+1.
+#   2. The merge step (`scripts/merge_offline_aug_shards.py`) has produced
+#      the per-cohort merged H5s.
+#   3. `corpus_server3.json` carries `image_aug_h5` + `latent_aug_h5` per
+#      cv cohort (updated by hand after the merge; see plan §4).
+#   4. The cohort_dedup preflight artifact is already at
+#      /media/hddb/mario/artifacts/preflights/cohort_dedup/LATEST/.
+
+run:
+  stage: s2
+  resume_from: null
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
+
+data:
+  corpus_registry: routines/fm/train/configs/corpus/corpus_server3.json
+  fold: 0
+  batch_size: 2
+  num_workers: 4
+  pin_memory: true
+  tau: 0.5
+  augmentation_config_path: routines/fm/train/configs/augmentations/equivariant_v1.yaml
+  preflight_decision_path: /media/hddb/mario/artifacts/latent_aug_equivariance/LATEST/decision.json
+  dedup_decisions_path: /media/hddb/mario/artifacts/preflights/cohort_dedup/LATEST/decision.json
+  use_offline_augmented_data: true
+  variant_weights:
+    v0: 0.2
+    v1: 0.2
+    v2: 0.2
+    v3: 0.2
+    v4: 0.2
+
+model:
+  trunk:
+    checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides: {}
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+    trainable: true
+  controlnet:
+    conditioning_inputs:
+      - latent:t1pre
+      - latent:t2
+      - latent:flair
+      - mask:wt:identity
+    arch_overrides: {}
+    perturb_keys: ["wt"]
+  vae_checkpoint: /media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt
+
+loss:
+  cfm:
+    weight: 1.0
+    reduction: mean
+    norm: l2
+  contrastive:
+    weight: 0.01
+    lambda_roi: 0.3
+    lambda_bg: 1.0
+    delta: 2.0
+    p_t: 1.0
+    p_b: 3.0
+
+rflow:
+  num_train_timesteps: 1000
+  use_discrete_timesteps: true
+  sample_method: uniform
+
+optim:
+  lr: 5.0e-5
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  warmup_steps: 1000
+  scheduler: polynomial
+
+ema:
+  decay: 0.9999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 50000
+  max_epochs: 2
+  batch_size: 2
+  grad_accum: 1
+  checkpoint_every_epochs: 1
+  log_train_every_steps: 25
+  best_metric_name: mse_latent
+  best_metric_region: bg
+  best_metric_nfe: 5
+  gradient_clip_val: 1.0
+
+validation:
+  every_epochs: 1
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 5
+  sweep_nfes: [1, 2, 5, 10, 50]
+  qualitative_every_epochs: 10
+  image_metrics: true
+
+exhaustive_val:
+  enabled: true
+  every_epochs: 1
+  n_patients: 20
+  nfe_levels: [1, 2, 5, 10, 20]
+  integrator: euler
+  corpus_registry: routines/fm/train/configs/corpus/corpus_server3.json
+  device: cuda:1
+  block_until_complete: true
+
+output:
+  experiments_root: /media/hddb/mario/experiments
+  retention_n_checkpoints: 5
+  tensorboard: false
+  wandb: false
+
+regions:
+  brain:
+    source: fallback_all_ones
+  wt:
+    source: derived_from_tumor_latent
+    threshold: 0.5
+  wt_dilated:
+    source: derived_via_scipy_binary_dilation
+    structure: ones_3x3x3
+  bg:
+    source: derived
+  vessel:
+    source: skipped
