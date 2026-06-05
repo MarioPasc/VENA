@@ -1,2 +1,0 @@
-icaigpuserver3
-Linux-5.15.0-139-generic-x86_64-with-glibc2.31
