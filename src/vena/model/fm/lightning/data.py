@@ -45,6 +45,57 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class MissingFoldSplitError(RuntimeError):
+    """Raised when a cohort's latent H5 lacks the requested CV fold splits.
+
+    Surfaces the cohort name, file path, requested fold, and the splits
+    actually present so the operator can either regenerate the H5 (re-run the
+    cohort's image-domain converter) or re-copy the canonical artifact from
+    a host that has the correct schema.
+    """
+
+
+def _assert_cohort_splits_present(
+    f: h5py.File,
+    *,
+    cohort_name: str,
+    latent_h5: Path,
+    fold: int,
+) -> None:
+    """Probe a cohort H5 for the splits required by the FM training data path.
+
+    Raises MissingFoldSplitError naming the cohort, file, requested fold, and
+    available alternatives. Without this probe, the operator sees only a raw
+    ``h5py KeyError: 'Unable to synchronously open object (component not
+    found)'`` traced to a generic h5py line — useless for diagnosis on HPC.
+    """
+    required = [
+        f"splits/cv/fold_{fold}/train",
+        f"splits/cv/fold_{fold}/val",
+        "splits/test",
+    ]
+    missing = [k for k in required if k not in f]
+    if not missing:
+        return
+
+    available_folds: list[str] = []
+    if "splits/cv" in f:
+        try:
+            available_folds = sorted(f["splits/cv"].keys())
+        except (AttributeError, TypeError):
+            available_folds = []
+    splits_root = sorted(f["splits"].keys()) if "splits" in f else []
+    raise MissingFoldSplitError(
+        f"cohort {cohort_name!r}: latent_h5={latent_h5} is missing "
+        f"{missing} (requested fold={fold}). Splits group contains "
+        f"{splits_root!r}; available CV folds: {available_folds!r}. "
+        f"Re-run the cohort's image-domain converter to write "
+        f"'splits/cv/fold_K/{{train,val}}' or replace this H5 with the "
+        f"canonical artifact (likely a stale upload predating the cv-splits "
+        f"schema)."
+    )
+
+
 def _seed_worker(worker_id: int) -> None:
     """Deterministic per-worker seeding (training_routine.md §9).
 
@@ -700,6 +751,12 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
         # --- cv cohorts (contribute train/val/test) ---
         for cohort in self.registry.cv_cohorts():
             with self._open_cohort_h5(cohort.latent_h5) as f:
+                _assert_cohort_splits_present(
+                    f,
+                    cohort_name=cohort.name,
+                    latent_h5=cohort.latent_h5,
+                    fold=self.fold,
+                )
                 ids = self._decode_ids(f["ids"])
                 offsets = f["patients/offsets"][:]
                 keys = self._decode_ids(f["patients/keys"])

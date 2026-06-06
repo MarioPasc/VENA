@@ -18,6 +18,7 @@ pytestmark = pytest.mark.unit
 from vena.data.registry.models import CohortEntry, CorpusRegistry
 from vena.model.fm.lightning.data import (
     LatentH5Dataset,
+    MissingFoldSplitError,
     MultiCohortLatentDataModule,
     MultiCohortLatentDataset,
 )
@@ -422,3 +423,157 @@ def test_expand_patients_missing_key_raises() -> None:
     ids = ["P0_s0"]
     with pytest.raises(KeyError, match="MISSING"):
         MultiCohortLatentDataModule._expand_patients_to_scans(offsets, keys, ids, ["MISSING"])
+
+
+# ---------------------------------------------------------------------------
+# Tests: Missing-fold-split diagnostic (regression — Picasso REMBRANDT 2026-06-06)
+# ---------------------------------------------------------------------------
+
+
+def _build_h5_legacy_flat_splits(path: Path, cohort_name: str = "REMBRANDT_LIKE") -> None:
+    """Synthetic H5 mirroring the broken Picasso REMBRANDT artifact.
+
+    Carries patients/CSR/ids/latents/masks but only the *legacy* flat
+    ``splits/{train,val,test}`` keys — no ``splits/cv`` group. This is the
+    exact schema that caused job 1021670/1/2 to fail at data.py:706 with a
+    raw h5py KeyError.
+    """
+    patient_ids = [f"PX{i}" for i in range(6)]
+    scans_per_patient = [1] * 6
+    scan_ids = [f"{pid}_s0" for pid in patient_ids]
+    offsets = list(range(len(patient_ids) + 1))
+    n_scans = len(scan_ids)
+    rng = np.random.default_rng(0)
+
+    with h5py.File(path, "w") as f:
+        f.attrs["schema_version"] = "2.0.0"
+        f.attrs["cohort"] = cohort_name
+        f.attrs["created_at"] = "2026-01-01T00:00:00Z"
+        f.attrs["producer"] = "test_fixture_legacy"
+        f.attrs["config_json"] = "{}"
+        f.attrs["git_sha"] = "deadbeef"
+
+        dt = h5py.special_dtype(vlen=str)
+        f.create_dataset("ids", data=np.array(scan_ids, dtype=object), dtype=dt)
+        for mod in ("t1pre", "t1c", "t2", "flair"):
+            data = rng.random((n_scans, *LATENT_SHAPE), dtype=np.float32).astype(np.float16)
+            f.create_dataset(f"latents/{mod}", data=data, compression="gzip")
+        f.create_dataset(
+            "masks/tumor_latent",
+            data=rng.random((n_scans, MASK_CHANNELS, *LATENT_SHAPE[1:]), dtype=np.float32),
+            compression="gzip",
+        )
+        f.create_dataset("patients/offsets", data=np.array(offsets, dtype=np.int32))
+        f.create_dataset(
+            "patients/keys", data=np.array(patient_ids, dtype=object), dtype=dt
+        )
+        # Legacy flat splits only — no splits/cv group at all.
+        f.create_dataset(
+            "splits/train", data=np.array(patient_ids[:4], dtype=object), dtype=dt
+        )
+        f.create_dataset(
+            "splits/val", data=np.array(patient_ids[4:5], dtype=object), dtype=dt
+        )
+        f.create_dataset(
+            "splits/test", data=np.array(patient_ids[5:], dtype=object), dtype=dt
+        )
+
+
+def _build_registry_with_legacy_cohort(tmp_path: Path) -> CorpusRegistry:
+    h5_legacy = tmp_path / "rembrandt_like.h5"
+    _build_h5_legacy_flat_splits(h5_legacy)
+    img = tmp_path / "img.h5"
+    img.touch()
+    return CorpusRegistry(
+        schema_version="1.0.0",
+        name="legacy_cohort_corpus",
+        cohorts=[
+            CohortEntry(
+                name="REMBRANDT_LIKE",
+                pathology="glioma",
+                label_system="BraTS2023",
+                role="cv",
+                longitudinal=False,
+                image_h5=img,
+                latent_h5=h5_legacy,
+                n_patients=6,
+                n_scans=6,
+                modalities=["t1pre", "t1c", "t2", "flair"],
+                has_swan=False,
+            ),
+        ],
+    )
+
+
+def test_setup_raises_missing_fold_split_when_cv_group_absent(tmp_path) -> None:
+    """Reproduces the Picasso vena-s1-fft / s2 / s2-lora failure mode.
+
+    The REMBRANDT_latents.h5 on Picasso carries schema_version=2.0.0 but only
+    the legacy ``splits/{train,val,test}`` keys — no ``splits/cv`` group.
+    setup() asked for ``splits/cv/fold_0/train`` and h5py raised
+    ``KeyError: 'Unable to synchronously open object (component not found)'``
+    from inside h5py._hl.group, with zero context about which cohort.
+    """
+    registry = _build_registry_with_legacy_cohort(tmp_path)
+    dm = MultiCohortLatentDataModule(
+        registry=registry,
+        fold=0,
+        batch_size=1,
+        num_workers=0,
+    )
+    with pytest.raises(MissingFoldSplitError) as excinfo:
+        dm.setup(stage="fit")
+    msg = str(excinfo.value)
+    assert "REMBRANDT_LIKE" in msg
+    assert "fold=0" in msg
+    assert "splits/cv/fold_0/train" in msg
+    # The error should also surface what *is* present (legacy flat splits).
+    assert "train" in msg and "val" in msg and "test" in msg
+
+
+def test_setup_raises_when_requested_fold_index_absent(tmp_path) -> None:
+    """When ``splits/cv`` exists but the requested fold does not, the error
+    lists available folds so the operator can fix data.fold or regenerate."""
+    h5_path = tmp_path / "cohort_fold0_only.h5"
+    _build_h5(
+        h5_path,
+        patient_ids=[f"PA{i}" for i in range(6)],
+        scans_per_patient=[1] * 6,
+        split_train_patients=["PA0", "PA1", "PA2", "PA3"],
+        split_val_patients=["PA4"],
+        split_test_patients=["PA5"],
+        cohort_name="CohortFold0Only",
+    )
+    img = tmp_path / "img.h5"
+    img.touch()
+    registry = CorpusRegistry(
+        schema_version="1.0.0",
+        name="fold0_only_corpus",
+        cohorts=[
+            CohortEntry(
+                name="CohortFold0Only",
+                pathology="glioma",
+                label_system="BraTS2021",
+                role="cv",
+                longitudinal=False,
+                image_h5=img,
+                latent_h5=h5_path,
+                n_patients=6,
+                n_scans=6,
+                modalities=["t1pre", "t1c", "t2", "flair"],
+                has_swan=False,
+            ),
+        ],
+    )
+    dm = MultiCohortLatentDataModule(
+        registry=registry,
+        fold=3,  # only fold_0 exists in the fixture
+        batch_size=1,
+        num_workers=0,
+    )
+    with pytest.raises(MissingFoldSplitError) as excinfo:
+        dm.setup(stage="fit")
+    msg = str(excinfo.value)
+    assert "CohortFold0Only" in msg
+    assert "fold=3" in msg
+    assert "fold_0" in msg  # available alternatives advertised
