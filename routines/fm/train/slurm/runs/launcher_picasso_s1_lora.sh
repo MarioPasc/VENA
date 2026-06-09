@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Submit the S1 (FFT trunk + CFM-only) 1000-epoch run to Picasso.
+# Submit the S1 + LoRA r=16 (CFM-only) 1000-epoch run to Picasso.
 #
 # Usage:
-#   bash launcher_picasso_s1.sh             # submit
-#   bash launcher_picasso_s1.sh --dry-run   # print sbatch command
+#   bash launcher_picasso_s1_lora.sh             # submit
+#   bash launcher_picasso_s1_lora.sh --dry-run   # print sbatch command
 
 set -euo pipefail
 
@@ -11,8 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export CONDA_ENV_NAME="${CONDA_ENV_NAME:-vena}"
 export REPO_DIR="${REPO_DIR:-/mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA}"
-export CONFIG_PATH="${REPO_DIR}/routines/fm/train/configs/runs/picasso_s1_1000ep.yaml"
-JOB_NAME="vena-s1-fft"
+export CONFIG_PATH="${REPO_DIR}/routines/fm/train/configs/runs/picasso_s1_1000ep_lora_r16.yaml"
+JOB_NAME="vena-s1-lora-r16"
 LOGS_DIR="/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs"
 
 DRY_RUN=false

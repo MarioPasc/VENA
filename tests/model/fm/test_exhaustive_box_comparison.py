@@ -51,6 +51,61 @@ def test_wt_mask_in_image_space_upsamples_correctly() -> None:
 
 
 @pytest.mark.unit
+def test_brain_mask_in_image_space_upsamples_correctly() -> None:
+    """Same NN-upsample contract as WT, applied to ``batch['m_brain']``.
+
+    Mirrors the 2026-06-09 overhaul (CHANGE 2 of the regime note): the
+    `regions.brain.source: latents_h5` YAML field is now consumed by
+    `_brain_mask_in_image_space`, which reads ``masks/brain_latent`` via the
+    dataset's `m_brain` key. Falls back to None when the H5 lacks the dataset.
+    """
+    engine = ExhaustiveValEngine.__new__(ExhaustiveValEngine)
+    m_brain = torch.zeros(1, 1, 4, 4, 4)
+    m_brain[0, 0, :2, :2, :2] = 1.0  # 8 latent voxels active
+    image_shape = (1, 1, 8, 8, 8)
+    out = engine._brain_mask_in_image_space({"m_brain": m_brain}, image_shape)
+    assert out is not None
+    assert out.shape == (1, 1, 8, 8, 8)
+    assert out.dtype == torch.bool
+    # 8 latent voxels × 2³ NN-upsample = 64 image voxels.
+    assert out.sum().item() == 64
+    # Absent-mask path returns None — exhaustive_val then falls back to r>0.
+    assert engine._brain_mask_in_image_space({}, image_shape) is None
+
+
+@pytest.mark.unit
+def test_region_psnr_ssim_uses_m_brain_when_provided() -> None:
+    """When ``m_brain_img`` is passed, the healthy-brain region (``nwt``) is
+    derived from the precise mask, not from ``real_box > 0``. Construct a real
+    volume that disagrees with the precise mask to surface the path."""
+    metrics = ImageMetrics(data_range=1.0)
+    H, W, D = 8, 8, 8
+    pred = torch.zeros(1, 1, H, W, D)
+    real = torch.zeros(1, 1, H, W, D)
+    # `real_box > 0` would consider ZERO voxels as brain. Without m_brain the
+    # nwt region is empty → SSIM is NaN.
+    real += 0.0
+    wt_mask = torch.zeros(1, 1, H, W, D, dtype=torch.bool)
+    wt_mask[0, 0, 0, 0, 0] = True
+
+    # No m_brain_img → fall back to r>0 (empty brain) → nwt empty → NaN.
+    out_no_brain = ExhaustiveValEngine._region_psnr_ssim(pred, real, wt_mask, metrics)
+    assert out_no_brain[4] != out_no_brain[4]  # psnr_nwt is NaN
+    assert out_no_brain[5] != out_no_brain[5]  # ssim_nwt is NaN
+
+    # With m_brain_img covering the half-volume that the proxy missed,
+    # the healthy-brain region is populated → finite SSIM (pred == real, so
+    # PSNR is +inf clamped to the metric's representation).
+    brain_mask = torch.zeros(1, 1, H, W, D, dtype=torch.bool)
+    brain_mask[0, 0, :, :, :] = True
+    out_with_brain = ExhaustiveValEngine._region_psnr_ssim(
+        pred, real, wt_mask, metrics, m_brain_img=brain_mask
+    )
+    # ssim_nwt should now be finite (pred==real → ssim=1.0).
+    assert out_with_brain[5] == out_with_brain[5]  # not NaN
+
+
+@pytest.mark.unit
 def test_render_best_worst_top_k_selection() -> None:
     """``_render_best_worst`` must rank patients by mean SSIM and produce 2*k
     targets: ``best_1..k`` (highest) + ``worst_1..k`` (lowest).

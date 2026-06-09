@@ -550,10 +550,15 @@ class ExhaustiveValEngine:
 
         module.compute_val_conditioning(batch)
 
-        # WT mask in image space (NN-upsampled from the latent mask the dataset
-        # already loaded). Used for region-masked PSNR/SSIM below — the decoded
-        # volume is already on the GPU, so the extra metric calls are near-free.
+        # WT + brain masks in image space (NN-upsampled from the latent masks
+        # the dataset already loaded). Used for region-masked PSNR/SSIM below;
+        # the decoded volume is already on the GPU so the extra metric calls
+        # are near-free. ``m_brain_img`` is ``None`` for H5s that pre-date
+        # `vena-encode-brain-to-latent`; the metric helper falls back to the
+        # `real_box > 0` inference in that case.
         m_wt_img = self._wt_mask_in_image_space(batch, real_box.shape)
+        m_brain_img = self._brain_mask_in_image_space(batch, real_box.shape)
+        brain_mask_source = "masks/brain_latent" if m_brain_img is not None else "real_box>0"
 
         for nfe in cfg.nfe_levels:
             z_pred, gen_t = self._sample(module, sampler, z_target, int(nfe))
@@ -563,7 +568,7 @@ class ExhaustiveValEngine:
             img_pred, dec_t = self._decode(vae, z_pred, crop_spec)
             psnr, ssim = full_volume_psnr_ssim(img_pred, real_box, image_metrics)
             psnr_wt, ssim_wt, psnr_bg, ssim_bg, psnr_nwt, ssim_nwt = self._region_psnr_ssim(
-                img_pred, real_box, m_wt_img, image_metrics
+                img_pred, real_box, m_wt_img, image_metrics, m_brain_img=m_brain_img
             )
 
             mask = torch.ones_like(z_target, dtype=torch.bool)
@@ -592,6 +597,7 @@ class ExhaustiveValEngine:
                     "latent_cosine": lat_cos,
                     "gen_sec": gen_t,
                     "decode_sec": dec_t,
+                    "brain_mask_source": brain_mask_source,
                 }
             )
             del img_pred
@@ -709,16 +715,32 @@ class ExhaustiveValEngine:
             dataset did not supply ``m_wt`` for this patient. The boolean dtype
             matches what :class:`ImageMetrics` expects.
         """
-        m_wt = batch.get("m_wt")
-        if m_wt is None:
+        return self._upsample_latent_mask(batch.get("m_wt"), image_shape)
+
+    def _brain_mask_in_image_space(
+        self, batch: dict[str, Any], image_shape: tuple[int, ...]
+    ) -> torch.Tensor | None:
+        """NN-upsample the latent brain mask to the image box.
+
+        Reads ``batch["m_brain"]`` which the dataset populates from the
+        cohort's ``masks/brain_latent`` (max-pool 4 of the image-domain
+        ``masks/brain``, produced by ``vena-encode-brain-to-latent``). Returns
+        ``None`` when the H5 lacks the dataset; the caller then falls back
+        to the ``real_box > 0`` skull-strip-foreground inference.
+        """
+        return self._upsample_latent_mask(batch.get("m_brain"), image_shape)
+
+    @staticmethod
+    def _upsample_latent_mask(mask: Any, image_shape: tuple[int, ...]) -> torch.Tensor | None:
+        if mask is None:
             return None
-        if not isinstance(m_wt, torch.Tensor):
+        if not isinstance(mask, torch.Tensor):
             return None
-        if m_wt.dim() == 4:
+        if mask.dim() == 4:
             # CSR datasets occasionally return (1,h,w,d); add the batch dim.
-            m_wt = m_wt.unsqueeze(0)
+            mask = mask.unsqueeze(0)
         target_spatial = tuple(int(s) for s in image_shape[-3:])
-        m_up = F.interpolate(m_wt.float(), size=target_spatial, mode="nearest")
+        m_up = F.interpolate(mask.float(), size=target_spatial, mode="nearest")
         return m_up.bool()
 
     @staticmethod
@@ -727,6 +749,7 @@ class ExhaustiveValEngine:
         real_box: torch.Tensor,
         m_wt_img: torch.Tensor | None,
         image_metrics: ImageMetrics,
+        m_brain_img: torch.Tensor | None = None,
     ) -> tuple[float, float, float, float, float, float]:
         """Region-masked PSNR/SSIM for WT, BG, and NWT (healthy brain).
 
@@ -735,11 +758,16 @@ class ExhaustiveValEngine:
         * **wt** — whole-tumour mask (NN-upsampled from latent space).
         * **bg** — complement of ``wt`` (everything that is not tumour;
           historically named "background" but includes both outside-brain
-          voxels and healthy brain).
-        * **nwt** — healthy brain: brain-foreground (``real_box > 0`` after
-          skull-strip) intersected with ``~wt``. Because every training/eval
-          volume is skull-stripped (``percentile_normalise`` with
-          ``foreground_only=True``), the zero-foreground proxy is reliable.
+          voxels and healthy brain). Kept under this semantic for
+          backward-compat with existing CSV consumers.
+        * **nwt** — healthy brain: precise brain mask (from
+          ``masks/brain_latent`` when present in the H5, otherwise inferred
+          from ``real_box > 0``) intersected with ``~wt``. The precise mask
+          is preferred because the zero-foreground proxy mis-labels two
+          small populations as non-brain: (i) dark CSF voxels with intensity
+          exactly 0, (ii) near-zero halo around the skull-strip boundary.
+          The CSV cell ``brain_mask_source`` records which path was taken
+          per row.
 
         ``decode_box`` returns a 3-D ``(H, W, D)`` tensor and the whole-volume
         helper adds two leading dims internally; the masked metric helpers
@@ -753,13 +781,17 @@ class ExhaustiveValEngine:
         r = real_box[None, None] if real_box.ndim == 3 else real_box
         wt = m_wt_img if m_wt_img.ndim == 5 else m_wt_img[None, None]
         bg = ~wt
-        # Healthy brain: skull-stripped foreground AND not tumour.
-        brain = r > 0
-        if brain.shape != wt.shape:
-            # Defensive: only collapse when r had a multi-channel layout we did
-            # not anticipate. The training pipeline always emits single-channel
-            # boxes, so this branch is rarely taken.
-            brain = brain.any(dim=1, keepdim=True)
+        # Healthy brain: precise brain mask when available, otherwise
+        # `real_box > 0` skull-strip-foreground inference.
+        if m_brain_img is not None and m_brain_img.numel() > 0:
+            brain = m_brain_img if m_brain_img.ndim == 5 else m_brain_img[None, None]
+        else:
+            brain = r > 0
+            if brain.shape != wt.shape:
+                # Defensive: only collapse when r had a multi-channel layout we did
+                # not anticipate. The training pipeline always emits single-channel
+                # boxes, so this branch is rarely taken.
+                brain = brain.any(dim=1, keepdim=True)
         nwt = brain & ~wt
 
         psnr_wt = image_metrics.psnr(p, r, wt)
@@ -802,6 +834,11 @@ class ExhaustiveValEngine:
             "latent_cosine",
             "gen_sec",
             "decode_sec",
+            # 2026-06-09 overhaul: which mask supplied the brain region for the
+            # `nwt` PSNR/SSIM cells in this row — `masks/brain_latent` (precise,
+            # loaded from the latent H5) or `real_box>0` (skull-strip-foreground
+            # inference, fallback for H5s pre-dating `vena-encode-brain-to-latent`).
+            "brain_mask_source",
         ]
         with path.open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=cols)

@@ -80,7 +80,7 @@ loss:
 rflow:
   num_train_timesteps: 1000
   use_discrete_timesteps: true
-  sample_method: uniform
+  sample_method: logit-normal
 
 optim:
   lr: 1.0e-4
@@ -98,8 +98,8 @@ ema:
   min_value: 0.0
 
 training:
-  total_steps: 208000
-  max_epochs: 1000
+  total_steps: 400000
+  max_epochs: 10000
   batch_size: 4
   grad_accum: 2
   checkpoint_every_epochs: 25
@@ -120,14 +120,14 @@ validation:
 
 exhaustive_val:
   enabled: true
-  every_epochs: 50
+  every_epochs: 25
   n_patients: 60
   nfe_levels: [1, 2, 5, 10, 20]
   integrator: euler
   corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
   device: cuda:1
   block_until_complete: false
-  figure_top_k: 3
+  figure_top_k: 5
 
 output:
   experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments
@@ -137,7 +137,7 @@ output:
 
 regions:
   brain:
-    source: fallback_all_ones
+    source: latents_h5
   wt:
     source: derived_from_tumor_latent
     threshold: 0.5
