@@ -64,17 +64,22 @@ def test_build_loss_s1_returns_cfm_only() -> None:
 
 
 @pytest.mark.unit
-def test_build_loss_s2_includes_contrastive_and_requires_perturb() -> None:
+def test_build_loss_s2_includes_contrastive_no_perturbed_pass() -> None:
+    """v0.4 (2026-06-09 overhaul): S2 no longer needs the perturbed forward.
+    The conditioning-attribution path moved to the training-loop CFG dropout
+    (``training.conditioning_dropout_p``) — see CHANGE 3 of the overhaul note.
+    """
     composite = build_loss("S2", {})
     assert set(composite.terms.keys()) == {"cfm", "contrastive"}
-    assert composite.requires_perturbed_pass is True
+    assert composite.requires_perturbed_pass is False
 
 
 @pytest.mark.unit
 def test_build_loss_s3_adds_reconstruction() -> None:
     composite = build_loss("S3", {})
     assert set(composite.terms.keys()) == {"cfm", "contrastive", "reconstruction"}
-    assert composite.requires_perturbed_pass is True
+    # v0.4: contrastive no longer needs a perturbed pass; S3 inherits.
+    assert composite.requires_perturbed_pass is False
 
 
 @pytest.mark.unit
@@ -90,11 +95,12 @@ def test_s3_reconstruction_stub_raises_on_forward() -> None:
     ``tests/model/fm/test_losses_contrastive.py``.)
     """
     composite = build_loss("S3", {})
-    # Provide v_perturb + m_wt + m_bg so the (now-implemented) contrastive term
-    # is satisfied; the failure should come from the recon stub that runs next.
+    # Provide m_wt + m_brain so the v0.4 contrastive term is satisfied; the
+    # failure should come from the recon stub that runs next.
     base = _make_inputs()
     B, C, h, w, d = base.v_orig.shape
-    m = torch.zeros(B, 1, h, w, d)
+    m_wt = torch.zeros(B, 1, h, w, d)
+    m_brain = torch.ones(B, 1, h, w, d)
     inputs = LossInputs(
         x_clean=base.x_clean,
         noise=base.noise,
@@ -102,9 +108,9 @@ def test_s3_reconstruction_stub_raises_on_forward() -> None:
         timesteps=base.timesteps,
         u_target=base.u_target,
         v_orig=base.v_orig,
-        v_perturb=torch.zeros_like(base.v_orig),
-        m_wt=m,
-        m_bg=m,
+        v_perturb=None,
+        m_wt=m_wt,
+        m_brain=m_brain,
     )
     with pytest.raises(NotImplementedError, match="S3 commit"):
         composite(inputs)

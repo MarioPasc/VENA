@@ -1,132 +1,276 @@
-r"""Lp-aware mask-perturbation contrastive regulariser (proposal §5.3, v0.3).
+r"""Region-weighted CFM residual loss (proposal §5.3 v0.4 — 2026-06-09 overhaul).
 
-Given the velocity differential :math:`\Delta_\theta(x_t) = G_\theta(x_t,t,c_{\text{orig}})
-- G_\theta(x_t,t,c_{\text{perturb}})` (the ControlNet trained on the original
-conditioning vs the same tensor with the WT-mask channel zeroed), the loss has
-two terms:
+Replaces the mask-sensitivity ``|v_orig − v_perturb|^p`` formulation (v0.3,
+shipped 2026-05-30) that traded synthesis quality for attribution and saturated
+its ROI cap after a few thousand steps. The new formulation is a per-sample
+sum of Lp residuals between the predicted velocity and the FM target,
+restricted to a configurable list of latent-space regions:
 
-* **ROI**, pushing :math:`|\Delta|` *up* inside the tumour but capped on the
-  aggregate mean to keep the term bounded:
+.. math::
 
-  .. math::
-      \mathcal{L}_{\text{roi}}^{(p_t)} =
-        -\min\Big(\tfrac{1}{|m|}\!\sum_{x \in m} |\Delta_\theta(x)|^{p_t},
-                  \;\delta^{p_t}\Big)
+    \mathcal{L}_{\text{contrastive}}^{(\theta)} \;=\;
+        \sum_{\tau \in \text{terms}} w_\tau \cdot \mathcal{L}_\tau^{(p_\tau)}
+    \qquad
+    \mathcal{L}_\tau^{(p)} \;=\;
+        \tfrac{1}{|m_\tau| \cdot C} \sum_{i \in m_\tau} \sum_{c=1}^{C}
+            \big| v_{\text{pred}}^{(c)}(i) - u_{\text{target}}^{(c)}(i) \big|^{p}
 
-* **BG**, pushing :math:`|\Delta|` *down* outside the dilated tumour, with the
-  cap applied **per-voxel** so single outliers saturate without dragging the
-  regional mean to the cap:
+Each term is one of (binary masks, broadcast over the ``C=4`` latent channels):
 
-  .. math::
-      \mathcal{L}_{\text{bg}}^{(p_b)} =
-        \tfrac{1}{|m^-|}\!\sum_{x \in m^-} \min\big(|\Delta_\theta(x)|^{p_b},
-                                                   \;\delta^{p_b}\big)
+==========  =======================
+``region``  formula
+==========  =======================
+``wt``      :math:`m_{\text{wt}}`
+``brain``   :math:`m_{\text{brain}}`
+``healthy`` :math:`m_{\text{brain}} \wedge \neg m_{\text{wt}}`
+``background`` :math:`\neg m_{\text{brain}}`
+``full``    :math:`\mathbf{1}` (whole volume)
+==========  =======================
 
-The two terms are returned as a single weighted sum
-:math:`\lambda_{\text{roi}}\mathcal{L}_{\text{roi}} + \lambda_{\text{bg}}\mathcal{L}_{\text{bg}}`;
-the outer :math:`\lambda_{\text{contrast}}` is applied by
-:class:`CompositeLoss` via the ``contrastive`` weight in the builder.
+The doc-default of CHANGE 2 (single ``healthy`` term, ``p=2``) collapses to
+the recipe in the design note, but the YAML now lets us mix terms (e.g. ``wt``
+with ``p=1`` and ``healthy`` with ``p=3``) without code changes — see the
+``loss.contrastive`` block in ``routines/fm/train/configs/runs/picasso_s2_*``.
 
 Notes
 -----
 * Operates entirely on latent-space velocity fields; no VAE decode.
-* The cap :math:`\delta` (default 2.0) is the MAISI-v2 default — approximately
-  2σ of KL-regularised MAISI latents.
-* Empty-mask guard via ``clamp_min(1.0)`` on each region's voxel count so the
-  term contributes 0 (not NaN) when the WT mask is empty for a batch element.
-* The four diagnostics ``delta_abs_mean_in``, ``delta_abs_mean_out``,
-  ``roi_cap_hit_frac``, ``bg_cap_hit_frac`` are exposed via :meth:`aux` so the
-  composite forwards them as ``contrastive/<name>`` for CSV logging.
+* Every term independently ``clamp_min``s its denominator so an empty region
+  contributes 0, not NaN.
+* The cached per-sample tensor returned by :meth:`per_sample` is the sum of
+  ``w_τ × term_per_sample_τ`` — used by the LightningModule's per-cohort
+  contrastive breakdown wired in ``module.py:438+``.
+* ``requires_perturbed_pass`` is **False** for this loss; the v0.3 perturb-pass
+  machinery now exclusively serves the classifier-free-guidance training-time
+  dropout path (``training.conditioning_dropout_p`` in the YAML).
+
+DEPRECATION NOTE — the v0.3 schema keys ``lambda_roi``, ``lambda_bg``, ``delta``,
+``p_t``, ``p_b`` are no longer accepted. The same applies to the aux keys
+``delta_abs_mean_in/out``, ``roi_cap_hit_frac``, ``bg_cap_hit_frac`` which the
+old loss emitted to CSV — those columns simply stop appearing in new training
+runs' ``train_step.csv`` / ``train_epoch.csv``.
 
 References
 ----------
-Zhao et al. *MAISI-V2: Image-to-Image MR/CT Synthesis via Latent Flow Matching*,
-AAAI 2026 (arXiv:2508.05772) §3.4.1 — the upstream version uses a single L1
-contrastive with a window-ReLU mean cap and one combined weight. We generalise
-to per-region :math:`L^p` and a per-voxel BG cap per proposal §5.3.
+* Chartsias *et al.*, *Multimodal MR synthesis via modality-invariant latent
+  representation*, IEEE TMI 2018 — region-weighted MRI synthesis loss.
+* Konukoglu *et al.*, *Unsupervised lesion detection via image restoration
+  with a normative prior*, MedIA 2021 — ROI-restricted reconstruction error.
+* Design note: ``.claude/notes/changes/2026-06-09_training-regime-overhaul.md``
+  CHANGE 2.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
 from .base import AbstractFMLoss, LossInputs
 
+_RegionKind = Literal["wt", "brain", "healthy", "background", "full"]
+_REGION_KINDS: tuple[_RegionKind, ...] = ("wt", "brain", "healthy", "background", "full")
+# Regions that require ``m_brain`` (image-domain ``masks/brain`` max-pool-encoded
+# to latent space by ``vena-encode-brain-to-latent``).
+_REGIONS_NEEDING_BRAIN: frozenset[_RegionKind] = frozenset({"brain", "healthy", "background"})
+
+
+@dataclass(frozen=True)
+class RegionTerm:
+    """One ``(region, p, weight)`` triple inside the contrastive composite.
+
+    Parameters
+    ----------
+    name : str
+        Human-readable label used in CSV column names (``term_<name>_lp_mean``).
+        Recommended convention: same as ``region`` unless multiple terms share
+        a region with different ``p`` (e.g. ``name='wt_l1'`` for ``region='wt',
+        p=1.0``).
+    region : str
+        One of ``{wt, brain, healthy, background, full}``.
+    p : float
+        Lp exponent, strictly positive.
+    weight : float
+        Per-term scalar inside the contrastive bucket. The outer
+        ``loss.contrastive.weight`` (a separate scalar, applied by
+        :class:`CompositeLoss`) multiplies the *sum* of these.
+    """
+
+    name: str
+    region: _RegionKind
+    p: float
+    weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.region not in _REGION_KINDS:
+            raise ValueError(
+                f"RegionTerm.region must be one of {_REGION_KINDS}; got {self.region!r}"
+            )
+        if self.p <= 0.0:
+            raise ValueError(f"RegionTerm.p must be > 0; got {self.p}")
+        if not self.name:
+            raise ValueError("RegionTerm.name must be a non-empty string")
+
+
+def _resolve_region(
+    region: _RegionKind,
+    m_wt: torch.Tensor,
+    m_brain: torch.Tensor | None,
+) -> torch.Tensor:
+    """Materialise a binary mask for ``region`` on the device/dtype of ``m_wt``.
+
+    Returns a tensor of the same shape as ``m_wt`` (``(B, 1, h, w, d)``) with
+    values in ``{0.0, 1.0}``.
+    """
+    if region == "full":
+        return torch.ones_like(m_wt)
+    if region == "wt":
+        return m_wt
+    if region == "brain":
+        assert m_brain is not None
+        return m_brain
+    if region == "healthy":
+        assert m_brain is not None
+        return m_brain * (1.0 - m_wt)
+    if region == "background":
+        assert m_brain is not None
+        return 1.0 - m_brain
+    # Unreachable; validated in RegionTerm.__post_init__.
+    raise ValueError(f"unknown region {region!r}")
+
+
+def _masked_lp_per_sample(
+    residual: torch.Tensor,
+    region_mask: torch.Tensor,
+    p: float,
+) -> torch.Tensor:
+    """Compute per-sample mean of ``|residual|^p`` inside ``region_mask``.
+
+    Parameters
+    ----------
+    residual : Tensor
+        ``(B, C, h, w, d)`` — already ``.abs()``-ed if appropriate.
+    region_mask : Tensor
+        ``(B, 1, h, w, d)`` — binary, same dtype as ``residual``.
+    p : float
+        Lp exponent.
+
+    Returns
+    -------
+    Tensor of shape ``(B,)``. Empty regions contribute 0 via ``clamp_min(1)``
+    on the denominator.
+    """
+    C = float(residual.shape[1])
+    weighted = residual.pow(p) * region_mask
+    num = weighted.flatten(1).sum(dim=1)
+    den = (region_mask.flatten(1).sum(dim=1) * C).clamp_min(1.0)
+    return num / den
+
 
 class ContrastiveTumourLoss(AbstractFMLoss):
-    """Lp-aware mask-perturbation contrastive (proposal §5.3)."""
+    """Region-weighted CFM residual (proposal §5.3 v0.4).
 
-    def __init__(
-        self,
-        lambda_roi: float = 0.3,
-        lambda_bg: float = 1.0,
-        delta: float = 2.0,
-        p_t: float = 1.0,
-        p_b: float = 3.0,
-    ) -> None:
+    Parameters
+    ----------
+    terms : list[RegionTerm]
+        Ordered list of region terms; each contributes
+        ``weight × mean_{region}(|v_pred − u_target|^p)`` to the per-sample
+        total. At least one term required.
+
+    Notes
+    -----
+    The class name is preserved (not renamed to ``RegionalLpLoss``) because
+    downstream plumbing — ``CompositeLoss``'s ``terms["contrastive"]`` key,
+    ``train_csv._COHORT_PREFIXES``, the per-cohort logging path in
+    ``FMLightningModule.training_step`` — keys off the ``"contrastive"`` name
+    set by :func:`build_loss`.
+    """
+
+    def __init__(self, terms: list[RegionTerm]) -> None:
         super().__init__()
-        if delta <= 0.0:
-            raise ValueError(f"delta must be positive; got {delta}")
-        if p_t <= 0.0 or p_b <= 0.0:
-            raise ValueError(f"exponents must be positive; got p_t={p_t}, p_b={p_b}")
-        self.lambda_roi = float(lambda_roi)
-        self.lambda_bg = float(lambda_bg)
-        self.delta = float(delta)
-        self.p_t = float(p_t)
-        self.p_b = float(p_b)
+        if not terms:
+            raise ValueError(
+                "ContrastiveTumourLoss requires at least one RegionTerm; "
+                "an empty list would make the loss a constant zero."
+            )
+        names = [t.name for t in terms]
+        if len(set(names)) != len(names):
+            raise ValueError(
+                f"RegionTerm names must be unique within a single contrastive "
+                f"loss; got duplicates in {names}"
+            )
+        self.terms: tuple[RegionTerm, ...] = tuple(terms)
+        self._needs_brain = any(t.region in _REGIONS_NEEDING_BRAIN for t in terms)
 
     def forward(self, inputs: LossInputs) -> torch.Tensor:
-        if inputs.v_orig is None or inputs.v_perturb is None:
+        if inputs.v_orig is None:
+            raise ValueError("ContrastiveTumourLoss requires v_orig (predicted velocity).")
+        if inputs.u_target is None:
+            raise ValueError("ContrastiveTumourLoss requires u_target (FM target velocity).")
+        if inputs.m_wt is None:
             raise ValueError(
-                "ContrastiveTumourLoss requires v_orig and v_perturb; the composite "
-                "must request the perturbed pass (requires_perturbed_pass=True)."
+                "ContrastiveTumourLoss requires m_wt in LossInputs; the LightningModule "
+                "must populate it from the latent H5's masks/tumor_latent."
             )
-        if inputs.m_wt is None or inputs.m_bg is None:
+        if self._needs_brain and inputs.m_brain is None:
             raise ValueError(
-                "ContrastiveTumourLoss requires m_wt and m_bg in LossInputs; the "
-                "LightningModule must populate them when stage == 'S2'."
+                "ContrastiveTumourLoss has a region term in "
+                "{brain, healthy, background} but m_brain is None. Re-encode the "
+                "latent H5 with `vena-encode-brain-to-latent` so masks/brain_latent "
+                "is present, or use a terms list restricted to {wt, full}."
             )
 
-        v_orig = inputs.v_orig
-        delta_v = (v_orig - inputs.v_perturb).abs()  # (B, C, h, w, d)
-        m = inputs.m_wt.to(delta_v.dtype)
-        m_bg = inputs.m_bg.to(delta_v.dtype)
-        n_chan = float(v_orig.shape[1])
+        residual = (inputs.v_orig - inputs.u_target).abs()  # (B, C, h, w, d)
+        m_wt = inputs.m_wt.to(residual.dtype)
+        m_brain = inputs.m_brain.to(residual.dtype) if inputs.m_brain is not None else None
 
-        # ROI: aggregate-cap mean, negated. Mean is over (voxels x channels).
-        roi_pow = delta_v.pow(self.p_t)
-        roi_num = (roi_pow * m).flatten(1).sum(dim=1)
-        roi_den = (m.flatten(1).sum(dim=1) * n_chan).clamp_min(1.0)
-        roi_mean = roi_num / roi_den
-        cap_t = float(self.delta**self.p_t)
-        cap_t_tensor = torch.full_like(roi_mean, cap_t)
-        loss_roi = -torch.minimum(roi_mean, cap_t_tensor)
+        # Accumulate per-sample sum across terms; cache per-term diagnostics.
+        per_sample_total = torch.zeros(
+            residual.shape[0], device=residual.device, dtype=residual.dtype
+        )
+        aux: dict[str, torch.Tensor] = {}
+        for term in self.terms:
+            region_mask = _resolve_region(term.region, m_wt, m_brain)
+            term_ps = _masked_lp_per_sample(residual, region_mask, term.p)
+            per_sample_total = per_sample_total + float(term.weight) * term_ps
+            with torch.no_grad():
+                aux[f"term_{term.name}_lp_mean"] = term_ps.mean().detach()
+                voxel_frac = region_mask.flatten(1).sum(dim=1) / float(
+                    region_mask.shape[1]
+                    * region_mask.shape[2]
+                    * region_mask.shape[3]
+                    * region_mask.shape[4]
+                )
+                aux[f"term_{term.name}_voxel_frac"] = voxel_frac.mean().detach()
 
-        # BG: per-voxel cap, then mean.
-        bg_pow = delta_v.pow(self.p_b)
-        cap_b = float(self.delta**self.p_b)
-        bg_capped = torch.minimum(bg_pow, torch.full_like(bg_pow, cap_b))
-        bg_num = (bg_capped * m_bg).flatten(1).sum(dim=1)
-        bg_den = (m_bg.flatten(1).sum(dim=1) * n_chan).clamp_min(1.0)
-        loss_bg = bg_num / bg_den
-
-        total = (self.lambda_roi * loss_roi + self.lambda_bg * loss_bg).mean()
-
-        # Diagnostics — surfaced via ``aux()`` for CSV logging. Detached so the
-        # autograd graph is not duplicated.
+        # Sentinel diagnostics: always log healthy / wt residual_lp_mean even when
+        # not in `terms`, so post-hoc analyses can compare across configs.
         with torch.no_grad():
-            abs_in_num = (delta_v * m).flatten(1).sum(dim=1)
-            abs_out_num = (delta_v * m_bg).flatten(1).sum(dim=1)
-            delta_in = (abs_in_num / roi_den).mean()
-            delta_out = (abs_out_num / bg_den).mean()
-            roi_cap_hit = (roi_mean >= cap_t).float().mean()
-            bg_over_cap = (bg_pow >= cap_b).to(delta_v.dtype)
-            bg_cap_num = (bg_over_cap * m_bg).flatten(1).sum(dim=1)
-            bg_cap_hit = (bg_cap_num / bg_den).mean()
-            self._aux = {
-                "delta_abs_mean_in": delta_in.detach(),
-                "delta_abs_mean_out": delta_out.detach(),
-                "roi_cap_hit_frac": roi_cap_hit.detach(),
-                "bg_cap_hit_frac": bg_cap_hit.detach(),
-            }
-        return total
+            if m_brain is not None:
+                healthy_mask = m_brain * (1.0 - m_wt)
+                aux["residual_lp_mean_healthy"] = (
+                    _masked_lp_per_sample(residual, healthy_mask, 2.0).mean().detach()
+                )
+                aux["healthy_voxel_frac"] = (
+                    (
+                        healthy_mask.flatten(1).sum(dim=1)
+                        / m_brain.flatten(1).sum(dim=1).clamp_min(1.0)
+                    )
+                    .mean()
+                    .detach()
+                )
+            aux["residual_lp_mean_wt"] = _masked_lp_per_sample(residual, m_wt, 2.0).mean().detach()
+
+        self._per_sample = per_sample_total.detach()
+        self._aux = aux
+        return per_sample_total.mean()
+
+    def per_sample(self) -> torch.Tensor | None:
+        """Return the cached ``(B,)`` per-sample contrastive from the last forward.
+
+        Used by the LightningModule's per-cohort contrastive breakdown
+        (``module.py:438+``); returns ``None`` if :meth:`forward` has not been
+        called yet on this instance in the current step.
+        """
+        return getattr(self, "_per_sample", None)

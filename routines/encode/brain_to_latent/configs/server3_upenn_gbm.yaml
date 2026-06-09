@@ -1,0 +1,7 @@
+# Brain-to-latent encoder — UPENN-GBM on server-3.
+target_h5: /media/hddb/mario/data/GLIOMAS/upenn_gbm/h5/UPENN-GBM_latents.h5
+source_image_h5: /media/hddb/mario/data/GLIOMAS/upenn_gbm/h5/UPENN-GBM_image.h5
+target_aug_h5: /media/hddb/mario/data/GLIOMAS/upenn_gbm/h5/upenn_gbm_latents_aug.h5
+overwrite: false
+artifacts_root: /media/hddb/mario/artifacts/encode/brain_to_latent/upenn_gbm
+log_level: INFO

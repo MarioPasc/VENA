@@ -193,11 +193,18 @@ class _RFlowCfg(BaseModel):
 
 class _OptimCfg(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    lr: float = 5e-5
+    # Default bumped from 5e-5 (2026-06-07 runs) to 1e-4 to match the MAISI-V2
+    # joint trunk+ControlNet recipe (arXiv:2508.05772 §4.1) and TumorFlow
+    # (arXiv:2603.04058). The 2026-06-09 overhaul note documents the change.
+    lr: float = 1e-4
     betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 1e-2
     warmup_steps: int = 1000
-    scheduler: str = "polynomial"
+    # Restricted to the three values handled by ``_lr_lambda`` in
+    # ``vena.model.fm.lightning.module``. Anything else raises at module init,
+    # which is the bug-prevention the 2026-06-09 overhaul installed (the old
+    # silent fallthrough to constant LR hid the polynomial misconfiguration).
+    scheduler: Literal["constant", "polynomial", "cosine"] = "cosine"
 
 
 class _EMACfg(BaseModel):
@@ -233,6 +240,13 @@ class _TrainingCfg(BaseModel):
     # because exhaustive-val PSNR/SSIM never enter ``trainer.callback_metrics``
     # (the launcher writes them to CSV from a subprocess).
     patience: int | None = None
+    # Classifier-free-guidance training-time dropout. Per-sample Bernoulli flip
+    # — when True for sample ``i``, the listed conditioning channels are zeroed
+    # for that sample in the trunk forward (Ho & Salimans 2022; ControlNet
+    # §3.5). ``0.0`` disables the path (byte-identical to a run without CFG).
+    # The Picasso S2-LoRA+CFG run uses 0.15.
+    conditioning_dropout_p: float = 0.0
+    conditioning_dropout_keys: tuple[str, ...] = ("wt",)
 
 
 class _ValidationCfg(BaseModel):
@@ -305,6 +319,19 @@ class _OutputCfg(BaseModel):
     wandb: bool = False
 
 
+class _PostTrainCfg(BaseModel):
+    """Optional post-training plotting hook.
+
+    When enabled (default), :meth:`FMTrainRoutineEngine.run` calls the
+    post-training plotting routine after ``trainer.fit()`` returns; failures
+    are logged at WARNING and never fail the training run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = True
+    formats: tuple[str, ...] = ("png",)
+
+
 class FMTrainRoutineConfig(BaseModel):
     """Pydantic root config for ``vena-fm-train`` v2.
 
@@ -325,6 +352,7 @@ class FMTrainRoutineConfig(BaseModel):
     validation: _ValidationCfg = Field(default_factory=_ValidationCfg)
     exhaustive_val: _ExhaustiveValCfg = Field(default_factory=_ExhaustiveValCfg)
     output: _OutputCfg
+    post_train: _PostTrainCfg = Field(default_factory=_PostTrainCfg)
     # Region specs are no longer consumed in-process (validation is offloaded),
     # but the field is kept (optional) for backward compatibility with configs
     # that still declare it.
@@ -512,6 +540,26 @@ def _assert_dedup_gate(cfg: FMTrainRoutineConfig) -> None:
         )
 
 
+def _run_post_train(run_dir: Path, *, formats: tuple[str, ...]) -> None:
+    """Render the post-training plot bundle for ``run_dir``.
+
+    Failures are caught and logged at WARNING so the training run is still
+    considered successful even if matplotlib is unavailable or a CSV column
+    is malformed. The hook is import-deferred so a missing matplotlib does
+    not crash module import.
+    """
+    try:
+        from routines.fm.post_train.engine import render_for_run_dir
+
+        render_for_run_dir(run_dir, formats=formats)
+    except Exception as exc:
+        logger.warning(
+            "post-train plotting failed (training run remains successful): %s",
+            exc,
+            exc_info=True,
+        )
+
+
 # =============================================================================
 # Engine
 # =============================================================================
@@ -616,9 +664,9 @@ class FMTrainRoutineEngine:
             trunk_peft_variant = cfg.model.trunk.peft.get("variant")
             trunk_peft_params = dict(cfg.model.trunk.peft.get("params", {}))
         return {
-            "schema_version": "0.6.0",
+            "schema_version": "0.7.0",
             "produced_at": now_iso_utc(),
-            "producer": "routines.fm.train:0.6.0",
+            "producer": "routines.fm.train:0.7.0",
             "run_id": run_id,
             "run_dir": str(run_dir),
             "stage": cfg.run.stage,
@@ -654,6 +702,9 @@ class FMTrainRoutineEngine:
             else None,
             "aug_image_h5_paths": aug_image_paths or None,
             "aug_latent_h5_paths": aug_latent_paths or None,
+            # Schema 0.7.0 — CFG training-time dropout (additive, defaults to 0).
+            "conditioning_dropout_p": cfg.training.conditioning_dropout_p,
+            "conditioning_dropout_keys": list(cfg.training.conditioning_dropout_keys),
         }
 
     def _build_exhaustive_job_base(self, cfg: FMTrainRoutineConfig) -> dict[str, Any]:
@@ -871,6 +922,8 @@ class FMTrainRoutineEngine:
             ema_cfg=cfg.ema.model_dump(),
             region_resolver=None,
             vae_decoder=None,
+            conditioning_dropout_p=cfg.training.conditioning_dropout_p,
+            conditioning_dropout_keys=cfg.training.conditioning_dropout_keys,
         )
 
         # Checkpoint selection (ema_best) is on the epoch-aggregated training
@@ -960,5 +1013,7 @@ class FMTrainRoutineEngine:
         # and is the resume anchor, so a separate ``ema_final.ckpt`` would be
         # redundant. ``ema_final.ckpt`` is reserved for the SigtermHandler's
         # preemption save (captures mid-epoch state at signal time).
+        if cfg.post_train.enabled:
+            _run_post_train(run_dir, formats=cfg.post_train.formats)
         logger.info("FM-train completed; artifact dir: %s", run_dir)
         return run_dir

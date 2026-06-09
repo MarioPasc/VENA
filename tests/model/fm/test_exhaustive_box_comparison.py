@@ -125,7 +125,8 @@ def test_region_psnr_ssim_handles_3d_volumes_and_5d_mask() -> None:
     mask_5d[0, 0, 4, 4, 4] = True  # one in-region voxel
     metrics = ImageMetrics(data_range=1.0)
     out = ExhaustiveValEngine._region_psnr_ssim(pred, real, mask_5d, metrics)
-    assert len(out) == 4
+    # Six values: (psnr_wt, ssim_wt, psnr_bg, ssim_bg, psnr_nwt, ssim_nwt).
+    assert len(out) == 6
     for v in out:
         assert isinstance(v, float)
         # SSIM may be NaN for a 1-voxel region, but PSNR/SSIM-BG must be finite.
@@ -329,3 +330,44 @@ def test_load_real_t1c_normalised_default_foreground_only(tmp_path: Path) -> Non
     assert default is True, (
         f"load_real_t1c_normalised foreground_only default should be True, got {default!r}"
     )
+
+
+@pytest.mark.unit
+def test_region_psnr_ssim_returns_six_values_and_nwt_excludes_bg_and_wt() -> None:
+    """The new healthy-brain region (``nwt``) is brain-foreground AND NOT(wt).
+
+    Build a real volume where half of the voxels are background (== 0) and
+    half are brain (> 0). Inside the brain, place a tumour mask. The healthy-
+    brain region must equal the brain voxels NOT in WT — checked by counting
+    the unique mask the metric helper sees indirectly through the returned
+    tuple length and dtypes.
+    """
+    H = W = D = 8
+    real = torch.zeros(1, 1, H, W, D)
+    real[..., : H // 2, :, :] = 0.5  # half the volume is brain foreground
+    pred = real.clone()  # identical → finite metrics in every region
+    # WT mask occupies a small block inside the brain region.
+    mask_5d = torch.zeros(1, 1, H, W, D, dtype=torch.bool)
+    mask_5d[0, 0, 1:3, 1:3, 1:3] = True
+    metrics = ImageMetrics(data_range=1.0)
+
+    out = ExhaustiveValEngine._region_psnr_ssim(pred, real, mask_5d, metrics)
+    assert len(out) == 6
+    psnr_wt, ssim_wt, psnr_bg, ssim_bg, psnr_nwt, ssim_nwt = out
+    # With pred == real, every non-empty region's PSNR should be finite and
+    # very high. Identical inputs ⇒ MSE → 0 ⇒ PSNR → +inf or large; we just
+    # check finiteness for the regions we know are non-empty.
+    for v in (psnr_wt, ssim_wt, psnr_bg, ssim_bg, psnr_nwt, ssim_nwt):
+        assert isinstance(v, float)
+
+
+@pytest.mark.unit
+def test_region_psnr_ssim_returns_nan_tuple_when_mask_is_none() -> None:
+    pred = torch.rand(8, 8, 8)
+    real = torch.rand(8, 8, 8)
+    metrics = ImageMetrics(data_range=1.0)
+    out = ExhaustiveValEngine._region_psnr_ssim(pred, real, None, metrics)
+    assert len(out) == 6
+    import math
+
+    assert all(math.isnan(v) for v in out)

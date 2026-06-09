@@ -52,6 +52,12 @@ _EPOCH_AGG_KEYS: tuple[str, ...] = (
     "gpu_mem_peak_mb",
 )
 
+# Per-cohort log key prefixes discovered at runtime — accumulated into the
+# epoch CSV with the same ``<key>_mean``/``<key>_std`` convention. The order
+# inside each prefix is fixed by ``sorted()`` on first epoch-write so the
+# schema is stable across all subsequent epochs.
+_COHORT_PREFIXES: tuple[str, ...] = ("cfm_cohort_", "contrastive_cohort_")
+
 
 class TrainMetricsCSV(pl.Callback):
     """Writes ``train_step.csv`` (per optimiser step) and ``train_epoch.csv``."""
@@ -130,12 +136,11 @@ class TrainMetricsCSV(pl.Callback):
         for k in _EPOCH_AGG_KEYS:
             if k in scalars:
                 self._epoch_accum.setdefault(k, []).append(scalars[k])
-        # P1.2 — also accumulate any per-cohort cfm key discovered at runtime.
-        # The module logs ``train/cfm_cohort_<sanitised-name>`` per step when
-        # the batch carries cohort tags; these keys are absent for
-        # single-cohort runs.
+        # P1.2 — also accumulate any per-cohort key discovered at runtime
+        # (``train/{cfm,contrastive}_cohort_<sanitised-name>``). Single-cohort
+        # runs do not log these keys, so they auto-suppress.
         for k in scalars:
-            if k.startswith("cfm_cohort_"):
+            if any(k.startswith(p) for p in _COHORT_PREFIXES):
                 self._epoch_accum.setdefault(k, []).append(scalars[k])
 
     # ------------------------------------------------------------------
@@ -150,7 +155,9 @@ class TrainMetricsCSV(pl.Callback):
         # epoch CSV has a stable schema even if a cohort is missing from a
         # later epoch's batches (unusual but possible with extreme sampling).
         if self._epoch_header is None:
-            cohort_keys = sorted(k for k in self._epoch_accum if k.startswith("cfm_cohort_"))
+            cohort_keys = sorted(
+                k for k in self._epoch_accum if any(k.startswith(p) for p in _COHORT_PREFIXES)
+            )
             self._epoch_header = list(_EPOCH_AGG_KEYS) + cohort_keys
         cols = ["epoch", "step", "n_steps"]
         for k in self._epoch_header:

@@ -1,13 +1,17 @@
-# Picasso — 1000-epoch S2 with LoRA r=16 + the v0.4 region-weighted contrastive.
+# Picasso — 1000-epoch S2 with LoRA r=16 + v0.4 contrastive + CFG dropout.
 #
-# Identical to picasso_s2_1000ep_fft.yaml except `model.trunk` routes through
-# PEFT-LoRA (r=16, target QKVO of every self+cross attention block). The new
-# AdamW grouping in `configure_optimizers` puts the LoRA adapter params on
-# weight_decay=0.0 (HuggingFace PEFT recipe) and the ControlNet on the
-# configured weight_decay; no extra YAML knob.
+# Identical to picasso_s2_1000ep_lora_r16.yaml plus classifier-free-guidance
+# training-time dropout on the WT conditioning channel (Ho & Salimans 2022;
+# ControlNet §3.5 / appendix A.2). p_drop=0.15 — below ControlNet's 0.5
+# default because the WT mask is a much stronger condition than a text prompt
+# and over-dropping would under-train the high-signal input.
+#
+# The CFG arm is identified post-hoc by `decision.json[conditioning_dropout_p] > 0`;
+# the run.stage label stays "s2" so the existing per-cohort breakdown and the
+# exhaustive-val gates compose unchanged.
 #
 # Submit via:
-#   bash routines/fm/train/slurm/runs/launcher_picasso_s2_lora.sh
+#   bash routines/fm/train/slurm/runs/launcher_picasso_s2_lora_cfg.sh
 
 run:
   stage: s2
@@ -69,16 +73,12 @@ loss:
     reduction: mean
     norm: l2
   contrastive:
-    # Two-term region-weighted Lp residual:
-    #   * `healthy` (m_brain ∩ ¬m_wt) at p=3 — super-linear penalty on healthy
-    #     residuals. p=2 here would degenerate to a region-upweighted MSE
-    #     identical (up to scalar) to the CFM loss, which is already MSE over
-    #     the whole volume; p=3 changes the gradient shape so large healthy
-    #     errors are penalised more aggressively than CFM does.
-    #   * `wt` (m_wt) at p=1 — linear (MAE) penalty inside the tumour.
-    #     Robust to the heterogeneous enhancement that makes tumour synthesis
-    #     intrinsically noisier than healthy tissue; outliers are not
-    #     squared/cubed into dominating the gradient.
+    # Two-term region-weighted Lp residual (same as picasso_s2_1000ep_lora_r16.yaml):
+    #   * healthy p=3 — super-linear penalty on healthy residuals (CFM is
+    #     already MSE over the whole volume; p=2 healthy would just upweight
+    #     CFM, no qualitative change).
+    #   * wt p=1 — linear MAE inside tumour; robust to the heterogeneous
+    #     enhancement signature.
     weight: 0.1
     terms:
       - {name: healthy, region: healthy, p: 3.0, weight: 1.0}
@@ -116,6 +116,10 @@ training:
   best_metric_nfe: 5
   gradient_clip_val: 1.0
   patience: 100
+  # Classifier-free-guidance training-time dropout (per-sample Bernoulli).
+  # `conditioning_dropout_p == 0` would byte-identically match s2_lora_r16.
+  conditioning_dropout_p: 0.15
+  conditioning_dropout_keys: ["wt"]
 
 validation:
   every_epochs: 0

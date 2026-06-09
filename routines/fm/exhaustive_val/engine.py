@@ -562,7 +562,7 @@ class ExhaustiveValEngine:
 
             img_pred, dec_t = self._decode(vae, z_pred, crop_spec)
             psnr, ssim = full_volume_psnr_ssim(img_pred, real_box, image_metrics)
-            psnr_wt, ssim_wt, psnr_bg, ssim_bg = self._region_psnr_ssim(
+            psnr_wt, ssim_wt, psnr_bg, ssim_bg, psnr_nwt, ssim_nwt = self._region_psnr_ssim(
                 img_pred, real_box, m_wt_img, image_metrics
             )
 
@@ -585,6 +585,8 @@ class ExhaustiveValEngine:
                     "ssim_wt": ssim_wt,
                     "psnr_db_bg": psnr_bg,
                     "ssim_bg": ssim_bg,
+                    "psnr_db_nwt": psnr_nwt,
+                    "ssim_nwt": ssim_nwt,
                     "latent_mse": lat_mse,
                     "latent_l1": lat_l1,
                     "latent_cosine": lat_cos,
@@ -725,8 +727,19 @@ class ExhaustiveValEngine:
         real_box: torch.Tensor,
         m_wt_img: torch.Tensor | None,
         image_metrics: ImageMetrics,
-    ) -> tuple[float, float, float, float]:
-        """Region-masked PSNR/SSIM for WT and BG.
+    ) -> tuple[float, float, float, float, float, float]:
+        """Region-masked PSNR/SSIM for WT, BG, and NWT (healthy brain).
+
+        Three regions are returned:
+
+        * **wt** — whole-tumour mask (NN-upsampled from latent space).
+        * **bg** — complement of ``wt`` (everything that is not tumour;
+          historically named "background" but includes both outside-brain
+          voxels and healthy brain).
+        * **nwt** — healthy brain: brain-foreground (``real_box > 0`` after
+          skull-strip) intersected with ``~wt``. Because every training/eval
+          volume is skull-stripped (``percentile_normalise`` with
+          ``foreground_only=True``), the zero-foreground proxy is reliable.
 
         ``decode_box`` returns a 3-D ``(H, W, D)`` tensor and the whole-volume
         helper adds two leading dims internally; the masked metric helpers
@@ -735,15 +748,26 @@ class ExhaustiveValEngine:
         CSV cell renders blank (downstream tooling reads ``""`` as NaN).
         """
         if m_wt_img is None or m_wt_img.numel() == 0:
-            return (float("nan"),) * 4
+            return (float("nan"),) * 6
         p = img_pred[None, None] if img_pred.ndim == 3 else img_pred
         r = real_box[None, None] if real_box.ndim == 3 else real_box
         wt = m_wt_img if m_wt_img.ndim == 5 else m_wt_img[None, None]
         bg = ~wt
+        # Healthy brain: skull-stripped foreground AND not tumour.
+        brain = r > 0
+        if brain.shape != wt.shape:
+            # Defensive: only collapse when r had a multi-channel layout we did
+            # not anticipate. The training pipeline always emits single-channel
+            # boxes, so this branch is rarely taken.
+            brain = brain.any(dim=1, keepdim=True)
+        nwt = brain & ~wt
+
         psnr_wt = image_metrics.psnr(p, r, wt)
         ssim_wt = image_metrics.ssim(p, r, wt)
         psnr_bg = image_metrics.psnr(p, r, bg)
         ssim_bg = image_metrics.ssim(p, r, bg)
+        psnr_nwt = image_metrics.psnr(p, r, nwt)
+        ssim_nwt = image_metrics.ssim(p, r, nwt)
 
         def _first_finite(t: torch.Tensor) -> float:
             v = float(t[0].item()) if t.numel() else float("nan")
@@ -754,6 +778,8 @@ class ExhaustiveValEngine:
             _first_finite(ssim_wt),
             _first_finite(psnr_bg),
             _first_finite(ssim_bg),
+            _first_finite(psnr_nwt),
+            _first_finite(ssim_nwt),
         )
 
     @staticmethod
@@ -769,6 +795,8 @@ class ExhaustiveValEngine:
             "ssim_wt",
             "psnr_db_bg",
             "ssim_bg",
+            "psnr_db_nwt",
+            "ssim_nwt",
             "latent_mse",
             "latent_l1",
             "latent_cosine",

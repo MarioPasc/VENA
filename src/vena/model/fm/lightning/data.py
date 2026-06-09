@@ -199,6 +199,15 @@ class LatentH5Dataset(Dataset):
         m_wt = (soft_union >= self.wt_threshold).astype(np.float32)
         out["m_wt"] = torch.from_numpy(np.ascontiguousarray(m_wt))
 
+        # Brain mask in latent space — produced by `vena-encode-brain-to-latent`
+        # (`masks/brain_latent`, shape (1, h, w, d), int8). Required by the v0.4
+        # contrastive when any term uses region ∈ {brain, healthy, background};
+        # absent on legacy schema-v2.0.0 latent H5s. We load when present and let
+        # the loss raise a clear error otherwise (see contrastive.py:forward).
+        if "masks/brain_latent" in h5:
+            brain_lat = h5["masks/brain_latent"][row]
+            out["m_brain"] = torch.from_numpy(np.ascontiguousarray(brain_lat)).to(torch.float32)
+
         for prior in self.extra_priors:
             arr = h5[f"priors/{prior}"][row]
             out[f"prior_{prior}"] = torch.from_numpy(np.ascontiguousarray(arr)).float()

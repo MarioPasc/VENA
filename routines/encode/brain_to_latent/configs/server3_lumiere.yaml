@@ -1,0 +1,7 @@
+# Brain-to-latent encoder — LUMIERE on server-3.
+target_h5: /media/hddb/mario/data/GLIOMAS/lumiere/h5/LUMIERE_latents.h5
+source_image_h5: /media/hddb/mario/data/GLIOMAS/lumiere/h5/LUMIERE_image.h5
+target_aug_h5: /media/hddb/mario/data/GLIOMAS/lumiere/h5/lumiere_latents_aug.h5
+overwrite: false
+artifacts_root: /media/hddb/mario/artifacts/encode/brain_to_latent/lumiere
+log_level: INFO

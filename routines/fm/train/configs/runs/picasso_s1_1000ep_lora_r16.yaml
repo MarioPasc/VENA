@@ -1,16 +1,15 @@
-# Picasso — 1000-epoch S2 with LoRA r=16 + the v0.4 region-weighted contrastive.
+# Picasso — 1000-epoch S1 with LoRA r=16 on the trunk (CFM-only loss).
 #
-# Identical to picasso_s2_1000ep_fft.yaml except `model.trunk` routes through
-# PEFT-LoRA (r=16, target QKVO of every self+cross attention block). The new
-# AdamW grouping in `configure_optimizers` puts the LoRA adapter params on
-# weight_decay=0.0 (HuggingFace PEFT recipe) and the ControlNet on the
-# configured weight_decay; no extra YAML knob.
+# 2026-06-09 overhaul: clone of picasso_s1_1000ep_fft.yaml with the trunk
+# routed through the PEFT LoRA recipe (identical to picasso_s2_1000ep_lora_r16
+# minus the contrastive term). Useful as an A/B partner to s1_fft for
+# isolating the LoRA contribution without the new contrastive loss in play.
 #
 # Submit via:
-#   bash routines/fm/train/slurm/runs/launcher_picasso_s2_lora.sh
+#   bash routines/fm/train/slurm/runs/launcher_picasso_s1_lora.sh
 
 run:
-  stage: s2
+  stage: s1
   resume_from: latest
   seed: 1337
   device: cuda
@@ -68,21 +67,6 @@ loss:
     weight: 1.0
     reduction: mean
     norm: l2
-  contrastive:
-    # Two-term region-weighted Lp residual:
-    #   * `healthy` (m_brain ∩ ¬m_wt) at p=3 — super-linear penalty on healthy
-    #     residuals. p=2 here would degenerate to a region-upweighted MSE
-    #     identical (up to scalar) to the CFM loss, which is already MSE over
-    #     the whole volume; p=3 changes the gradient shape so large healthy
-    #     errors are penalised more aggressively than CFM does.
-    #   * `wt` (m_wt) at p=1 — linear (MAE) penalty inside the tumour.
-    #     Robust to the heterogeneous enhancement that makes tumour synthesis
-    #     intrinsically noisier than healthy tissue; outliers are not
-    #     squared/cubed into dominating the gradient.
-    weight: 0.1
-    terms:
-      - {name: healthy, region: healthy, p: 3.0, weight: 1.0}
-      - {name: wt,      region: wt,      p: 1.0, weight: 1.0}
 
 rflow:
   num_train_timesteps: 1000
@@ -92,7 +76,7 @@ rflow:
 optim:
   lr: 1.0e-4
   betas: [0.9, 0.95]
-  weight_decay: 1.0e-2
+  weight_decay: 1.0e-2  # applied to CN only; LoRA params auto-routed to wd=0.0
   warmup_steps: 1000
   scheduler: cosine
 
@@ -105,7 +89,7 @@ ema:
   min_value: 0.0
 
 training:
-  total_steps: 208000
+  total_steps: 208000      # see picasso_s1_1000ep_fft.yaml for the math.
   max_epochs: 1000
   batch_size: 4
   grad_accum: 2

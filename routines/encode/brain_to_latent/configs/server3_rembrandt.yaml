@@ -1,0 +1,7 @@
+# Brain-to-latent encoder — REMBRANDT on server-3.
+target_h5: /media/hddb/mario/data/GLIOMAS/rembrandt/h5/REMBRANDT_latents.h5
+source_image_h5: /media/hddb/mario/data/GLIOMAS/rembrandt/h5/REMBRANDT_image.h5
+target_aug_h5: /media/hddb/mario/data/GLIOMAS/rembrandt/h5/rembrandt_latents_aug.h5
+overwrite: false
+artifacts_root: /media/hddb/mario/artifacts/encode/brain_to_latent/rembrandt
+log_level: INFO

@@ -137,6 +137,8 @@ class FMLightningModule(pl.LightningModule):
         validation_cfg: dict[str, Any] | None = None,
         vae_decoder: Any | None = None,
         nan_tolerance: dict[str, int] | None = None,
+        conditioning_dropout_p: float = 0.0,
+        conditioning_dropout_keys: Iterable[str] | None = None,
     ) -> None:
         super().__init__()
         # Lightning saves these into checkpoint hparams. We exclude unpicklables.
@@ -145,6 +147,18 @@ class FMLightningModule(pl.LightningModule):
         self.trunk_config = trunk_config
         self.stage = stage
         self.perturb_keys: set[str] = set(perturb_keys or ()) if perturb_keys else {"wt"}
+        # Classifier-free-guidance training-time dropout (per-sample Bernoulli
+        # on the listed conditioning keys). ``p == 0`` disables the path
+        # entirely → byte-identical to a run without CFG. Keys default to
+        # ``{wt}`` matching the doc's CHANGE 3.
+        if conditioning_dropout_p < 0.0 or conditioning_dropout_p > 1.0:
+            raise ValueError(
+                f"conditioning_dropout_p must be in [0, 1]; got {conditioning_dropout_p}"
+            )
+        self.conditioning_dropout_p: float = float(conditioning_dropout_p)
+        self.conditioning_dropout_keys: set[str] = (
+            set(conditioning_dropout_keys) if conditioning_dropout_keys else {"wt"}
+        )
 
         # PEFT adapter handler. Built eagerly from ``trunk_config.peft`` so a
         # malformed config fails at __init__ time, not deep inside setup() under
@@ -351,6 +365,49 @@ class FMLightningModule(pl.LightningModule):
         return self._unpad(v_p, pad)
 
     # ------------------------------------------------------------------
+    # Classifier-free-guidance dropout helper.
+    # ------------------------------------------------------------------
+
+    def _build_conditioning_with_cfg_dropout(
+        self,
+        batch: dict[str, torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build the trunk conditioning, mixing kept + dropped channels per sample.
+
+        Implements the training-time classifier-free-guidance recipe (Ho &
+        Salimans 2022; ControlNet §3.5 / appendix A.2): for each sample,
+        independently flip a Bernoulli(``p``) coin. If True, replace the
+        listed conditioning keys with zeros (the ``perturb_keys`` path of the
+        :class:`ConditioningAssembler`). If False, keep the original
+        conditioning.
+
+        ``conditioning_dropout_p == 0`` returns the unperturbed conditioning
+        directly — byte-identical to the legacy path. Logs
+        ``train/cfg_dropout_active_frac`` as a per-step Bernoulli observation.
+        """
+        if self.conditioning_dropout_p <= 0.0:
+            return self.conditioning(batch)
+
+        cond_keep = self.conditioning(batch)
+        cond_drop = self.conditioning(batch, perturb_keys=self.conditioning_dropout_keys)
+        drop = torch.rand(batch_size, device=device) < self.conditioning_dropout_p
+        # Broadcast (B,) -> (B, 1, 1, 1, 1) so torch.where picks the whole
+        # spatial+channel tensor per sample.
+        mask = drop.view(-1, 1, 1, 1, 1)
+        cond = torch.where(mask, cond_drop, cond_keep)
+        # Per-step diagnostic: empirical Bernoulli rate. Stays near p_drop.
+        self.log(
+            "train/cfg_dropout_active_frac",
+            drop.float().mean(),
+            on_step=True,
+            on_epoch=False,
+            batch_size=batch_size,
+        )
+        return cond
+
+    # ------------------------------------------------------------------
     # Training step.
     # ------------------------------------------------------------------
 
@@ -372,7 +429,10 @@ class FMLightningModule(pl.LightningModule):
         class_labels = self.trunk_config.make_class_labels(B, device)
         spacing = self.trunk_config.make_spacing_tensor(B, device)
 
-        cond_orig = self.conditioning(batch)
+        # Classifier-free-guidance dropout (per-sample Bernoulli on the listed
+        # conditioning keys). ``conditioning_dropout_p == 0`` is the legacy path
+        # — a single ``self.conditioning(batch)`` call. See doc CHANGE 3.
+        cond_orig = self._build_conditioning_with_cfg_dropout(batch, B, device)
         v_orig = self._trunk_forward(
             self.controlnet, x_t, timesteps, cond_orig, class_labels, spacing
         )
@@ -395,6 +455,7 @@ class FMLightningModule(pl.LightningModule):
             if (m_wt is not None and self.composite.requires_perturbed_pass)
             else None
         )
+        m_brain = batch.get("m_brain")
         inputs = LossInputs(
             x_clean=x1,
             noise=x0,
@@ -405,6 +466,7 @@ class FMLightningModule(pl.LightningModule):
             v_perturb=v_perturb,
             m_wt=m_wt,
             m_bg=m_bg,
+            m_brain=m_brain,
         )
         total_steps = self._estimated_total_steps()
         total, per_term = self.composite(
@@ -435,6 +497,34 @@ class FMLightningModule(pl.LightningModule):
                     on_epoch=False,
                     batch_size=len(vals),
                 )
+
+            # Per-cohort contrastive breakdown. Only fires when the composite
+            # included a contrastive term (S2/S3); ``per_sample()`` returns the
+            # cached (B,) tensor the term stored during its forward call.
+            # ``ModuleDict`` does not implement ``.get``; check membership manually.
+            contrastive_term = (
+                self.composite.terms["contrastive"]
+                if "contrastive" in self.composite.terms
+                else None
+            )
+            contrastive_per_sample = (
+                contrastive_term.per_sample() if contrastive_term is not None else None
+            )
+            if contrastive_per_sample is not None:
+                cohort_groups_contrastive: dict[str, list[float]] = {}
+                for i, tag in enumerate(cohort_tags):
+                    cohort_groups_contrastive.setdefault(str(tag), []).append(
+                        float(contrastive_per_sample[i].item())
+                    )
+                for tag, vals in cohort_groups_contrastive.items():
+                    safe = tag.replace("/", "_").replace(" ", "_")
+                    self.log(
+                        f"train/contrastive_cohort_{safe}",
+                        sum(vals) / len(vals),
+                        on_step=True,
+                        on_epoch=False,
+                        batch_size=len(vals),
+                    )
 
         # NaN guard.
         if not torch.isfinite(total):
@@ -989,39 +1079,47 @@ class FMLightningModule(pl.LightningModule):
     # ------------------------------------------------------------------
 
     def configure_optimizers(self) -> dict[str, Any]:
-        lr = float(self.optim_cfg.get("lr", 5e-5))
+        lr = float(self.optim_cfg.get("lr", 1e-4))
         betas = tuple(self.optim_cfg.get("betas", (0.9, 0.95)))
         weight_decay = float(self.optim_cfg.get("weight_decay", 1e-2))
         warmup_steps = int(self.optim_cfg.get("warmup_steps", 100))
         max_steps = int(self.optim_cfg.get("max_steps", 50_000))
-        scheduler_kind = str(self.optim_cfg.get("scheduler", "polynomial")).lower()
+        scheduler_kind = str(self.optim_cfg.get("scheduler", "cosine")).lower()
 
-        trainable = [p for p in self.controlnet.parameters() if p.requires_grad]
+        # Param groups (rule: LoRA adapter weights get weight_decay=0.0 — the
+        # standard HuggingFace PEFT recipe; otherwise the adapters decay too
+        # fast and cancel the gains from joint trunk fine-tuning. ControlNet
+        # + non-LoRA trainable params keep the standard weight_decay.).
+        cn_params = [p for p in self.controlnet.parameters() if p.requires_grad]
+        trunk_params: list[torch.nn.Parameter] = []
         if self.trunk_config.trainable:
-            # Unfrozen-trunk paths: fine-tune the trunk jointly with the
-            # ControlNet under a single param group (matches TumorFlow's recipe
-            # for FFT; matches Diffusers convention for PEFT — same LR for
-            # ControlNet and adapter). PEFT regime: ``requires_grad`` is True
-            # only on adapter tensors (``lora_A``/``lora_B``), so the same
-            # filter naturally yields the adapter-only param set.
             trunk_params = [p for p in self.trunk.parameters() if p.requires_grad]
-            trainable += trunk_params
+
+        is_peft = self.trunk_config.regime == "peft" and bool(trunk_params)
+        if is_peft:
+            param_groups = [
+                {"params": cn_params, "weight_decay": weight_decay},
+                {"params": trunk_params, "weight_decay": 0.0},
+            ]
             logger.info(
-                "configure_optimizers: trunk UNFROZEN regime=%s — optimising %d controlnet + %d trunk tensors",
-                self.trunk_config.regime,
-                len(trainable) - len(trunk_params),
+                "configure_optimizers: PEFT param groups — ControlNet=%d (wd=%g) + LoRA adapters=%d (wd=0.0)",
+                len(cn_params),
+                weight_decay,
                 len(trunk_params),
             )
-        opt = AdamW(trainable, lr=lr, betas=betas, weight_decay=weight_decay)
+        else:
+            param_groups = [{"params": cn_params + trunk_params, "weight_decay": weight_decay}]
+            logger.info(
+                "configure_optimizers: %s param group — ControlNet=%d + trunk=%d (wd=%g)",
+                "FFT" if trunk_params else "frozen-trunk",
+                len(cn_params),
+                len(trunk_params),
+                weight_decay,
+            )
+        opt = AdamW(param_groups, lr=lr, betas=betas)
 
         def lr_lambda(step: int) -> float:
-            if warmup_steps > 0 and step < warmup_steps:
-                return float(step) / float(max(1, warmup_steps))
-            if scheduler_kind == "polynomial":
-                remaining = max(0, max_steps - step)
-                denom = max(1, max_steps - warmup_steps)
-                return max(0.0, remaining / denom)
-            return 1.0
+            return _lr_lambda(scheduler_kind, step, warmup_steps, max_steps)
 
         sched = LambdaLR(opt, lr_lambda=lr_lambda)
         return {
@@ -1033,6 +1131,53 @@ class FMLightningModule(pl.LightningModule):
 # ----------------------------------------------------------------------
 # Aggregator helpers — kept module-level to be picklable for DataLoader workers.
 # ----------------------------------------------------------------------
+
+
+def _lr_lambda(
+    scheduler: str,
+    step: int,
+    warmup_steps: int,
+    max_steps: int,
+) -> float:
+    """Linear-warmup → {cosine, polynomial, constant} decay LR multiplier.
+
+    Pure function so the unit tests cover every branch without spinning up
+    Lightning. The old in-method ``lr_lambda`` returned ``1.0`` for any
+    unknown ``scheduler`` string, which is the bug that hid the polynomial
+    misconfiguration in the 2026-06-07 runs (``total_steps=1e9`` made one
+    decay step span ~10 000 actual steps). Unknown values now raise.
+
+    Parameters
+    ----------
+    scheduler : str
+        One of ``"constant"``, ``"polynomial"``, ``"cosine"``.
+    step : int
+        Current optimiser step (``0``-indexed).
+    warmup_steps : int
+        Steps over which lr ramps linearly from 0 to peak.
+    max_steps : int
+        Total optimiser steps; cosine and polynomial decay reach 0 at
+        ``step == max_steps``.
+
+    Returns
+    -------
+    float
+        Multiplier in ``[0, 1]``; multiply by the optimiser's base lr to get
+        the live lr.
+    """
+    if warmup_steps > 0 and step < warmup_steps:
+        return float(step) / float(max(1, warmup_steps))
+    progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+    progress = min(max(progress, 0.0), 1.0)
+    if scheduler == "cosine":
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    if scheduler == "polynomial":
+        return max(0.0, 1.0 - progress)
+    if scheduler == "constant":
+        return 1.0
+    raise ValueError(
+        f"unknown LR scheduler '{scheduler}'; choose from cosine | polynomial | constant"
+    )
 
 
 def _bg_from_wt(m_wt: torch.Tensor) -> torch.Tensor:

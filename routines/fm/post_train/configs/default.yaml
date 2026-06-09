@@ -1,0 +1,11 @@
+# Default config for vena-fm-post-train.
+#
+# Points at a finished FM training run directory. The routine writes PNGs
+# into `<run_dir>/plots/`.
+#
+# Override `run_dir` from the CLI by editing this file or providing your own
+# YAML; the CLI takes one positional argument: the YAML path.
+
+run_dir: /media/mpascual/Sandisk2TB/research/vena/results/fm/2026-06-07_22-54-10_s2_eb714abc
+formats:
+  - png

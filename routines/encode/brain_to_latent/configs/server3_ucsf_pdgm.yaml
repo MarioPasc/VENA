@@ -1,0 +1,7 @@
+# Brain-to-latent encoder — UCSF-PDGM on server-3 (icai-server).
+target_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_latents.h5
+source_image_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_image.h5
+target_aug_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/ucsf_pdgm_latents_aug.h5
+overwrite: false
+artifacts_root: /media/hddb/mario/artifacts/encode/brain_to_latent/ucsf_pdgm
+log_level: INFO

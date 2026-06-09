@@ -139,10 +139,12 @@ vena-h5-upenn-gbm = "routines.h5_datasets.upenn_gbm.cli:main"
 vena-preprocess-brats-ped-skullstrip = "routines.preprocess.brats_ped_skullstrip.cli:main"
 vena-preprocess-rembrandt-skullstrip = "routines.preprocess.rembrandt_skullstrip.cli:main"
 vena-encode-maisi = "routines.encode.maisi.cli:main"
+vena-encode-brain-to-latent = "routines.encode.brain_to_latent.cli:main"
 vena-offline-aug-maisi = "routines.offline_aug.maisi.cli:main"
 vena-merge-offline-aug = "scripts.merge_offline_aug_shards:main"
 vena-fm-train = "routines.fm.train.cli:main"
 vena-fm-exhaustive-val = "routines.fm.exhaustive_val.cli:main"
+vena-fm-post-train = "routines.fm.post_train.cli:main"
 
 # ----------------------------------------------------------------------------
 # Setuptools layout — src/-layout for the library, flat-layout for routines/

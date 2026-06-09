@@ -45,12 +45,20 @@ class LossInputs:
         Trunk output for the *original* (unperturbed) conditioning.
     v_perturb : Tensor | None
         Trunk output for the *perturbed* (mask-zeroed) conditioning. ``None``
-        when the composite did not require a second pass (S1).
+        when the composite did not require a second pass. The v0.4 contrastive
+        does not need this; field retained for code paths (CFG diagnostic,
+        ablation harnesses) that still want it.
     m_wt : Tensor | None
         Whole-tumour mask in latent space, shape ``(B, 1, h, w, d)``, binary.
-        Used by S2 contrastive and S3 reconstruction. ``None`` for S1.
+        Read from ``masks/tumor_latent`` by ``LatentH5Dataset``.
     m_bg : Tensor | None
-        Dilated-complement background mask. Same shape as ``m_wt``.
+        Dilated-complement background mask (``1 − dilate3(m_wt)``). Kept for
+        legacy callers; the v0.4 contrastive uses :attr:`m_brain` instead.
+    m_brain : Tensor | None
+        Binary brain mask in latent space, shape ``(B, 1, h, w, d)``. Read
+        from ``masks/brain_latent`` (max-pool-4 of image-domain ``masks/brain``,
+        encoded by ``vena-encode-brain-to-latent``). Required by the v0.4
+        contrastive when any term uses ``region ∈ {brain, healthy, background}``.
     """
 
     x_clean: torch.Tensor
@@ -62,6 +70,7 @@ class LossInputs:
     v_perturb: torch.Tensor | None = None
     m_wt: torch.Tensor | None = None
     m_bg: torch.Tensor | None = None
+    m_brain: torch.Tensor | None = None
 
 
 class AbstractFMLoss(nn.Module, ABC):

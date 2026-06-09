@@ -16,7 +16,7 @@ to the proposal's acceptance criterion (S1 smoke).
 from .base import AbstractFMLoss, CompositeLoss, LossInputs
 from .builder import build_loss
 from .cfm import CFMLoss
-from .contrastive import ContrastiveTumourLoss
+from .contrastive import ContrastiveTumourLoss, RegionTerm
 
 __all__ = [
     "AbstractFMLoss",
@@ -24,5 +24,6 @@ __all__ = [
     "CompositeLoss",
     "ContrastiveTumourLoss",
     "LossInputs",
+    "RegionTerm",
     "build_loss",
 ]

@@ -1,17 +1,19 @@
 # Picasso — 1000-epoch S1 baseline (FFT trunk + ControlNet, CFM-only loss).
 #
+# 2026-06-09 overhaul:
+#   * LR scheduler -> cosine (was "polynomial" with total_steps=1e9 → no-op).
+#   * Peak lr 1e-4 (was 5e-5; matches MAISI-V2 §4.1 + TumorFlow).
+#   * total_steps pinned to the measured value: 208 steps/epoch × 1000 ep ≈ 208 000.
+#     (Empirical: prior run logged 117 728 steps over 566 epochs = 208 steps/epoch.)
+#
 # Hardware: 2× A100 40 GB (cuda:0 training, cuda:1 async exhaustive val).
 # Walltime: 7 days. EarlyStopping patience=100 epochs on train/total_epoch
 # releases the allocation if the run plateaus before exhausting the budget.
 # Effective batch 8 (physical 4, grad_accum 2) matches the Diffusers SDXL
 # ControlNet sweet spot.
 #
-# Data: corpus_picasso.json carries the 6 cv cohorts + 3 test_only cohorts,
-# all with image+latent H5s and (for cv cohorts) the K=4 offline aug bank.
-# Online aug: equivariant_v1 (latent flip_lr + translate).
-#
 # Submit via:
-#   bash routines/fm/train/slurm/runs/launcher_picasso_s1.sh
+#   bash routines/fm/train/slurm/runs/launcher_picasso_s1_fft.sh
 
 run:
   stage: s1
@@ -55,7 +57,10 @@ model:
       - latent:flair
       - mask:wt:identity
     arch_overrides: {}
-    perturb_keys: ["wt"]
+    # S1 has no contrastive term; perturb_keys is irrelevant but kept for
+    # backward compat. CFG dropout (training.conditioning_dropout_p) drives
+    # any conditioning ablation in the s2_cfg variant.
+    perturb_keys: []
   vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
 
 loss:
@@ -70,11 +75,11 @@ rflow:
   sample_method: uniform
 
 optim:
-  lr: 5.0e-5
+  lr: 1.0e-4
   betas: [0.9, 0.95]
   weight_decay: 1.0e-2
   warmup_steps: 1000
-  scheduler: polynomial
+  scheduler: cosine
 
 ema:
   decay: 0.9999
@@ -85,7 +90,10 @@ ema:
   min_value: 0.0
 
 training:
-  total_steps: 1000000000
+  # 208 steps/epoch × 1000 epochs = 208 000. The cosine LR decay completes
+  # over this window. Pin a comment when changing dataset size or batch:
+  # steps_per_epoch ≈ Σ_c (N_c × variant_weight_sum_c) / batch_size / grad_accum.
+  total_steps: 208000
   max_epochs: 1000
   batch_size: 4
   grad_accum: 2
@@ -101,7 +109,7 @@ validation:
   every_epochs: 0
   per_epoch_nfe: 5
   full_sweep_every_epochs: 999999
-  sweep_nfes: [1, 5, 20]
+  sweep_nfes: [1, 2, 5, 10, 20]
   qualitative_every_epochs: 999999
   image_metrics: false
 
@@ -109,7 +117,7 @@ exhaustive_val:
   enabled: true
   every_epochs: 50
   n_patients: 60
-  nfe_levels: [1, 5, 20]
+  nfe_levels: [1, 2, 5, 10, 20]
   integrator: euler
   corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
   device: cuda:1

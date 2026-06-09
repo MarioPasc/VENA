@@ -1,0 +1,7 @@
+# Brain-to-latent encoder — BraTS-Africa-Glioma (test-only) on server-3.
+target_h5: /media/hddb/mario/data/GLIOMAS/brats_africa_glioma/h5/BraTS_Africa_glioma_latents.h5
+source_image_h5: /media/hddb/mario/data/GLIOMAS/brats_africa_glioma/h5/BraTS_Africa_glioma_image.h5
+target_aug_h5: null
+overwrite: false
+artifacts_root: /media/hddb/mario/artifacts/encode/brain_to_latent/brats_africa_glioma
+log_level: INFO

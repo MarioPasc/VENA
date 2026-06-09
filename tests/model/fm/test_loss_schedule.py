@@ -57,6 +57,8 @@ def test_build_schedule_rejects_unknown_kind() -> None:
 
 def _toy_inputs(B: int = 1) -> LossInputs:
     v = torch.randn(B, 4, 4, 4, 4)
+    # v0.4 contrastive needs m_brain (default region = healthy); m_wt is read
+    # from the batch dict in training_step, m_brain from masks/brain_latent.
     return LossInputs(
         x_clean=v,
         noise=v,
@@ -64,9 +66,9 @@ def _toy_inputs(B: int = 1) -> LossInputs:
         timesteps=torch.zeros(B, dtype=torch.long),
         u_target=v,
         v_orig=v,
-        v_perturb=torch.zeros_like(v),
+        v_perturb=None,
         m_wt=torch.ones(B, 1, 4, 4, 4),
-        m_bg=torch.zeros(B, 1, 4, 4, 4),
+        m_brain=torch.ones(B, 1, 4, 4, 4),
     )
 
 
