@@ -223,3 +223,5 @@ artifacts/
 
 # Scheduled wakeup lockfile written by the /loop skill
 .claude/scheduled_tasks.lock
+
+checkpoints/

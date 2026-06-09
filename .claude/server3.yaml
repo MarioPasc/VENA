@@ -1,0 +1,44 @@
+# Per-project config for the global `server3` skill.
+# Schema: see ~/.claude/skills/server3/SKILL.md §"Project configuration".
+
+ssh_host: icai-server
+repo_path_remote: /home/mariopascual/projects/VENA
+python_interpreter: ~/.conda/envs/vena/bin/python
+
+experiments_root: /media/hddb/mario/experiments
+scratch_logs: /media/hddb/mario/smoke_logs
+
+# Pre-flight: non-GPU pytest sweep (catches import / contract breaks fast).
+# Set to null to skip.
+preflight_cmd: '~/.conda/envs/vena/bin/python -m pytest tests/ -q -m "not gpu and not slow"'
+
+# Launch command template. Placeholders: {python}, {config}.
+# The canonical FM trainer takes a single positional YAML argument.
+launch_cmd_template: '{python} -m routines.fm.train.cli {config}'
+
+# Completion signal — three layers, all must pass for "done".
+completion_signal:
+  log_path_template: '{run_dir}/logs/train.log'
+  log_pattern: 'FM-train completed'
+  required_artifacts:
+    - '{run_dir}/checkpoints/last.ckpt'
+    - '{run_dir}/checkpoints/ema_final.ckpt'
+    - '{run_dir}/metrics/train_step.csv'
+    - '{run_dir}/metrics/train_epoch.csv'
+    - '{run_dir}/decision.json'
+
+# pgrep -f anchor — the `vena/bin/python` prefix skips bash watchdog matches.
+# See ~/.claude/skills/server3/SKILL.md §"pgrep traps".
+process_anchor: 'vena/bin/python -m routines.fm.train.cli'
+
+# Monitor cadence. 1200 s (20 min) suits smoke / 4-epoch runs (~20 min total).
+# Raise to 1800 s for full multi-hour training.
+wake_interval_seconds: 1200
+
+# Picasso SSH alias as known on icai-server.
+picasso_host: picasso
+
+# Default single-GPU. Override at invocation for dual-GPU runs (training +
+# exhaustive val): do NOT set CUDA_VISIBLE_DEVICES so both cuda:0 and cuda:1
+# are visible — see project SKILL.md §"Single-GPU vs dual-GPU launches".
+default_cuda_visible_devices: '0'
