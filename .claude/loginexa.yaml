@@ -2,29 +2,58 @@
 # Schema: see ~/.claude/skills/test-picasso-loginexa/SKILL.md §"Project configuration".
 
 repo_path_remote: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA
-python_interpreter: /mnt/home/users/tic_163_uma/mpascual/fscratch/conda_envs/vena/bin/python
+# IMPORTANT: prod env `vena` ships torch 2.12.0+cu130 — sm_70 kernels DROPPED.
+# Loginexa V100-DGXS = sm_70 ⇒ prod env crashes with
+#   "CUDA error: no kernel image is available for execution on the device"
+# at the first cuda call (caught 2026-06-10).
+# The sibling env `vena-v100` is a `conda create --clone` of `vena` with
+# torch pinned to 2.7.1+cu126 (arch list: sm_50/60/70/75/80/86/90 + the
+# matching nvidia-cuda-* / nvidia-cusparselt-cu12 runtimes). Prod env is
+# untouched; loginexa-only.
+python_interpreter: /mnt/home/users/tic_163_uma/mpascual/fscratch/conda_envs/vena-v100/bin/python
 
 # Smoke command template. {python} = python_interpreter, {config} = config path.
 # The canonical FM trainer takes a single positional YAML.
 smoke_cmd_template: '{python} -m routines.fm.train.cli {config}'
 
+# 1 GPU for default smoke; bump to 2 for dual-GPU runs with async exhaustive-val.
+n_gpus_needed: 1
+default_cuda_visible_devices: null  # auto-pick freest by memory
+
+# Warm Lustre before the timed launch. Cold imports of the VENA stack take
+# 2-4 min on loginexa (PL 2.6.5 + MONAI MAISI is heavy). With these pre-loaded,
+# wallclock_budget_minutes below means actual training time.
+warm_imports: ['torch', 'pytorch_lightning', 'monai', 'nibabel']
+
 # 25 min to leave margin under the 30-min loginexa wallclock.
 wallclock_budget_minutes: 25
 
 loginexa_log_dir: ~/execs/VENA/logs
+# Production picasso_s*_1000ep_*.yaml configs write to ~/execs/vena/experiments,
+# but the loginexa smokes write directly under ~/execs/VENA so the user can
+# eyeball a clean per-condition directory tree.
+experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/VENA
 
-# Run-dir discovery — FM trainer creates a timestamped subdir here.
-experiments_root: /mnt/home/users/tic_163_uma/mpascual/fscratch/experiments/VENA
+# Reject anything outside the smoke configs dir — production configs (full
+# epochs × 1255 scans) would be SIGKILLed by `timeout` mid-training and
+# fail the pass criteria for a non-issue. Mirrors the VENA layout pinned in
+# .claude/rules/training-stages.md and the server3 skill overlay.
+smoke_config_glob: 'routines/fm/train/configs/smoke/*.yaml'
+
+# null → use `ls -td experiments_root/*/`. The FM trainer does not currently
+# print a parseable RUN_DIR= line on stdout.
+run_dir_pattern: null
 
 pass_criteria:
-  # The FM trainer prints this when training completes successfully.
+  # FM trainer prints this when training completes successfully.
   log_pattern: 'FM-train completed'
   # All must exist for PASS (use {run_dir} placeholder).
   required_artifacts:
     - '{run_dir}/checkpoints/last.ckpt'
     - '{run_dir}/metrics/train_step.csv'
     - '{run_dir}/decision.json'
-  # CSV must have at least 1 row beyond header (catches silent-fail subprocess trap).
+  # CSV must have at least 1 row beyond header — catches the silent-fail
+  # subprocess trap documented in the VENA server3 SKILL overlay.
   required_csv_min_rows:
     '{run_dir}/metrics/train_step.csv': 1
   # FAIL if any of these appear in the log.
@@ -33,12 +62,10 @@ pass_criteria:
     - 'CUDA out of memory'
     - 'PreflightGateError'
 
-# pgrep -f anchor. `vena/bin/python` prefix skips bash watchdog matches.
-process_anchor: 'vena/bin/python -m routines.fm.train.cli'
+# pgrep -f anchor. `vena-v100/bin/python` prefix is the sibling-env path —
+# `vena/bin/python` (substring match) would have matched too, but anchoring
+# on the exact env keeps stray prod-env launches off the loginexa filter.
+process_anchor: 'vena-v100/bin/python -m routines.fm.train.cli'
 
 # Poll cadence while the smoke runs. 90s is fine for a 25-min budget.
 poll_interval_seconds: 90
-
-# Default to GPU 0 on loginexa. Override for dual-GPU smokes if VENA's
-# async exhaustive-val needs both V100s.
-default_cuda_visible_devices: '0'

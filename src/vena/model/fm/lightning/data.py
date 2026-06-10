@@ -392,6 +392,13 @@ class OfflineAugmentedLatentH5Dataset(Dataset):
         soft_union = np.clip(tumor_lat.sum(axis=0, keepdims=True), 0.0, 1.0)
         m_wt = (soft_union >= self._wt_threshold).astype(np.float32)
         out["m_wt"] = torch.from_numpy(np.ascontiguousarray(m_wt))
+        # Parity with LatentH5Dataset.__getitem__: load `masks/brain_latent` when
+        # the aug H5 carries it. Without this, a mixed batch (v0 emits m_brain,
+        # v1+ does not) collapses in default_collate with KeyError 'm_brain'.
+        # The v0.4 contrastive `healthy` term needs m_brain on EVERY sample.
+        if "masks/brain_latent" in h5:
+            brain_lat = h5["masks/brain_latent"][row]
+            out["m_brain"] = torch.from_numpy(np.ascontiguousarray(brain_lat)).to(torch.float32)
         # extra_priors are not stored in the aug-H5 (no priors group); skip.
         return out
 

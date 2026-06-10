@@ -1,0 +1,146 @@
+# Loginexa 4-epoch smoke — S2 + LoRA r=16 + v0.4 contrastive + CFG dropout.
+#
+# Mirrors routines/fm/train/configs/runs/picasso_s2_1000ep_lora_r16_cfg.yaml
+# under loginexa constraints (2× V100-DGXS-32GB, 30-min hard wallclock).
+# See loginexa_s1_4ep_fft.yaml for the smoke-vs-production diff rationale.
+
+run:
+  stage: s2
+  resume_from: null
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
+
+data:
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  batch_size: 2
+  num_workers: 4
+  pin_memory: true
+  tau: 0.5
+  # See loginexa_s1_4ep_fft.yaml for rationale.
+  max_train_patients_per_cohort: 10
+  augmentation_config_path: routines/fm/train/configs/augmentations/equivariant_v1.yaml
+  preflight_decision_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/latent_aug_equivariance/LATEST/decision.json
+  dedup_decisions_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
+  use_offline_augmented_data: true
+  variant_weights:
+    v0: 0.2
+    v1: 0.2
+    v2: 0.2
+    v3: 0.2
+    v4: 0.2
+
+model:
+  trunk:
+    checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides: {}
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+    trainable: true
+    regime: peft
+    peft:
+      variant: lora
+      params:
+        r: 16
+        alpha: 16
+        dropout: 0.0
+        target_modules: ["to_q", "to_k", "to_v", "out_proj"]
+        bias: "none"
+        init_lora_weights: "gaussian"
+  controlnet:
+    conditioning_inputs:
+      - latent:t1pre
+      - latent:t2
+      - latent:flair
+      - mask:wt:identity
+    arch_overrides: {}
+    perturb_keys: []
+  vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+
+loss:
+  cfm:
+    weight: 1.0
+    reduction: mean
+    norm: l2
+  contrastive:
+    weight: 0.1
+    terms:
+      - {name: healthy, region: healthy, p: 3.0, weight: 1.0}
+      - {name: wt,      region: wt,      p: 1.0, weight: 1.0}
+
+rflow:
+  num_train_timesteps: 1000
+  use_discrete_timesteps: true
+  sample_method: logit-normal
+
+optim:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  warmup_steps: 40
+  scheduler: cosine
+
+ema:
+  decay: 0.9999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 600
+  max_epochs: 4
+  batch_size: 2
+  grad_accum: 1
+  checkpoint_every_epochs: 1
+  log_train_every_steps: 10
+  best_metric_name: mse_latent
+  best_metric_region: bg
+  best_metric_nfe: 5
+  gradient_clip_val: 1.0
+  patience: 100
+  conditioning_dropout_p: 0.15
+  conditioning_dropout_keys: ["wt"]
+
+validation:
+  every_epochs: 0
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 999999
+  sweep_nfes: [1, 2, 5, 10, 20]
+  qualitative_every_epochs: 999999
+  image_metrics: false
+
+exhaustive_val:
+  enabled: true
+  every_epochs: 1
+  n_patients: 3
+  nfe_levels: [1, 5]
+  integrator: euler
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  device: cuda:1
+  block_until_complete: true
+  figure_top_k: 2
+
+output:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/VENA
+  retention_n_checkpoints: 3
+  tensorboard: false
+  wandb: false
+
+regions:
+  brain:
+    source: latents_h5
+  wt:
+    source: derived_from_tumor_latent
+    threshold: 0.5
+  wt_dilated:
+    source: derived_via_scipy_binary_dilation
+    structure: ones_3x3x3
+  bg:
+    source: derived
+  vessel:
+    source: skipped
