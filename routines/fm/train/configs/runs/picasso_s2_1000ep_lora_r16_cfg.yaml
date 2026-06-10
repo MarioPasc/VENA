@@ -15,7 +15,13 @@
 
 run:
   stage: s2
-  resume_from: latest
+  # Recipe tag (schema 0.8.0). Same-recipe scoping for ``resume_from: latest``.
+  # The trailing ``_cfg`` differentiates this CFG-dropout ablation from the
+  # ``lora_r16_contrastive`` baseline so the two never collide on resume.
+  tag: lora_r16_contrastive_cfg
+  # BASELINE — explicit fresh start from MAISI base trunk + fresh LoRA adapters.
+  # Walltime auto-resubmit is OFF (see picasso_s1_1000ep_fft.yaml note).
+  resume_from: baseline
   seed: 1337
   device: cuda
   precision: bf16-mixed

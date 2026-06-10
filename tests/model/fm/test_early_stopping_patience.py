@@ -123,7 +123,7 @@ def test_patience_yaml_round_trip() -> None:
     from routines.fm.train.engine import FMTrainRoutineConfig
 
     minimal = {
-        "run": {"stage": "s1", "seed": 0, "device": "cpu", "precision": "32"},
+        "run": {"stage": "s1", "tag": "fft_cfm", "seed": 0, "device": "cpu", "precision": "32"},
         "data": {
             "corpus_registry": "routines/fm/train/configs/corpus/corpus_picasso.json",
             "fold": 0,

@@ -1075,6 +1075,80 @@ class FMLightningModule(pl.LightningModule):
             logger.warning("RNG restore failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Warm-start (weights-only) load.
+    # ------------------------------------------------------------------
+
+    def load_warm_start(self, ckpt_path: str | Path) -> dict[str, int]:
+        """Load module weights from a Lightning checkpoint, weights-only.
+
+        The engine calls this in ``ResumeMode.WARM_START`` *before*
+        ``trainer.fit``. Optimiser state, scheduler state, EMA state, RNG
+        state are intentionally *not* restored — the new run starts a fresh
+        training schedule on top of the loaded weights. This is the s1→s2
+        warm-start path and the way to bring in an external checkpoint.
+
+        Behaviour:
+
+        * Loads ``checkpoint["state_dict"]`` with ``strict=False`` so a
+          partial overlap is fine — e.g. an s1 ControlNet warm-starting an
+          s2 module that adds extra heads, or an FFT trunk warm-starting a
+          LoRA recipe where the LoRA adapter params get a fresh init.
+        * Logs an INFO-level summary ``loaded=N missing=M unexpected=K`` so
+          the audit trail records exactly what was transferred (per
+          ``.claude/rules/coding-standards.md`` rule #15: no silent swallow).
+        * Returns the same counts as a dict so callers can persist them in
+          ``decision.json`` if they want.
+
+        Parameters
+        ----------
+        ckpt_path : str | Path
+            Absolute path to a Lightning ``.ckpt`` file.
+
+        Returns
+        -------
+        dict[str, int]
+            ``{"loaded": ..., "missing": ..., "unexpected": ...}``.
+
+        Raises
+        ------
+        FileNotFoundError
+            If ``ckpt_path`` does not exist.
+        KeyError
+            If the file does not carry a ``state_dict`` key (not a Lightning
+            checkpoint).
+        """
+        p = Path(ckpt_path)
+        if not p.is_file():
+            raise FileNotFoundError(f"warm-start checkpoint not found: {p}")
+        ckpt = torch.load(p, map_location="cpu", weights_only=False)
+        if "state_dict" not in ckpt:
+            raise KeyError(
+                f"warm-start: {p} is not a Lightning checkpoint (no 'state_dict' key)."
+            )
+        src_state = ckpt["state_dict"]
+        own_state = self.state_dict()
+        # Filter to shape-compatible overlapping keys; everything else is
+        # surfaced in the missing/unexpected log line.
+        loadable = {
+            k: v for k, v in src_state.items()
+            if k in own_state and own_state[k].shape == v.shape
+        }
+        result = self.load_state_dict(loadable, strict=False)
+        missing = list(result.missing_keys)
+        unexpected = list(result.unexpected_keys) + [
+            k for k in src_state if k not in loadable
+        ]
+        logger.info(
+            "load_warm_start: src=%s loaded=%d missing=%d unexpected=%d",
+            p, len(loadable), len(missing), len(unexpected),
+        )
+        if missing:
+            logger.info("  first missing (cn-only / new heads): %s", missing[:5])
+        if unexpected:
+            logger.info("  first unexpected (dropped from src): %s", unexpected[:5])
+        return {"loaded": len(loadable), "missing": len(missing), "unexpected": len(unexpected)}
+
+    # ------------------------------------------------------------------
     # Optimiser.
     # ------------------------------------------------------------------
 

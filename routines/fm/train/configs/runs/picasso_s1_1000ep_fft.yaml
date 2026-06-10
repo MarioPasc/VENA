@@ -17,7 +17,17 @@
 
 run:
   stage: s1
-  resume_from: latest
+  # Recipe tag (schema 0.8.0). Embedded in the run_id so ``resume_from: latest``
+  # globs ``*_{stage}_{tag}_*/`` and only picks up sibling runs of THIS recipe —
+  # never an s1-lora or s2 sibling under the same experiments_root.
+  tag: fft_cfm
+  # BASELINE — explicit fresh start from the MAISI FM base trunk
+  # (``model.trunk.checkpoint``). The auto-resubmit gate in
+  # ``worker_fm_train_picasso.sh`` (``grep "resume_from: latest"``) does NOT
+  # fire here, so a SLURM walltime kill will not self-relaunch. To resume
+  # manually after a kill, edit this YAML to ``resume_from: latest`` (or to
+  # the prior run_id for an explicit warm-start) and re-submit.
+  resume_from: baseline
   seed: 1337
   device: cuda
   precision: bf16-mixed

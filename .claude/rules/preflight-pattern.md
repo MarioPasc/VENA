@@ -121,31 +121,43 @@ A downstream consumer never reads `report.md` programmatically. It loads `decisi
 
 ## `decision.json` for training routines
 
-Phase-3 routines also emit `decision.json` so external-validation and reader-study routines can verify exactly which weights and gates produced a given run. The canonical schema (`routines.fm.train` v0.3.0) is:
+Phase-3 routines also emit `decision.json` so external-validation and reader-study routines can verify exactly which weights and gates produced a given run. The canonical schema (`routines.fm.train` v0.8.0) is:
 
 ```json
 {
-  "schema_version": "0.3.0",
+  "schema_version": "0.8.0",
   "produced_at": "<ISO-8601-UTC>",
-  "producer": "routines.fm.train:0.3.0",
-  "run_id": "<UTC>_<stage>_<short-sha>",
+  "producer": "routines.fm.train:0.8.0",
+  "run_id": "<UTC>_<stage>_<tag>_<short-sha>",
   "run_dir": "/abs/path/to/experiments/<run_id>",
   "stage": "s1|s2|s3",
+  "tag": "fft_cfm|lora_r16_cfm|fft_contrastive|lora_r16_contrastive|lora_r16_contrastive_cfg|...",
   "seed": 1337,
+  "resume_mode": "baseline|continue|warm_start",
+  "resume_source": "<verbatim YAML run.resume_from value, or null>",
+  "resume_source_run_id": "<source run_id when warm_start; else null>",
   "corpus_registry": "routines/fm/train/configs/corpus/corpus_<host>.json",
   "cohorts_used": ["UCSF-PDGM", "BraTS-GLI"],
   "trunk_checkpoint": "/abs/path/to/diff_unet_3d_rflow-mr.pt",
   "trunk_checkpoint_sha256": "<sha256>",
   "trunk_trainable": true,
+  "trunk_regime": "fft|peft",
   "vae_checkpoint": "/abs/path/to/autoencoder_v2.pt",
   "vae_checkpoint_sha256": "<sha256>",
   "loss_stage": "s1",
   "ema_decay": 0.9999,
   "augmentation_config_path": "routines/fm/train/configs/augmentations/<name>.yaml",
   "augmentation_preflight_path": "/abs/path/to/.../decision.json",
-  "exhaustive_val_enabled": true
+  "exhaustive_val_enabled": true,
+  "conditioning_dropout_p": 0.0,
+  "conditioning_dropout_keys": ["wt"]
 }
 ```
+
+Schema bumps to date:
+- **0.6.0** added `trunk_regime` / `trunk_peft_variant` / `trunk_peft_params` (PEFT recipes).
+- **0.7.0** added `conditioning_dropout_p` / `conditioning_dropout_keys` (CFG training-time dropout).
+- **0.8.0** added `tag` / `resume_mode` / `resume_source` / `resume_source_run_id`, and extended the run_id from `<UTC>_<stage>_<sha>` to `<UTC>_<stage>_<tag>_<sha>`. The schema bump is the audit-trail half of the 2026-06-10 Picasso fix: an s2 job that was supposed to start fresh from the MAISI FM base trunk silently latched onto a sibling s1 `last.ckpt` because `resume_from: latest` was workspace-wide rather than recipe-scoped. The new `tag` makes the recipe explicit in the run_id and lets the resume resolver glob `*_{stage}_{tag}_*/` to keep recipes isolated. See `.claude/rules/preflight-pattern.md` and `routines/fm/train/engine.py::_classify_resume_from` for the three resume modes (BASELINE / CONTINUE / WARM_START).
 
 Bump `schema_version` on any breaking change. Add fields freely; never repurpose an existing key.
 

@@ -14,3 +14,14 @@ class PreflightGateError(FMTrainError):
     (vessel mask QC, latent-aug equivariance, MAISI VAE audit, ...) that
     either does not exist or does not declare the required permissions.
     """
+
+
+class InvalidResumeFromError(FMTrainError):
+    """``run.resume_from`` could not be classified.
+
+    Raised by :func:`routines.fm.train.engine._classify_resume_from` when the
+    YAML value is neither one of the literal keywords (``baseline`` / ``latest``
+    / ``best``), nor a run_id matching ``<UTC>_<stage>_<tag>_<sha>``, nor an
+    absolute path to an existing ``.ckpt`` file. The engine does **not**
+    silently fall back to fresh — an unrecognised value is a config bug.
+    """

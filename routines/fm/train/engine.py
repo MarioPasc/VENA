@@ -20,14 +20,16 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
 import pytorch_lightning as pl
 import torch
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from vena.data.augment import AugmentationTracker, VariantTracker, build_pipeline_from_yaml
 from vena.data.h5.shared import now_iso_utc, sha256_file
@@ -49,10 +51,70 @@ from vena.preflight.cohort_dedup import (
     build_allowlists,
 )
 
-from .exceptions import PreflightGateError
-from .runner import generate_run_id, write_provenance
+from .exceptions import InvalidResumeFromError, PreflightGateError
+from .runner import generate_run_id, normalise_tag, write_provenance
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Resume semantics (see ``.claude/rules/preflight-pattern.md`` §"resume_from").
+#
+# The YAML field ``run.resume_from`` carries three distinct intents that the
+# old "scan ``experiments_root`` newest-first" heuristic conflated. The
+# 2026-06-10 Picasso incident showed why that's dangerous: an s2 job that
+# meant to start fresh from the MAISI FM base trunk silently latched onto a
+# sibling s1 run's ``last.ckpt`` because both runs shared the workspace.
+#
+# We now classify the YAML value explicitly:
+#
+# * ``baseline`` / null   → BASELINE   : new dir, no checkpoint load (default).
+# * ``latest`` / ``best`` → CONTINUE   : continue THIS recipe in place — glob
+#                                       scoped to ``*_{stage}_{tag}_*/`` so a
+#                                       different recipe's checkpoint is
+#                                       invisible. Same dir, full state.
+# * ``<run_id>``          → WARM_START : new dir; load weights from the named
+#                                       prior run, leave optimiser/EMA/sched
+#                                       untouched. The s1→s2 experiment path.
+# * absolute ``.ckpt``    → WARM_START : same as above for external checkpoints.
+# * anything else         → raise InvalidResumeFromError (no silent fallback).
+# =============================================================================
+
+
+# 4-field run_id: <UTC>_<stage>_<tag>_<sha>; tag/stage are ``[a-z0-9_]+``.
+_RUN_ID_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[a-z0-9_]+_[a-z0-9_]+_[0-9a-f]{6,}$"
+)
+
+
+class ResumeMode(str, Enum):
+    """Classification of ``run.resume_from``; see comment block above."""
+
+    BASELINE = "baseline"
+    CONTINUE = "continue"
+    WARM_START = "warm_start"
+
+
+def _classify_resume_from(rf: str | None) -> ResumeMode:
+    """Classify ``run.resume_from`` (string) into a :class:`ResumeMode`.
+
+    Path-existence is intentionally NOT checked here — that's the resolver's
+    job. We only need to know which branch the engine should take.
+    """
+    if rf is None or rf == "" or rf == "baseline":
+        return ResumeMode.BASELINE
+    if rf in ("latest", "best"):
+        return ResumeMode.CONTINUE
+    if _RUN_ID_RE.match(rf):
+        return ResumeMode.WARM_START
+    if Path(rf).is_absolute():
+        return ResumeMode.WARM_START
+    raise InvalidResumeFromError(
+        f"run.resume_from={rf!r} is unrecognised. Use one of: 'baseline' (or null) "
+        "for a fresh run from MAISI; 'latest'/'best' to continue the same recipe in "
+        "place; a run_id like '2026-06-10_10-24-10_s1_fft_cfm_9441bf91' to warm-start "
+        "a new run from a prior run; or an absolute path to a .ckpt file."
+    )
 
 
 # =============================================================================
@@ -63,11 +125,25 @@ logger = logging.getLogger(__name__)
 class _RunCfg(BaseModel):
     model_config = ConfigDict(extra="forbid")
     stage: str = "s1"
+    # Recipe identifier within a stage (``fft_cfm``, ``lora_r16_contrastive``,
+    # ``lora_r16_contrastive_cfg``, …). Embedded in the run_id so that
+    # ``resume_from: latest`` globs ``*_{stage}_{tag}_*/`` and never picks up
+    # a sibling job of a different recipe. Required — there is no sensible
+    # default once the experiments_root is shared across recipes.
+    tag: str
     resume_from: str | None = None
     seed: int = 1337
     device: str = "cuda"
     precision: str = "bf16-mixed"
     full_determinism: bool = False
+
+    @field_validator("tag")
+    @classmethod
+    def _normalise_tag(cls, v: str) -> str:
+        # Single source of truth lives in routines.fm.train.runner.run_id —
+        # this validator delegates so the format is enforced identically at
+        # config-load time and at run_id generation time.
+        return normalise_tag(v)
 
 
 class _DataCfg(BaseModel):
@@ -560,6 +636,34 @@ def _run_post_train(run_dir: Path, *, formats: tuple[str, ...]) -> None:
         )
 
 
+class _WarmStartCallback(pl.Callback):
+    """One-shot ``on_fit_start`` weights-only load for ``ResumeMode.WARM_START``.
+
+    The callback fires *after* ``LightningModule.setup()`` (when the trunk has
+    been built and the module's full ``state_dict`` is assembled) but *before*
+    the training loop, so :meth:`FMLightningModule.load_warm_start` sees every
+    key it needs to overlap against. Optimiser / EMA / scheduler / RNG state
+    stay fresh — that's what distinguishes WARM_START from CONTINUE.
+
+    The ``_applied`` flag makes the callback idempotent: ``on_fit_start`` only
+    runs once per ``trainer.fit`` invocation, but defending against re-fits is
+    cheap and surfaces accidental misuse loudly (the duplicate-load attempt is
+    a single no-op).
+    """
+
+    def __init__(self, ckpt_path: str) -> None:
+        super().__init__()
+        self.ckpt_path = ckpt_path
+        self._applied = False
+
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if self._applied:
+            return
+        # The module is FMLightningModule — typed loosely for Lightning's hook.
+        pl_module.load_warm_start(self.ckpt_path)  # type: ignore[attr-defined]
+        self._applied = True
+
+
 # =============================================================================
 # Engine
 # =============================================================================
@@ -573,7 +677,7 @@ class FMTrainRoutineEngine:
         self.config_yaml_path = config_yaml_path
 
     def _make_run_dir(self) -> tuple[str, Path]:
-        run_id = generate_run_id(self.cfg.run.stage)
+        run_id = generate_run_id(self.cfg.run.stage, self.cfg.run.tag)
         run_dir = Path(self.cfg.output.experiments_root) / run_id
         # ``qualitative`` and ``performance`` are no longer produced in-process —
         # their content (qualitative figures + latent preds, per-NFE timing) now
@@ -582,23 +686,27 @@ class FMTrainRoutineEngine:
             (run_dir / sub).mkdir(parents=True, exist_ok=True)
         return run_id, run_dir
 
-    def _resolve_run_dir(self, resume_ckpt: str | None) -> tuple[str, Path, bool]:
-        """Choose the run directory, continuing in place when resuming.
+    def _resolve_run_dir(
+        self, resume_ckpt: str | None, mode: ResumeMode
+    ) -> tuple[str, Path, bool]:
+        """Choose the run directory based on the resume mode.
 
-        If ``resume_ckpt`` points inside ``experiments_root`` (a prior run of
-        this project), reuse that run's directory so the resumed training appends
-        to the same metrics/checkpoints rather than forking a new empty run —
-        essential for long, preemptible Picasso runs to stay one contiguous
-        artifact, and it lets Lightning's ``ModelCheckpoint`` reload its full loop
-        state (same ``dirpath``). An explicit external checkpoint, or no resume,
-        creates a fresh timestamped directory.
+        * CONTINUE — reuse the dir of the prior run we resolved a checkpoint
+          from; ``trainer.fit(ckpt_path=...)`` will then restore the optimiser
+          / EMA / scheduler / RNG state and Lightning's ``ModelCheckpoint``
+          will append to the same ``dirpath``. This is the SIGTERM auto-resubmit
+          path and the only one that keeps a single contiguous artifact across
+          Picasso walltime kills.
+        * BASELINE / WARM_START — always mint a fresh timestamped dir; the
+          warm-start mode pre-loads weights but the new run starts with a
+          fresh optimiser, scheduler, EMA, and RNG state.
 
         Returns
         -------
         tuple[str, Path, bool]
             ``(run_id, run_dir, resuming_in_place)``.
         """
-        if resume_ckpt is not None:
+        if mode is ResumeMode.CONTINUE and resume_ckpt is not None:
             p = Path(resume_ckpt).resolve()
             root = Path(self.cfg.output.experiments_root).resolve()
             if root in p.parents:
@@ -639,16 +747,29 @@ class FMTrainRoutineEngine:
             (run_dir / "config.original.yaml").write_text(yaml.safe_dump(merged, sort_keys=False))
         write_provenance(run_dir, repo=Path(__file__).resolve().parents[3])
 
-    def _build_decision_payload(self, run_id: str, run_dir: Path) -> dict[str, Any]:
-        """Schema-0.6.0 decision JSON written once at run creation.
+    def _build_decision_payload(
+        self,
+        run_id: str,
+        run_dir: Path,
+        *,
+        resume_mode: ResumeMode,
+        resume_source: str | None,
+        resume_source_run_id: str | None,
+    ) -> dict[str, Any]:
+        """Schema-0.8.0 decision JSON written once at run creation.
 
         Carries enough provenance for a downstream consumer to reproduce the
         run end-to-end: data registry, trunk + VAE SHA-256, loss stage,
         optimiser/EMA hyperparameters, augmentation gate path, the list of
         cohort names actually wired in, the cohort deduplication decision
         file + SHA-256 used to filter the corpus, the offline-augmentation
-        bank toggle + per-cohort latent_aug_h5 paths + variant_weights, and
-        (from schema 0.6.0) the trunk regime + PEFT variant + params.
+        bank toggle + per-cohort latent_aug_h5 paths + variant_weights, the
+        trunk regime + PEFT variant + params (schema 0.6.0), the CFG
+        conditioning dropout (schema 0.7.0), and — from schema 0.8.0 — the
+        recipe ``tag`` plus the classified resume mode and its source so an
+        auditor can tell at a glance whether a given run was a fresh
+        baseline, a SIGTERM-resume continuation, or a warm-start from a
+        prior run.
         """
         cfg = self.cfg
         registry = load_registry(cfg.data.corpus_registry)
@@ -664,13 +785,18 @@ class FMTrainRoutineEngine:
             trunk_peft_variant = cfg.model.trunk.peft.get("variant")
             trunk_peft_params = dict(cfg.model.trunk.peft.get("params", {}))
         return {
-            "schema_version": "0.7.0",
+            "schema_version": "0.8.0",
             "produced_at": now_iso_utc(),
-            "producer": "routines.fm.train:0.7.0",
+            "producer": "routines.fm.train:0.8.0",
             "run_id": run_id,
             "run_dir": str(run_dir),
             "stage": cfg.run.stage,
+            "tag": cfg.run.tag,
             "seed": cfg.run.seed,
+            # Resume audit trail (schema 0.8.0).
+            "resume_mode": resume_mode.value,
+            "resume_source": resume_source,
+            "resume_source_run_id": resume_source_run_id,
             "corpus_registry": str(cfg.data.corpus_registry),
             "cohorts_used": [c.name for c in registry.cohorts],
             "trunk_checkpoint": str(cfg.model.trunk.checkpoint),
@@ -752,48 +878,75 @@ class FMTrainRoutineEngine:
         job["corpus_registry"] = str(ev.corpus_registry)
         return job
 
-    def _resolve_resume_ckpt(self, exclude_dir: Path | None = None) -> str | None:
-        """Resolve ``run.resume_from`` to a checkpoint path.
+    def _resolve_resume_ckpt(
+        self, exclude_dir: Path | None = None
+    ) -> tuple[str | None, ResumeMode]:
+        """Resolve ``run.resume_from`` to ``(checkpoint_path, mode)``.
 
-        ``latest``/``best`` scan ``experiments_root`` newest-first and return the
-        first run directory that actually contains the target checkpoint, skipping
-        ``exclude_dir`` (the run we just created, whose ``checkpoints/`` is still
-        empty). An explicit path is returned verbatim if it exists.
+        * BASELINE  → ``(None, BASELINE)``.
+        * CONTINUE  → newest sibling under ``experiments_root`` whose dir name
+          matches ``*_{stage}_{tag}_*`` and contains the target checkpoint
+          (``last.ckpt`` for ``latest``; ``ema_best.ckpt`` for ``best``). The
+          scan is scoped to the same recipe so a sibling job of a different
+          recipe is invisible — fixing the 2026-06-10 Picasso bug where an s2
+          job inherited an s1 ``last.ckpt``.
+        * WARM_START → either ``experiments_root/<run_id>/checkpoints/last.ckpt``
+          (for a literal run_id) or the explicit absolute ``.ckpt`` path. The
+          source run may live under any recipe — that's the point.
+        * Unrecognised → ``InvalidResumeFromError`` (no silent fallback).
+
+        ``exclude_dir`` skips a just-created run dir whose ``checkpoints/`` is
+        empty (CONTINUE only). Unused in BASELINE / WARM_START.
         """
-        rf = self.cfg.run.resume_from
-        if not rf:
-            return None
+        cfg = self.cfg
+        rf = cfg.run.resume_from
+        mode = _classify_resume_from(rf)
 
-        if rf in ("latest", "best"):
-            root = Path(self.cfg.output.experiments_root)
+        if mode is ResumeMode.BASELINE:
+            return None, mode
+
+        root = Path(cfg.output.experiments_root)
+
+        if mode is ResumeMode.CONTINUE:
+            assert rf is not None  # narrowed by _classify_resume_from
+            target = "last.ckpt" if rf == "latest" else "ema_best.ckpt"
+            glob_pat = f"*_{cfg.run.stage}_{cfg.run.tag}_*/"
             skip = exclude_dir.resolve() if exclude_dir is not None else None
             dirs = sorted(
-                (d for d in root.glob("*/") if d.is_dir() and d.resolve() != skip),
+                (d for d in root.glob(glob_pat) if d.is_dir() and d.resolve() != skip),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
-            target = "last.ckpt" if rf == "latest" else "ema_best.ckpt"
             for d in dirs:
                 cand = d / "checkpoints" / target
                 if cand.is_file():
-                    logger.info("Resuming (%s) from %s", rf, cand)
-                    return str(cand)
-                if rf == "latest":
-                    ema = sorted((d / "checkpoints").glob("ema_epoch_*.ckpt"))
-                    if ema:
-                        logger.info("Resuming (latest) from %s", ema[-1])
-                        return str(ema[-1])
-            logger.warning(
-                "resume_from=%r: no matching checkpoint under %s; starting fresh.", rf, root
+                    logger.info("CONTINUE (%s): resuming from %s", rf, cand)
+                    return str(cand), mode
+            logger.info(
+                "CONTINUE (%s): no checkpoint under %s matching recipe %s/%s; "
+                "treating as BASELINE (fresh run from MAISI trunk).",
+                rf, root, cfg.run.stage, cfg.run.tag,
             )
-            return None
+            return None, ResumeMode.BASELINE
+
+        # WARM_START
+        assert mode is ResumeMode.WARM_START and rf is not None
+        if _RUN_ID_RE.match(rf):
+            cand = root / rf / "checkpoints" / "last.ckpt"
+            if not cand.is_file():
+                raise InvalidResumeFromError(
+                    f"WARM_START: run_id {rf!r} resolves to {cand} which does not exist."
+                )
+            logger.info("WARM_START: weights from %s (new run dir will be created)", cand)
+            return str(cand), mode
 
         p = Path(rf)
-        if p.is_file():
-            logger.info("Resuming from explicit path %s", p)
-            return str(p)
-        logger.warning("resume_from=%r could not be resolved; starting fresh.", rf)
-        return None
+        if not p.is_file():
+            raise InvalidResumeFromError(
+                f"WARM_START: explicit path {rf!r} does not exist."
+            )
+        logger.info("WARM_START: weights from explicit path %s", p)
+        return str(p), mode
 
     def run(self) -> Path:
         cfg = self.cfg
@@ -810,24 +963,44 @@ class FMTrainRoutineEngine:
         torch.set_float32_matmul_precision("high")
 
         # Resolve the resume checkpoint *before* choosing the run dir so we can
-        # continue in place (same dir) instead of forking a new empty run.
-        resume_ckpt = self._resolve_resume_ckpt()
-        run_id, run_dir, resuming_in_place = self._resolve_run_dir(resume_ckpt)
+        # continue in place (CONTINUE — same dir) instead of forking a new
+        # empty run. BASELINE and WARM_START always mint a fresh dir.
+        resume_ckpt, resume_mode = self._resolve_resume_ckpt()
+        run_id, run_dir, resuming_in_place = self._resolve_run_dir(resume_ckpt, resume_mode)
         self._attach_file_log(run_dir)
         self._write_static_provenance(run_dir, resuming_in_place=resuming_in_place)
         logger.info(
-            "FM-train run_id=%s dir=%s%s",
+            "FM-train run_id=%s dir=%s resume_mode=%s%s",
             run_id,
             run_dir,
+            resume_mode.value,
             " (RESUMING IN PLACE)" if resuming_in_place else "",
         )
 
         # Decision JSON for downstream consumers — written once at run creation;
-        # left intact on in-place resume.
+        # left intact on in-place resume. ``resume_source_run_id`` is only set
+        # in WARM_START mode (when ``resume_from`` is a literal run_id).
         decision_path = run_dir / "decision.json"
         if not decision_path.exists():
+            resume_source = cfg.run.resume_from
+            resume_source_run_id = (
+                resume_source
+                if (resume_mode is ResumeMode.WARM_START
+                    and resume_source is not None
+                    and _RUN_ID_RE.match(resume_source))
+                else None
+            )
             decision_path.write_text(
-                json.dumps(self._build_decision_payload(run_id, run_dir), indent=2)
+                json.dumps(
+                    self._build_decision_payload(
+                        run_id,
+                        run_dir,
+                        resume_mode=resume_mode,
+                        resume_source=resume_source,
+                        resume_source_run_id=resume_source_run_id,
+                    ),
+                    indent=2,
+                )
             )
 
         # Augmentation pipeline (optional). Built once on the main process
@@ -1006,7 +1179,25 @@ class FMTrainRoutineEngine:
             num_sanity_val_steps=0,
         )
 
-        trainer.fit(model=module, datamodule=dm, ckpt_path=resume_ckpt)
+        # Dispatch on resume mode for the fit call:
+        # * CONTINUE: hand ``ckpt_path`` to Lightning — it restores weights +
+        #   optimiser + scheduler + EMA + RNG state and resumes the same
+        #   epoch counter (same dir, contiguous artifact).
+        # * WARM_START: the trunk does not exist until ``module.setup()`` runs
+        #   (it's built lazily per ``model-coding-standards.md`` rule #2), so
+        #   we cannot call ``load_warm_start`` here — the full state_dict is
+        #   not assembled yet. We inject a one-shot callback whose
+        #   ``on_fit_start`` fires after ``setup()`` and loads weights then.
+        # * BASELINE: no checkpoint touched; trunk is loaded from
+        #   ``model.trunk.checkpoint`` inside ``module.setup()`` as usual.
+        if resume_mode is ResumeMode.WARM_START and resume_ckpt is not None:
+            trainer.callbacks.append(_WarmStartCallback(resume_ckpt))
+            fit_ckpt: str | None = None
+        elif resume_mode is ResumeMode.CONTINUE:
+            fit_ckpt = resume_ckpt
+        else:
+            fit_ckpt = None
+        trainer.fit(model=module, datamodule=dm, ckpt_path=fit_ckpt)
 
         # No explicit final dump on graceful exit: ``last.ckpt`` (ModelCheckpoint
         # ``save_last``) already holds the final weights + optimiser + loop state

@@ -11,7 +11,13 @@
 
 run:
   stage: s2
-  resume_from: latest
+  # Recipe tag (schema 0.8.0). Same-recipe scoping for ``resume_from: latest``.
+  tag: lora_r16_contrastive
+  # BASELINE — explicit fresh start from MAISI base trunk + fresh LoRA adapters.
+  # Walltime auto-resubmit is OFF (see picasso_s1_1000ep_fft.yaml note). For an
+  # s1→s2 warm-start, replace ``baseline`` with a source run_id like
+  # ``2026-06-10_10-24-10_s1_lora_r16_cfm_9441bf91``.
+  resume_from: baseline
   seed: 1337
   device: cuda
   precision: bf16-mixed

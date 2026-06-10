@@ -41,7 +41,7 @@ def _build_minimal_cfg(
     dummy_arch = tmp_path / "arch.json"
     dummy_arch.write_text("{}")
     cfg_dict = {
-        "run": {"stage": "S1", "seed": 42, "device": "cpu"},
+        "run": {"stage": "S1", "tag": "fft_cfm", "seed": 42, "device": "cpu"},
         "data": {
             "corpus_registry": str(dummy_registry),
             "augmentation_config_path": (
