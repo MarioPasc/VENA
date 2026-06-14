@@ -14,12 +14,13 @@ Local:
     - /media/mpascual/Sandisk2TB/research/vena/docs
 
 Picasso:
-- Comments: "4 exa nodes of 8xA100 40GB VRAM ; up to 128GB RAM"
+- Comments: "4 exa nodes of 8xA100 40GB VRAM ; up to 128GB RAM. Loginexa: separate V100-DGXS-32GB interactive node at 10.248.7.200 (vena-v100 env, sm_70)."
 - MAISI-V2:
     - VAE-GAN model: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
     - Flow Matching model: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/diff_unet_3d_rflow-mr.pt
 - UCSF_PDGM:
-    - (Image domain, schema of 19/05/2026): /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSFPDGM_image.h5
+    - (Image domain, schema of 19/05/2026): /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSF_PDGM/h5/UCSFPDGM_image.h5
+    - (Latent domain): /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSF_PDGM/h5/UCSFPDGM_latents.h5
 
 Research Server 3:
 - Comments: "2 GPUs RTX 4090 24GB VRAM ; Server with GUI Desktop, no need for SLURM jobs"

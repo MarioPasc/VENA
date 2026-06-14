@@ -1,0 +1,44 @@
+# Smoke run for the pGAN competitor on the Picasso loginexa V100 queue.
+# 4 training patients × all valid axial slices, 4 epochs total.
+# Wallclock budget: 30 min hard cap (Picasso loginexa rule).
+# Uses sibling env `vena-v100` (torch 2.7.1+cu126, sm_70-compatible).
+runtime:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/VENA/experiments/competitors/pgan_cgan
+  platform: loginexa
+  tag: smoke_4ep
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  image_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSF_PDGM/h5/UCSFPDGM_image.h5
+  fold: 0
+  input_modalities: [t1pre, t2, flair]
+  target_modality: t1c
+  image_size: 256
+  min_brain_voxels: 1000
+  max_train_patients: 4
+
+hp:
+  input_nc: 3
+  output_nc: 1
+  ngf: 64
+  ndf: 64
+  n_layers_D: 3
+  norm: instance
+  init_type: normal
+  no_dropout: false
+  pool_size: 0
+  lambda_A: 100.0
+  lambda_vgg: 100.0
+  lambda_adv: 1.0
+  lr: 0.0002
+  beta1: 0.5
+  lr_policy: lambda
+  lr_decay_iters: 50
+  epoch_count: 1
+  niter: 3
+  niter_decay: 1
+  batchSize: 1
+  save_epoch_freq: 1
+  log_every: 50
+  num_workers: 2

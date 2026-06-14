@@ -1,0 +1,44 @@
+# Full pGAN training on Picasso A100 DGX node.
+# UCSF-PDGM fold 0 — train + val partitions of the 445 non-test patients.
+# 50 epochs constant LR + 50 epochs linear decay (Dar et al. 2019 paper recipe).
+# Expected wallclock: ~24-36 h on a single A100.
+runtime:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/fscratch/experiments/competitors/pgan_cgan
+  platform: picasso
+  tag: full
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  image_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSF_PDGM/h5/UCSFPDGM_image.h5
+  fold: 0
+  input_modalities: [t1pre, t2, flair]
+  target_modality: t1c
+  image_size: 256
+  min_brain_voxels: 1000
+  max_train_patients: null
+
+hp:
+  input_nc: 3
+  output_nc: 1
+  ngf: 64
+  ndf: 64
+  n_layers_D: 3
+  norm: instance
+  init_type: normal
+  no_dropout: false
+  pool_size: 0
+  lambda_A: 100.0
+  lambda_vgg: 100.0
+  lambda_adv: 1.0
+  lr: 0.0002
+  beta1: 0.5
+  lr_policy: lambda
+  lr_decay_iters: 50
+  epoch_count: 1
+  niter: 50
+  niter_decay: 50
+  batchSize: 1
+  save_epoch_freq: 10
+  log_every: 200
+  num_workers: 8

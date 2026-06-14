@@ -1,0 +1,3 @@
+The upstream "data" directory already provides its own __init__.py defining CreateDataLoader.
+VENA does not call it; instead, src/vena/competitors/pgan_cgan/dataset.py implements the
+same dict-returning contract from the UCSF-PDGM image H5 directly.

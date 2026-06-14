@@ -55,6 +55,11 @@ dependencies = [
     # RandomBiasField / RandomMotion / RandomAnisotropy that MAISI's VAE
     # is not equivariant to). See routines/offline_aug/maisi/.
     "torchio>=0.19.6",
+    # torchvision is required by the pGAN-cGAN competitor (Dar et al. 2019)
+    # for its VGG16 perceptual loss. See routines/competitors/pgan_cgan/.
+    # The wheel must match the installed torch's CUDA tag; pick at install
+    # time via --extra-index-url like torch.
+    "torchvision>=0.20",
     # Optimally Oriented Flux (Law & Chung 2008) is consumed through ITK +
     # ITK-TubeTK Python bindings. ITK ships the Hessian / oriented-flux
     # primitives; ITK-TubeTK adds the curated vessel-enhancement filters
@@ -145,6 +150,8 @@ vena-merge-offline-aug = "scripts.merge_offline_aug_shards:main"
 vena-fm-train = "routines.fm.train.cli:main"
 vena-fm-exhaustive-val = "routines.fm.exhaustive_val.cli:main"
 vena-fm-post-train = "routines.fm.post_train.cli:main"
+vena-competitor-pgan = "routines.competitors.pgan_cgan.cli:main"
+vena-competitor-pgan-infer = "routines.competitors.pgan_cgan.infer_cli:main"
 
 # ----------------------------------------------------------------------------
 # Setuptools layout — src/-layout for the library, flat-layout for routines/
