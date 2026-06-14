@@ -141,3 +141,54 @@ def test_pad_to_crop_when_input_larger() -> None:
     y = _pad_to(x, 256)
     assert y.shape == (1, 256, 256)
     assert float(y.sum()) == 256 * 256
+
+
+def test_dataset_falls_back_to_flat_splits_schema(tmp_path) -> None:
+    """REMBRANDT uses splits/{train,val,test} (no k-fold) — verify fallback."""
+    out = tmp_path / "flat.h5"
+    H, W, D = 100, 100, 60
+    rng = np.random.default_rng(0)
+    N = 5
+    with h5py.File(out, "w") as f:
+        f.create_dataset("ids", data=np.array([f"P-{i:03d}" for i in range(N)], dtype="S10"))
+        for mod in ("t1pre", "t1c", "t2", "flair"):
+            f.create_dataset(
+                f"images/{mod}",
+                data=rng.uniform(0.0, 100.0, size=(N, H, W, D)).astype(np.float32),
+            )
+        f.create_dataset("masks/brain", data=np.ones((N, H, W, D), dtype=np.int8))
+        # Flat schema (no splits/cv/...).
+        f.create_dataset("splits/train", data=np.array([b"P-000", b"P-001", b"P-002"]))
+        f.create_dataset("splits/val", data=np.array([b"P-003"]))
+        f.create_dataset("splits/test", data=np.array([b"P-004"]))
+    ds = UCSFPDGMSliceDataset(image_h5=out, fold=0, phase="train", min_brain_voxels=10)
+    assert len(ds.patient_indices) == 3
+
+
+def test_dataset_resolves_longitudinal_patient_ids(tmp_path) -> None:
+    """BraTS-GLI / LUMIERE store scan-level /ids but patient-level splits."""
+    out = tmp_path / "longitudinal.h5"
+    H, W, D = 100, 100, 60
+    rng = np.random.default_rng(0)
+    # Three patients × 2 scans each = 6 scan ids.
+    scan_ids = [
+        f"PT-{p:04d}-{s:03d}" for p in range(3) for s in range(2)
+    ]
+    with h5py.File(out, "w") as f:
+        f.create_dataset("ids", data=np.array(scan_ids, dtype="S20"))
+        for mod in ("t1pre", "t1c", "t2", "flair"):
+            f.create_dataset(
+                f"images/{mod}",
+                data=rng.uniform(0.0, 100.0, size=(6, H, W, D)).astype(np.float32),
+            )
+        brain = np.ones((6, H, W, D), dtype=np.int8)
+        f.create_dataset("masks/brain", data=brain)
+        # Splits at PATIENT level (no session suffix).
+        f.create_dataset("splits/cv/fold_0/train", data=np.array([b"PT-0000", b"PT-0001"]))
+        f.create_dataset("splits/cv/fold_0/val", data=np.array([b"PT-0002"]))
+        f.create_dataset("splits/test", data=np.array([b"PT-0000"]))
+    ds = UCSFPDGMSliceDataset(image_h5=out, fold=0, phase="train", min_brain_voxels=10)
+    # Each requested patient → 2 scans. 2 patients × 2 scans = 4 patient indices.
+    assert len(ds.patient_indices) == 4
+    # Resolved ids carry the session suffix (the actual /ids entries).
+    assert all("-" in pid and len(pid.split("-")[-1]) == 3 for pid in ds.patient_ids)

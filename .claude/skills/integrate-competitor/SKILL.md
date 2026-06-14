@@ -27,6 +27,42 @@ Every new competitor follows the same 7-step recipe. Do not improvise — match 
 existing layout and conventions exactly. If you have to deviate, document the deviation
 in the validation note.
 
+## The pGAN-cGAN integration as a reusable template
+
+Each file under `src/vena/competitors/pgan_cgan/` and
+`routines/competitors/pgan_cgan/` is a usable scaffold; copy it into the new
+competitor's directory and edit the marked points. The boundaries between
+files are stable and were validated end-to-end across all three platforms.
+
+### File-by-file map (treat as the canonical scaffold)
+
+| File | Role | What to keep, what to adapt |
+|---|---|---|
+| `src/external/<name>/upstream/` | Vendored upstream snapshot, frozen. | Replace; patch torch-API drift in-place; never monkey-patch at runtime. |
+| `src/external/<name>/UPSTREAM.md`, `UPSTREAM_SHA.txt`, `PATCHES.md` | Vendor metadata. | Replace verbatim — same fields, new values. |
+| `src/vena/competitors/<name>/__init__.py` | Public API re-exports. | Keep shape: `Dataset`, `MultiCohortDataset`, `train_*`, `run_inference`. |
+| `src/vena/competitors/<name>/dataset.py` | Per-cohort + multi-cohort H5 → competitor-format batches. | Replace the batch-formatting (`__getitem__` return dict, channel layout, range rescale). Keep the percentile-norm pipeline, the lazy-open + `__getstate__` pattern, the longitudinal id resolver, the flat-splits fallback, and the `MultiCohortImageSliceDataset` shape (cohort loop → skip-with-WARNING → ConcatDataset). |
+| `src/vena/competitors/<name>/runner.py` | Programmatic training loop: build options Namespace, import vendored model, drive epoch loop, write CSVs, save `best` + `latest`. | Replace the import + opt builder + the inner step body. Keep the epoch-CSV / step-CSV writers, the `best_loss` / `patience` early-stop block, the `max_epochs` cap, the `_verify_vgg_cache()`-style pretrained-weight check, the sentinel log line. |
+| `src/vena/competitors/<name>/inference.py` | Load `best_net_G.pth` (or epoch N), run on N val patients, write NIfTI + PNG + metrics CSV. | Replace the generator build + forward pass. Keep the percentile-norm parity, the crop-back to native shape, the per-patient PSNR/SSIM. |
+| `routines/competitors/<name>/cli.py` | One-positional-arg CLI; rich logging; calls Engine. | Copy verbatim — only the module path changes. |
+| `routines/competitors/<name>/engine.py` | Pydantic config (`DataCfg`, `HyperParamsCfg`, `RuntimeCfg`), run-id generator, `decision.json` writer, preflight checks, build runner SimpleNamespace, call `train_<name>`. | Replace the hyperparameter fields; keep the multi-cohort / single-cohort either-or validator, the `_preflight` grandparent check, the `_write_decision` schema-1.0 block, and the `_short_git_sha` / `_file_sha256` helpers. |
+| `routines/competitors/<name>/infer_cli.py` | CLI wrapper around `run_inference`. | Copy verbatim — only the import path changes. |
+| `routines/competitors/<name>/configs/{smoke_server3_4ep,smoke_loginexa_2ep,picasso_full}.yaml` | Per-platform YAML configs. | Copy + adapt the hyperparams + corpus_registry per platform. Smokes use `num_workers: 0` and `max_patients_per_cohort: 1`. Picasso full uses `corpus_picasso.json`, `max_epochs: 10000`, `patience: 100`, `num_workers: 8`, `batchSize: 4`, fold 0, seed 1337 — these are the paired-comparison axes. |
+| `routines/competitors/<name>/server3/launcher_<name>_server3_4ep.sh` | rsync → ssh icai-server → `screen -dmS` → exit. | Copy verbatim — change session name + config path. Pre-warm VGG-style caches on icai-server (has internet). |
+| `routines/competitors/<name>/loginexa/launcher_<name>_loginexa_2ep.sh` | ssh picasso → warm cache on login node → ssh loginexa → `tmux new-session -d` → exit. | Copy verbatim — change session name + config path + python interpreter pin (`vena-v100` env). Auto-pick freest V100 by `nvidia-smi memory.free`. |
+| `routines/competitors/<name>/slurm/runs/{launcher,worker}_<name>_picasso_full.sh` | sbatch launcher + worker with `--constraint=dgx --partition=gpu_partition --gres=gpu:1 --time=7-00:00:00`. | Copy verbatim — change paths + env name (`vena` for A100). |
+| `tests/competitors/<name>/test_dataset.py`, `test_inference.py`, `test_multicohort.py` | Synthetic-H5 fixtures + behavioural assertions. | Copy + adapt. The longitudinal-resolver, flat-splits, and missing-cohort tests carry over essentially unchanged. |
+| `.claude/notes/validation/<name>.md` | Implementation log, paired-comparison axes table, per-platform recipes, gotchas. | Replace per-competitor body; keep the section structure (Scope / Code layout / Patches / Data contract / Per-platform recipe / Paired axes / Things to watch). |
+| `pyproject.toml` `[project.scripts]` | Console scripts `vena-competitor-<name>` + `vena-competitor-<name>-infer`. | Add two lines per competitor. |
+
+### Boundary that must not move
+
+`vena.competitors.<name>` depends on `vena.common.percentile_normalise` and
+the vendored upstream — **nothing from `vena.model.fm.*`, `vena.preflight.*`,
+or another `vena.competitors.<other>.*`**. The competitor wrappers form a fan
+of independent leaves under `vena.competitors`, so deleting one never
+breaks the others.
+
 ## The 7 steps
 
 ### Step 1 — Vendor upstream
@@ -77,18 +113,93 @@ Hard constraints:
 1. **Deterministic dataset.** No augmentation. Repeat reads of the same index return
    byte-identical tensors. Pin this with a unit test
    (`test_<name>_dataset_is_deterministic`).
-2. **Match the channel dim contract of the competitor.** pGAN took N input channels →
+2. **Match VENA's training corpus.** Production runs **must** read the same
+   `routines/fm/train/configs/corpus/corpus_<host>.json` that VENA's FM trainer reads
+   — never hand-roll a competitor-specific corpus, never train on a single cohort when
+   VENA trains on the union. Build a `MultiCohort<X>Dataset` that takes a corpus
+   registry path, filters by `role=="cv"`, and concatenates per-cohort datasets via
+   `torch.utils.data.ConcatDataset`. Skip with WARNING (not error) when a cohort's
+   `image_h5` is missing on the current platform or its `splits/cv/fold_<k>/<phase>`
+   is empty — this is what lets the same corpus JSON drive heterogeneous environments.
+   Keep a single-cohort path on the dataset class for fast sanity smokes.
+3. **Match the channel dim contract of the competitor.** pGAN took N input channels →
    1 output. If the competitor expects different shapes, adapt with pad/crop in the
-   dataset, not in the model.
-3. **Normalise via `vena.common.percentile_normalise`.** Per-patient thresholds, cached
+   dataset, not in the model. The padder must handle native shape heterogeneity
+   across cohorts (UCSF-PDGM is 240×240, BraTS-GLI is 182×218 — both pad to 256).
+4. **Normalise via `vena.common.percentile_normalise`.** Per-patient thresholds, cached
    at init time, applied per-slice — this matches what VENA's own FM trainer sees.
    Image-domain models then rescale `[0, 1] → [-1, 1]` for tanh outputs (pGAN); latent
    models skip this and read from `*_latents.h5` instead.
-4. **No `vena.model.fm.*` imports in the wrapper.** Competitor wrappers depend only on
+5. **No `vena.model.fm.*` imports in the wrapper.** Competitor wrappers depend only on
    `vena.common` and `vena.data.*`.
-5. **Open H5 lazily in workers.** Use a `self._h5 = None` field and a `_open()` method —
+6. **Open H5 lazily in workers.** Use a `self._h5 = None` field and a `_open()` method —
    h5py file handles are not picklable across `num_workers > 0`. Override `__getstate__`
-   to drop the handle.
+   to drop the handle. **Do NOT pass `swmr=True`** to a non-SWMR-written file; some h5py
+   builds deadlock on the no-op handshake under multiprocessing.
+7. **Track `best` and `latest` checkpoints, not just `latest`.** Save `best_net_*` on
+   every improvement of an epoch-level metric (G_L1 for pGAN, the equivalent for your
+   model). `latest` is the resume point; `best` is the evaluation point. The runner
+   should accept a `patience` knob (epochs without improvement → early stop) and a
+   `max_epochs` cap that mirrors VENA's reference recipe.
+
+### Step 3.4 — Cohort schema heterogeneity (real, hit on pGAN integration)
+
+The VENA corpus is **not** schema-uniform. Two failure modes silently drop
+cohorts at run start if the wrapper assumes UCSF-PDGM's schema for all of
+them. The pGAN reference integration fixed both inside
+`src/vena/competitors/pgan_cgan/dataset.py`; future competitors must
+implement the equivalent fallbacks (or import the same dataset class).
+
+1. **Longitudinal cohorts store scan-level `/ids` but patient-level splits.**
+   BraTS-GLI: `/ids[i] = "BraTS-GLI-00000-000"` (scan with `-NNN` session
+   suffix), `splits/cv/fold_0/train[j] = "BraTS-GLI-00000"` (patient). Same
+   pattern in LUMIERE with a `Patient-001__week-...` form. Resolution: when
+   an exact `pid in /ids` fails, try prefix-match (`pid + "-"` or
+   `pid + "_"`) and concatenate every matching scan. Skipping the prefix
+   match drops 815 + 64 ≈ 879 patients (≈170 K slices) silently. The
+   `longitudinal: true` field in the corpus registry is the flag that
+   tells you to expect this.
+
+2. **Small cohorts use a flat `splits/<phase>` schema, not k-fold.**
+   REMBRANDT (N=63) stores its single 53/5/5 train/val/test split at
+   `splits/{train,val,test}`; there is no `splits/cv/fold_<k>/...` at all.
+   Resolution: prefer the k-fold path, fall back to the flat path. The
+   manifest comment ("N=63 too small for nested CV") is the canonical
+   warning. Other small cohorts may follow the same convention.
+
+When in doubt, walk the H5 once before integrating a new dataset:
+
+```python
+with h5py.File(path, "r") as f:
+    print(sorted(f.keys()), sorted(f["splits"].keys()) if "splits" in f else [])
+    sample_id = f["ids"][0].decode()
+    sample_split = next(iter(f.get("splits/cv/fold_0/train", f.get("splits/train", []))), b"")
+    print("ids[0]:", sample_id, "vs split[0]:", sample_split)
+```
+
+If the two strings differ structurally, you have the BraTS-GLI/LUMIERE
+case. If `splits/cv/fold_0/train` doesn't exist, you have the REMBRANDT
+case. Either way the wrapper must handle it before going to production —
+both `UCSFPDGMSliceDataset` (per-cohort) and `MultiCohortImageSliceDataset`
+should *skip with WARNING*, not raise, when a single cohort fails to
+resolve. Pin every fallback with a unit test under
+`tests/competitors/<name>/`.
+
+### Step 3.5 — h5py + multiprocessing trap (real, hit on pGAN integration)
+
+h5py file handles + Python's `multiprocessing` start method (fork on Linux) +
+a `ConcatDataset` over multiple H5s **deadlocks the DataLoader** when several
+worker processes open the same file family concurrently. The symptom: training
+loop hangs mid-epoch, CPU pegged at 100 % across workers, no Traceback, log
+silent for many minutes. We hit this on the first multi-cohort pGAN smoke
+(4 workers × 4 cohorts → 16 concurrent handles → freeze at step ~950).
+
+Mitigation by config:
+- **Smokes**: set `num_workers: 0` (the loop runs in the main process).
+- **Production**: keep `num_workers: 8` only if the slowdown is a real cost;
+  start with `num_workers: 0` and bump only after confirming no deadlocks on a
+  full epoch.
+- The dataset's `_open()` must open in plain `"r"` mode (no SWMR).
 
 ### Step 4 — Build the routine
 
@@ -153,29 +264,120 @@ The three platforms have different transports. Match the templates exactly.
 
 ### Step 6 — Validate the integration
 
-Acceptance is THREE platforms, in this order:
+Acceptance is THREE platforms in **strict order**: server-3 → loginexa →
+Picasso. Each stage gates the next: if a smoke fails, fix the bug before
+moving up. Do NOT skip a tier because "it'll be the same on the next one" —
+each platform has caught at least one bug during the pGAN integration
+(server-3 caught the multi-worker h5py deadlock, loginexa caught the V100
+sm_70 / cu130 mismatch, Picasso caught the longitudinal-id resolver gap and
+the REMBRANDT flat-split fallback gap).
 
-1. **Server-3 4-epoch smoke** — loss descends, checkpoints + metrics CSV + decision.json
-   written, `pGAN-train completed`-style sentinel in the log. Wallclock ≤ 5 min on RTX
-   4090.
-2. **Loginexa 4-epoch smoke** — same artifact set, wallclock ≤ 30 min on V100.
-3. **Picasso full submission** — `bash <launcher> --dry-run` resolves the sbatch
-   command with correct paths. Do NOT submit the full run as part of the integration
-   PR; the user controls when to spend the A100 budget.
+1. **Server-3 multi-cohort smoke (4 epochs, 1 patient/cohort)** — uses
+   `corpus_server3.json`; loss descends across the cohort union; checkpoints +
+   metrics CSV + decision.json written; sentinel in log. Wallclock ≤ 10 min on
+   RTX 4090 with `num_workers: 0`.
+2. **Loginexa multi-cohort smoke (2 epochs)** — uses `corpus_picasso.json` via
+   the shared Lustre mount; same artifact set; wallclock ≤ 10 min on V100. The
+   shorter 2-epoch budget exists because loginexa shares GPUs with other users
+   and the 30-min wallclock convention applies.
+3. **Picasso full submission** — actually `sbatch` (no dry-run): once
+   `squeue -j <id>` shows `RUNNING` and the python log emits the
+   `MultiCohortImageSliceDataset[train/fold0]` line with the expected cohort
+   count, the integration is live. The user gates the budget by requesting the
+   submission; they don't need to be in the loop for the sbatch itself once
+   they've authorised it.
+
+### Step 6.1 — Watcher pattern (`/loop`-driven async monitoring)
+
+A 4-epoch smoke takes minutes; a Picasso job takes hours-to-days. The agent
+must NOT block the conversation by polling. The canonical pattern for every
+submitted job is **one background watcher + one ScheduleWakeup backstop**:
+
+1. After every submission (server-3 / loginexa / Picasso), `Bash run_in_background=true`
+   a polling loop:
+
+   ```bash
+   for i in $(seq 1 N); do
+     if ssh <host> "grep -q '<sentinel>' <log>"; then
+       echo "[$(date +%H:%M:%S)] DONE iter $i"
+       exit 0
+     fi
+     if ssh <host> "grep -q 'Traceback' <log>"; then
+       echo "[$(date +%H:%M:%S)] TRACEBACK iter $i"
+       exit 1
+     fi
+     sleep <T>
+   done
+   ```
+
+   The sentinel for VENA competitor runs is `pGAN-train completed`-style
+   (replace per competitor). `T` is 8–12 s for smokes, 30–60 s for Picasso.
+
+2. Call `ScheduleWakeup` with `prompt: <<autonomous-loop-dynamic>>` so the
+   harness wakes the agent again at a heartbeat interval if the watcher hangs
+   or the SSH connection drops. Heartbeat budget: 60–270 s during active
+   polling (cache stays warm), 1200–1800 s when the only signal is the
+   Monitor or the watcher itself. Don't pick 300 s — it pays the cache miss
+   without amortising.
+
+3. On wake (`<task-notification>` for the watcher, or the dynamic loop
+   trigger), check the watcher output file, decide:
+   - **DONE** → run inference on 10 val patients with `--epoch best`,
+     verify NIfTI + PNG + metrics, mark task complete, advance to the next
+     platform tier.
+   - **TRACEBACK** → fetch the failing log block, fix the bug, kill the
+     job (`scancel <id>` or `screen -X -S <session> quit`), resubmit.
+   - **TIMEOUT** → re-arm a new watcher with a longer window, schedule
+     a heartbeat, return.
+
+4. Two watchers can run concurrently if smokes are independent (server-3 +
+   loginexa share no GPUs); a unified poller (`if [[ S3 -gt 0 && LX -gt 0 ]]`)
+   is fine. Picasso runs are long-lived — set Monitor-style heartbeats at
+   1200 s.
+
+5. NEVER chain `sleep` calls in the foreground — the harness blocks long
+   leading sleeps. Run the wait in `run_in_background: true` OR use the
+   Monitor tool with an `until <check>; do sleep <T>; done` loop.
+
+This is the same pattern the `server3` skill encodes for VENA's own FM
+trainer; the competitor skill reuses it verbatim.
 
 After each training run that produced checkpoints, **run inference on 10 val patients**
-(or test if explicitly asked):
+using the `best` epoch (the early-stopping-selected weights), not `latest`:
 
 ```
 vena-competitor-<name>-infer \
     --run-dir   <run_dir> \
     --image-h5  <UCSFPDGM_image.h5> \
-    --epoch     latest \
+    --epoch     best \
     --n-patients 10 \
     --phase     val
 ```
 
 Verify outputs: 10 NIfTI volumes + PNG midslices + `metrics.csv` + `summary.json`.
+
+### Paired comparison axes (must match VENA's reference run)
+
+The default VENA reference is `routines/fm/train/configs/runs/picasso_s1_1000ep_fft.yaml`.
+Audit each axis when authoring the competitor's `picasso_full.yaml`:
+
+| Axis | Match exactly | Match conceptually | Differ by design |
+|---|---|---|---|
+| seed | ✅ | | |
+| fold | ✅ | | |
+| corpus_registry | ✅ | | |
+| max_epochs | ✅ | | |
+| patience | ✅ (on epoch-mean train loss analogue) | | |
+| save cadence | ✅ | | |
+| batch_size (physical) | ✅ | | |
+| num_workers | ✅ | | |
+| walltime | ✅ | | |
+| input modalities + masks | | | ⚠ paper-faithful set |
+| output domain (latent vs image) | | | ⚠ paper-faithful |
+| target metric | | ⚠ best-epoch selector | |
+
+Differences in the right two columns are explicit choices that go in the
+validation note — they are not bugs.
 
 ### Step 7 — Document
 
@@ -228,12 +430,20 @@ ssh picasso "/mnt/home/users/tic_163_uma/mpascual/fscratch/conda_envs/vena/bin/p
 - [ ] Upstream cloned, SHA recorded, `.pyc`/`.git` removed.
 - [ ] `PATCHES.md` lists every in-place change.
 - [ ] Wrapper `dataset.py` returns deterministic tensors with no augmentation.
-- [ ] Unit test pins determinism + correct shape/range.
-- [ ] Engine writes `decision.json` v1.0 with the competitor block.
+- [ ] `MultiCohort<X>Dataset` reads `corpus_<host>.json` (same as VENA's FM trainer).
+- [ ] Cohort fallback: missing H5 / empty split → WARNING, not crash.
+- [ ] `_open()` uses plain `"r"` mode, never SWMR.
+- [ ] Smoke configs set `num_workers: 0` (multi-cohort h5py deadlock).
+- [ ] Runner saves `best_net_*` on epoch-metric improvement and supports `patience`.
+- [ ] Unit tests pin: determinism, shape/range, multi-cohort concat, missing-cohort fallback, **longitudinal patient→scan resolver (BraTS-GLI, LUMIERE), flat-splits fallback (REMBRANDT)**.
+- [ ] Engine writes `decision.json` v1.0 with the competitor + corpus_registry block.
 - [ ] Three platform launchers exist and dry-run cleanly.
 - [ ] Console scripts registered in `pyproject.toml`.
-- [ ] Server-3 4-epoch smoke completed; artifacts verified.
-- [ ] Loginexa 4-epoch smoke completed; artifacts verified.
-- [ ] Picasso launcher dry-run validated.
-- [ ] Inference run on 10 val patients after each training run.
+- [ ] Server-3 multi-cohort smoke completed; artifacts verified.
+- [ ] Loginexa multi-cohort smoke completed; artifacts verified.
+- [ ] Picasso job actually `sbatch`-submitted (not dry-run) once user authorises;
+      `scontrol show job` confirms RUNNING on `gpu_partition` with `--constraint=dgx`.
+- [ ] Inference run on 10 val patients with `--epoch best` after each training run.
 - [ ] Validation note in `.claude/notes/validation/<name>.md`.
+- [ ] Pair-comparison axes table in the validation note flags every divergence
+      from VENA's reference run.

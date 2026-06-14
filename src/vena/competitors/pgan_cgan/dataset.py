@@ -151,24 +151,54 @@ class UCSFPDGMSliceDataset(Dataset[dict[str, torch.Tensor | str]]):
         with h5py.File(self.image_h5, "r") as f:
             all_ids = _decode_ids(np.asarray(f["ids"]))
             if phase == "test":
-                key = "splits/test"
+                candidates = ["splits/test"]
             else:
-                key = f"splits/cv/fold_{fold}/{phase}"
-            if key not in f:
-                raise DatasetError(f"{key} missing from {self.image_h5}")
+                # Prefer k-fold CV splits; fall back to the flat
+                # ``splits/<phase>`` schema used by small cohorts (REMBRANDT,
+                # N=63: single 53/5/5 train/val/test — no nested CV).
+                candidates = [f"splits/cv/fold_{fold}/{phase}", f"splits/{phase}"]
+            key = next((c for c in candidates if c in f), None)
+            if key is None:
+                raise DatasetError(
+                    f"none of {candidates} present in {self.image_h5}"
+                )
             split_ids = _decode_ids(np.asarray(f[key]))
 
         id_to_idx = {pid: i for i, pid in enumerate(all_ids)}
-        missing = [pid for pid in split_ids if pid not in id_to_idx]
+        # Longitudinal cohorts (BraTS-GLI, LUMIERE) store scan-level entries in
+        # /ids ("BraTS-GLI-00000-000") but patient-level entries in splits
+        # ("BraTS-GLI-00000"). Resolve via prefix match when exact match fails.
+        resolved_indices: list[int] = []
+        resolved_ids: list[str] = []
+        missing: list[str] = []
+        for pid in split_ids:
+            if pid in id_to_idx:
+                resolved_indices.append(id_to_idx[pid])
+                resolved_ids.append(pid)
+                continue
+            # Try prefix match: scan_id starts with patient_id + non-alnum sep.
+            matched = False
+            prefix_dash = f"{pid}-"
+            prefix_uscr = f"{pid}_"
+            for full_id, idx in id_to_idx.items():
+                if full_id.startswith(prefix_dash) or full_id.startswith(prefix_uscr):
+                    resolved_indices.append(idx)
+                    resolved_ids.append(full_id)
+                    matched = True
+            if not matched:
+                missing.append(pid)
         if missing:
             raise DatasetError(
-                f"split {key!r} references {len(missing)} ids absent from /ids"
+                f"split {key!r} references {len(missing)} ids absent from /ids "
+                f"(both exact and prefix match failed; e.g. {missing[:3]})"
             )
         if max_patients is not None:
-            split_ids = split_ids[:max_patients]
+            # Cap at scan-id count so we keep ≥1 scan per requested patient.
+            resolved_ids = resolved_ids[:max_patients]
+            resolved_indices = resolved_indices[:max_patients]
 
-        self.patient_ids: list[str] = split_ids
-        self.patient_indices: list[int] = [id_to_idx[pid] for pid in split_ids]
+        self.patient_ids: list[str] = resolved_ids
+        self.patient_indices: list[int] = resolved_indices
 
         logger.info(
             "UCSFPDGMSliceDataset[%s/fold%d]: %d patients, modalities=%s → %s",
