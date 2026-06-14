@@ -5,8 +5,18 @@ Exports ``UCSFPDGMSliceDataset`` and ``train_pgan``.
 
 from __future__ import annotations
 
-from .dataset import UCSFPDGMSliceDataset
+from .dataset import (
+    CohortImageSliceDataset,
+    MultiCohortImageSliceDataset,
+    UCSFPDGMSliceDataset,
+)
 from .inference import run_inference
 from .runner import train_pgan
 
-__all__ = ["UCSFPDGMSliceDataset", "run_inference", "train_pgan"]
+__all__ = [
+    "CohortImageSliceDataset",
+    "MultiCohortImageSliceDataset",
+    "UCSFPDGMSliceDataset",
+    "run_inference",
+    "train_pgan",
+]

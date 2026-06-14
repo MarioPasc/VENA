@@ -20,7 +20,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR_REMOTE="${REPO_DIR_REMOTE:-/mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA}"
 PYTHON="${PYTHON:-/mnt/home/users/tic_163_uma/mpascual/fscratch/conda_envs/vena-v100/bin/python}"
-CONFIG_PATH="${REPO_DIR_REMOTE}/routines/competitors/pgan_cgan/configs/smoke_loginexa_4ep.yaml"
+CONFIG_PATH="${REPO_DIR_REMOTE}/routines/competitors/pgan_cgan/configs/smoke_loginexa_2ep.yaml"
 LOG_DIR="${LOG_DIR:-/mnt/home/users/tic_163_uma/mpascual/execs/VENA/logs/competitors/pgan_cgan}"
 TORCH_HOME="${TORCH_HOME:-${HOME}/.cache/torch}"
 SESSION="${SESSION:-vena-pgan-loginexa-smoke}"

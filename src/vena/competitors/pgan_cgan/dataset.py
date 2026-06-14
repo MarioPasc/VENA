@@ -1,4 +1,4 @@
-"""UCSF-PDGM image-H5 → pGAN 2D-slice dataset.
+"""Cohort image-H5 → pGAN 2D-slice dataset (single- and multi-cohort).
 
 The dataset is deterministic (no augmentation) by contract: VENA owns the
 augmentation regime, the competitor's loader does not. Each ``__getitem__``
@@ -11,16 +11,24 @@ Pipeline per slice:
 3. Apply ``percentile_normalise(0, 99.5, foreground_only=True)`` *over the
    patient-wide foreground statistics* (cached at dataset init time so we
    don't re-read the volume on every slice access).
-4. Pad H/W from native (240, 240) to ``image_size`` (default 256×256,
-   divisible by 4 as required by pGAN's two stride-2 downsampling layers).
+4. Pad H/W to ``image_size`` (default 256×256, divisible by 4 as required
+   by pGAN's two stride-2 downsampling layers). Native shapes vary across
+   cohorts: UCSF-PDGM/UPENN-GBM/IvyGAP/REMBRANDT are (240, 240, 155),
+   BraTS-GLI/LUMIERE are (182, 218, 182). The centred pad handles both.
 5. Rescale ``[0, 1] → [-1, 1]`` to match pGAN's tanh output range.
 
 Returned dict matches pGAN's `CreateDataset` contract:
 ``{'A': source_tensor, 'B': target_tensor, 'A_paths': str, 'B_paths': str}``.
+
+``UCSFPDGMSliceDataset`` is the per-cohort loader (the name is historical —
+the H5 schema is shared across all VENA cohorts). ``MultiCohortImageSliceDataset``
+takes a VENA corpus-registry JSON and concatenates per-cohort datasets so the
+competitor sees the same patient union as VENA's FM trainer.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -29,7 +37,7 @@ import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset
 
 from vena.common import percentile_normalise
 
@@ -191,7 +199,9 @@ class UCSFPDGMSliceDataset(Dataset[dict[str, torch.Tensor | str]]):
 
     def _open(self) -> h5py.File:
         if self._h5 is None:
-            self._h5 = h5py.File(self.image_h5, "r", swmr=True)
+            # Drop SWMR (the writer didn't enable it; some versions of h5py deadlock
+            # on the no-op SWMR handshake under multiprocessing + ConcatDataset).
+            self._h5 = h5py.File(self.image_h5, "r")
         return self._h5
 
     def _get_thresholds(self, pidx: int) -> dict[str, tuple[float, float]]:
@@ -262,6 +272,127 @@ def _pad_to(x: torch.Tensor, size: int) -> torch.Tensor:
     left = pad_w // 2
     right = pad_w - left
     return F.pad(x, (left, right, top, bottom), mode="constant", value=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Multi-cohort wrapper — mirrors VENA's training corpus
+# ---------------------------------------------------------------------------
+# UCSFPDGMSliceDataset's H5 schema is shared across every VENA cohort; the
+# alias below makes the cohort-agnostic intent explicit at call sites.
+CohortImageSliceDataset = UCSFPDGMSliceDataset
+
+
+def _load_corpus_registry(path: Path | str) -> list[dict]:
+    """Read a VENA corpus_registry JSON and return the cohort list."""
+    with Path(path).open("r") as f:
+        registry = json.load(f)
+    if "cohorts" not in registry:
+        raise DatasetError(f"corpus registry {path} missing 'cohorts'")
+    return registry["cohorts"]
+
+
+class MultiCohortImageSliceDataset(Dataset[dict[str, torch.Tensor | str]]):
+    """ConcatDataset over per-cohort ``CohortImageSliceDataset`` instances.
+
+    Reads a VENA corpus-registry JSON (the same file consumed by
+    ``MultiCohortLatentDataModule``) and assembles one per-cohort dataset for
+    every entry with ``role == role_filter`` (default ``"cv"``). Per-cohort
+    datasets are concatenated via ``torch.utils.data.ConcatDataset`` so the
+    DataLoader sees a flat slice index across the entire cohort union.
+
+    A cohort whose split is empty for the requested ``fold`` / ``phase`` is
+    skipped with a WARNING (e.g. REMBRANDT has 0 train patients in fold 0
+    of the Picasso corpus). A cohort whose image_h5 is unreachable is also
+    skipped — this is the contract that lets server-3 / loginexa / Picasso
+    share one corpus JSON when each platform has only a subset of the data
+    mirrored locally.
+    """
+
+    def __init__(
+        self,
+        corpus_registry: Path | str,
+        fold: int,
+        phase: str,
+        input_modalities: Sequence[str] = ("t1pre", "t2", "flair"),
+        target_modality: str = "t1c",
+        image_size: int = 256,
+        min_brain_voxels: int = 1000,
+        max_patients_per_cohort: int | None = None,
+        role_filter: str = "cv",
+        path_overrides: dict[str, Path | str] | None = None,
+    ) -> None:
+        self.corpus_registry = Path(corpus_registry)
+        self.fold = fold
+        self.phase = phase
+        self.input_modalities = tuple(input_modalities)
+        self.target_modality = target_modality
+        self.image_size = image_size
+        self.min_brain_voxels = min_brain_voxels
+        self.max_patients_per_cohort = max_patients_per_cohort
+        self.role_filter = role_filter
+        self.path_overrides = {k: Path(v) for k, v in (path_overrides or {}).items()}
+
+        cohorts = _load_corpus_registry(self.corpus_registry)
+        datasets: list[CohortImageSliceDataset] = []
+        self.cohort_names: list[str] = []
+        self.cohort_sizes: list[int] = []
+        for entry in cohorts:
+            name = entry["name"]
+            if entry.get("role") != role_filter:
+                continue
+            h5 = self.path_overrides.get(name, Path(entry["image_h5"]))
+            if not h5.is_file():
+                logger.warning(
+                    "MultiCohortImageSliceDataset: skipping cohort %s — H5 missing at %s",
+                    name, h5,
+                )
+                continue
+            try:
+                ds = CohortImageSliceDataset(
+                    image_h5=h5,
+                    fold=fold,
+                    phase=phase,
+                    input_modalities=input_modalities,
+                    target_modality=target_modality,
+                    image_size=image_size,
+                    min_brain_voxels=min_brain_voxels,
+                    max_patients=max_patients_per_cohort,
+                )
+            except DatasetError as exc:
+                logger.warning(
+                    "MultiCohortImageSliceDataset: skipping cohort %s — %s", name, exc,
+                )
+                continue
+            if len(ds) == 0:
+                logger.warning(
+                    "MultiCohortImageSliceDataset: cohort %s has 0 slices for "
+                    "fold=%d phase=%s — skipped", name, fold, phase,
+                )
+                continue
+            datasets.append(ds)
+            self.cohort_names.append(name)
+            self.cohort_sizes.append(len(ds))
+
+        if not datasets:
+            raise DatasetError(
+                f"no usable cohorts in {self.corpus_registry} (fold={fold}, phase={phase}, "
+                f"role={role_filter}). Override paths via path_overrides if your platform "
+                f"mirrors data at non-canonical locations."
+            )
+
+        self._concat = ConcatDataset(datasets)
+        logger.info(
+            "MultiCohortImageSliceDataset[%s/fold%d]: %d cohorts, %d total slices "
+            "(per-cohort: %s)",
+            phase, fold, len(datasets), len(self._concat),
+            ", ".join(f"{n}={s}" for n, s in zip(self.cohort_names, self.cohort_sizes)),
+        )
+
+    def __len__(self) -> int:
+        return len(self._concat)
+
+    def __getitem__(self, i: int) -> dict[str, torch.Tensor | str]:
+        return self._concat[i]
 
 
 # Mirror pGAN's CreateDataLoader API so external callers can pretend nothing changed.

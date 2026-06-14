@@ -183,16 +183,33 @@ def train_pgan(cfg, run_dir: Path) -> Path:
     logger.info("pGAN model initialised (input_nc=%d, output_nc=%d, ngf=%d)",
                 opt.input_nc, opt.output_nc, opt.ngf)
 
-    train_ds = UCSFPDGMSliceDataset(
-        image_h5=cfg.image_h5,
-        fold=cfg.fold,
-        phase="train",
-        input_modalities=cfg.input_modalities,
-        target_modality=cfg.target_modality,
-        image_size=cfg.image_size,
-        min_brain_voxels=cfg.min_brain_voxels,
-        max_patients=cfg.max_train_patients,
-    )
+    # Build either a single-cohort or a multi-cohort training dataset, depending
+    # on which leg of DataCfg the config used.
+    if getattr(cfg, "corpus_registry", None):
+        from .dataset import MultiCohortImageSliceDataset
+        overrides = {k: v for k, v in getattr(cfg, "cohort_path_overrides", {}).items()}
+        train_ds = MultiCohortImageSliceDataset(
+            corpus_registry=cfg.corpus_registry,
+            fold=cfg.fold,
+            phase="train",
+            input_modalities=cfg.input_modalities,
+            target_modality=cfg.target_modality,
+            image_size=cfg.image_size,
+            min_brain_voxels=cfg.min_brain_voxels,
+            max_patients_per_cohort=getattr(cfg, "max_patients_per_cohort", None),
+            path_overrides=overrides,
+        )
+    else:
+        train_ds = UCSFPDGMSliceDataset(
+            image_h5=cfg.image_h5,
+            fold=cfg.fold,
+            phase="train",
+            input_modalities=cfg.input_modalities,
+            target_modality=cfg.target_modality,
+            image_size=cfg.image_size,
+            min_brain_voxels=cfg.min_brain_voxels,
+            max_patients=cfg.max_train_patients,
+        )
 
     from torch.utils.data import DataLoader
 
@@ -224,8 +241,16 @@ def train_pgan(cfg, run_dir: Path) -> Path:
             )
             epoch_writer.writeheader()
 
+            # Early stopping — track epoch-level G_L1 mean. Lower is better. Mirrors
+            # VENA's "ema_best on train/total_epoch" selection for a fair comparison.
+            best_loss: float = float("inf")
+            best_epoch: int = -1
+            no_improve_epochs: int = 0
+            max_total_epochs = min(opt.niter + opt.niter_decay, cfg.max_epochs)
+
             global_step = 0
-            for epoch in range(opt.epoch_count, opt.niter + opt.niter_decay + 1):
+            stopped_early = False
+            for epoch in range(opt.epoch_count, max_total_epochs + 1):
                 epoch_start = time.time()
                 acc: dict[str, list[float]] = {
                     "G_GAN": [], "G_L1": [], "G_VGG": [], "D_real": [], "D_fake": [],
@@ -274,13 +299,35 @@ def train_pgan(cfg, run_dir: Path) -> Path:
                     epoch, wall, means["G_L1_mean"], means["G_VGG_mean"], means["G_GAN_mean"],
                 )
 
-                if epoch % cfg.save_epoch_freq == 0 or epoch == opt.niter + opt.niter_decay:
+                if epoch % cfg.save_epoch_freq == 0 or epoch == max_total_epochs:
                     model.save(epoch)
                     logger.info("saved checkpoint %d_net_{G,D}.pth", epoch)
                 model.save("latest")
                 model.update_learning_rate()
 
-    logger.info("pGAN training completed — %d epochs, %d steps", epoch, global_step)
+                # Best-G tracking + patience-based early stopping.
+                metric = means["G_L1_mean"]
+                if metric < best_loss - 1e-6:
+                    best_loss = metric
+                    best_epoch = epoch
+                    no_improve_epochs = 0
+                    model.save("best")
+                    logger.info("new best epoch %d (G_L1=%.4f) — saved best_net_{G,D}.pth",
+                                epoch, metric)
+                else:
+                    no_improve_epochs += 1
+                    if cfg.patience > 0 and no_improve_epochs >= cfg.patience:
+                        logger.info(
+                            "early stopping at epoch %d (no improvement for %d epochs; "
+                            "best was epoch %d at G_L1=%.4f)",
+                            epoch, no_improve_epochs, best_epoch, best_loss,
+                        )
+                        stopped_early = True
+                        break
+
+    logger.info("pGAN training completed — %d epochs, %d steps (stopped_early=%s, "
+                "best_epoch=%d, best_G_L1=%.4f)",
+                epoch, global_step, stopped_early, best_epoch, best_loss)
     # Sentinel string consumed by skill completion checks.
     logger.info("pGAN-train completed")
     return run_dir

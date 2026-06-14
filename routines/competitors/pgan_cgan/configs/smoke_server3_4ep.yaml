@@ -1,21 +1,22 @@
-# Smoke run for the pGAN competitor on the ICAI server-3 workstation.
-# 4 training patients × all valid axial slices, 4 epochs total (3 constant LR + 1 decay).
-# Expected wallclock on RTX 4090: ~10 min.
+# Multi-cohort smoke on the ICAI server-3 workstation.
+# Reads VENA's server-3 corpus registry (6 cv cohorts), capped at 1 patient per
+# cohort to keep the smoke under 5 min on RTX 4090.
+# Expected wallclock: ~5-7 min for 4 epochs.
 runtime:
   experiments_root: /media/hddb/mario/experiments/competitors/pgan_cgan
   platform: server3
-  tag: smoke_4ep
+  tag: smoke_4ep_multicohort
   gpu_ids: [0]
   seed: 1337
 
 data:
-  image_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_image.h5
+  corpus_registry: /home/mariopascual/projects/VENA/routines/fm/train/configs/corpus/corpus_server3.json
   fold: 0
   input_modalities: [t1pre, t2, flair]
   target_modality: t1c
   image_size: 256
   min_brain_voxels: 1000
-  max_train_patients: 4
+  max_patients_per_cohort: 1   # 1 patient per cv cohort → ~6 patients total
 
 hp:
   input_nc: 3
@@ -35,9 +36,15 @@ hp:
   lr_policy: lambda
   lr_decay_iters: 50
   epoch_count: 1
-  niter: 3            # 3 epochs constant LR
-  niter_decay: 1      # 1 epoch decay  →  4 total
+  niter: 3
+  niter_decay: 1
   batchSize: 1
   save_epoch_freq: 1
   log_every: 50
-  num_workers: 4
+  # num_workers=0 — multi-cohort H5 hits an h5py + multiprocessing deadlock when
+  # multiple workers open the same files concurrently. Smokes are fast enough
+  # in-process; the full Picasso run keeps num_workers=8 because the worker
+  # fan-out is one-h5-per-cohort and we accept the warm-up cost.
+  num_workers: 0
+  max_epochs: 4
+  patience: 0   # disable early-stop for smoke

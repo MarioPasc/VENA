@@ -1,22 +1,31 @@
-# Full pGAN training on Picasso A100 DGX node.
-# UCSF-PDGM fold 0 — train + val partitions of the 445 non-test patients.
-# 50 epochs constant LR + 50 epochs linear decay (Dar et al. 2019 paper recipe).
-# Expected wallclock: ~24-36 h on a single A100.
+# Picasso A100 full pGAN training — multi-cohort, fair-comparison with VENA's
+# routines/fm/train/configs/runs/picasso_s1_1000ep_fft.yaml.
+#
+# Reads the same corpus registry VENA uses (corpus_picasso.json: 6 cv cohorts —
+# UCSF-PDGM + BraTS-GLI + UPENN-GBM + IvyGAP + LUMIERE + REMBRANDT), same fold,
+# same seed, same epoch cap, same patience. Total fold-0 train union ≈ 1698
+# patients (vs single-cohort UCSF-PDGM = 356).
+#
+# Paired comparison axes:
+#   seed=1337, fold=0, max_epochs=10000, patience=100, walltime 7d, batch 4,
+#   workers 8, checkpoint every 25 epochs.
+#
+# Competitor-internal hyperparams stay at Dar et al. 2019 §3 defaults.
 runtime:
-  experiments_root: /mnt/home/users/tic_163_uma/mpascual/fscratch/experiments/competitors/pgan_cgan
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/pgan_cgan
   platform: picasso
-  tag: full
+  tag: full_multicohort
   gpu_ids: [0]
   seed: 1337
 
 data:
-  image_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSF_PDGM/h5/UCSFPDGM_image.h5
+  corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
   fold: 0
   input_modalities: [t1pre, t2, flair]
   target_modality: t1c
   image_size: 256
   min_brain_voxels: 1000
-  max_train_patients: null
+  max_patients_per_cohort: null   # use the full fold-0 train union per cohort
 
 hp:
   input_nc: 3
@@ -36,9 +45,11 @@ hp:
   lr_policy: lambda
   lr_decay_iters: 50
   epoch_count: 1
-  niter: 50
-  niter_decay: 50
-  batchSize: 1
-  save_epoch_freq: 10
+  niter: 5000
+  niter_decay: 5000
+  batchSize: 4
+  save_epoch_freq: 25
   log_every: 200
   num_workers: 8
+  max_epochs: 10000
+  patience: 100

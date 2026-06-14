@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #SBATCH -J vena-pgan-picasso-full
-#SBATCH --time=2-00:00:00
+#SBATCH --time=7-00:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --constraint=dgx
+#SBATCH --partition=gpu_partition
 #SBATCH --gres=gpu:1
 #SBATCH --output=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/pgan_picasso_full_%j.out
 #SBATCH --error=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/pgan_picasso_full_%j.err

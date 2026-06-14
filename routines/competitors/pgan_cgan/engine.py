@@ -56,14 +56,34 @@ def _short_git_sha(repo_root: Path) -> str:
 # Pydantic config
 # ---------------------------------------------------------------------------
 class DataCfg(BaseModel):
-    """Where to read VENA's image-domain H5 from and how to slice it."""
-    image_h5: Path
+    """Where to read VENA's image-domain data from and how to slice it.
+
+    Two modes:
+
+    1. **Single-cohort** (smoke / sanity): set ``image_h5`` to a UCSF-PDGM-schema
+       H5; the runner builds a ``UCSFPDGMSliceDataset`` directly. Used for fast
+       per-cohort sanity checks.
+    2. **Multi-cohort** (production / fair comparison vs VENA): set
+       ``corpus_registry`` to a VENA corpus-registry JSON; the runner builds a
+       ``MultiCohortImageSliceDataset`` that concatenates every cohort with
+       ``role="cv"``. This matches VENA's FM-train data path exactly.
+
+    Exactly one of ``image_h5`` or ``corpus_registry`` must be set.
+    """
+    image_h5: Path | None = None
+    corpus_registry: Path | None = None
     fold: int = 0
     input_modalities: tuple[str, ...] = ("t1pre", "t2", "flair")
     target_modality: str = "t1c"
     image_size: int = 256
     min_brain_voxels: int = 1000
     max_train_patients: int | None = None
+    max_patients_per_cohort: int | None = None
+    # Per-platform overrides — corpus_registry's image_h5 may be Picasso-canonical
+    # while the smoke runs on server-3 with a different mount path. Keys are
+    # cohort names (e.g. "UCSF-PDGM"); values are absolute paths to that
+    # cohort's image H5 on the running platform.
+    cohort_path_overrides: dict[str, Path] = Field(default_factory=dict)
 
 
 class HyperParamsCfg(BaseModel):
@@ -91,6 +111,12 @@ class HyperParamsCfg(BaseModel):
     save_epoch_freq: int = 1
     log_every: int = 25
     num_workers: int = 4
+    # Epoch cap + patience-based early stopping. Mirrors the FM-train recipe
+    # in ``routines/fm/train/configs/runs/picasso_s1_1000ep_fft.yaml``:
+    # max_epochs is the hard cap; patience > 0 enables early stopping on
+    # epoch-level G_L1 mean (the metric analogue of VENA's train/total_epoch).
+    max_epochs: int = 100
+    patience: int = 0
 
 
 class RuntimeCfg(BaseModel):
@@ -118,6 +144,10 @@ class PGANCompetitorConfig(BaseModel):
         if self.hp.output_nc != 1:
             raise ValueError(
                 f"pGAN target is single-channel; hp.output_nc={self.hp.output_nc}"
+            )
+        if bool(self.data.image_h5) == bool(self.data.corpus_registry):
+            raise ValueError(
+                "DataCfg requires exactly one of {image_h5, corpus_registry} to be set."
             )
         return self
 
@@ -149,6 +179,9 @@ class PGANCompetitorEngine:
         d, h = self.cfg.data, self.cfg.hp
         return SimpleNamespace(
             image_h5=d.image_h5,
+            corpus_registry=d.corpus_registry,
+            cohort_path_overrides=d.cohort_path_overrides,
+            max_patients_per_cohort=d.max_patients_per_cohort,
             fold=d.fold,
             input_modalities=d.input_modalities,
             target_modality=d.target_modality,
@@ -178,6 +211,8 @@ class PGANCompetitorEngine:
             save_epoch_freq=h.save_epoch_freq,
             log_every=h.log_every,
             num_workers=h.num_workers,
+            max_epochs=h.max_epochs,
+            patience=h.patience,
             gpu_ids=self.cfg.runtime.gpu_ids,
         )
 
@@ -189,7 +224,6 @@ class PGANCompetitorEngine:
         return h.hexdigest()
 
     def _write_decision(self, run_dir: Path, completed: bool) -> None:
-        h5 = self.cfg.data.image_h5
         decision = {
             "schema_version": "1.0",
             "produced_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -209,14 +243,16 @@ class PGANCompetitorEngine:
             "seed": self.cfg.runtime.seed,
             "git_sha": _short_git_sha(self.repo_root),
             "data": {
-                "image_h5": str(h5),
-                "image_h5_size_bytes": h5.stat().st_size if h5.is_file() else None,
+                "image_h5": str(self.cfg.data.image_h5) if self.cfg.data.image_h5 else None,
+                "corpus_registry": str(self.cfg.data.corpus_registry) if self.cfg.data.corpus_registry else None,
+                "cohort_path_overrides": {k: str(v) for k, v in self.cfg.data.cohort_path_overrides.items()},
                 "fold": self.cfg.data.fold,
                 "input_modalities": list(self.cfg.data.input_modalities),
                 "target_modality": self.cfg.data.target_modality,
                 "image_size": self.cfg.data.image_size,
                 "min_brain_voxels": self.cfg.data.min_brain_voxels,
                 "max_train_patients": self.cfg.data.max_train_patients,
+                "max_patients_per_cohort": self.cfg.data.max_patients_per_cohort,
             },
             "hyperparams": self.cfg.hp.model_dump(),
             "runtime": {
@@ -228,9 +264,12 @@ class PGANCompetitorEngine:
         (run_dir / "decision.json").write_text(json.dumps(decision, indent=2))
 
     def _preflight(self) -> None:
-        h5 = self.cfg.data.image_h5
-        if not h5.is_file():
-            raise FileNotFoundError(f"image H5 missing: {h5}")
+        if self.cfg.data.image_h5 is not None and not self.cfg.data.image_h5.is_file():
+            raise FileNotFoundError(f"image H5 missing: {self.cfg.data.image_h5}")
+        if self.cfg.data.corpus_registry is not None and not self.cfg.data.corpus_registry.is_file():
+            raise FileNotFoundError(
+                f"corpus_registry missing: {self.cfg.data.corpus_registry}"
+            )
         # Walk up two levels (bucket + per-competitor subdir) and ensure that
         # ancestor exists — this catches typos in experiments_root while still
         # letting us create the competitor's own bucket dir on first run.
