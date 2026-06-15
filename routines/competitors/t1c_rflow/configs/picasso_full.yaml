@@ -1,0 +1,48 @@
+# Picasso A100 full T1C-RFlow training — multi-cohort, fair-comparison with
+# VENA's routines/fm/train/configs/runs/picasso_s1_1000ep_fft.yaml.
+#
+# Reads the same corpus registry VENA uses (corpus_picasso.json: 6 cv cohorts —
+# UCSF-PDGM + BraTS-GLI + UPENN-GBM + IvyGAP + LUMIERE + REMBRANDT), same fold,
+# same seed, same epoch cap, same patience. Total fold-0 train union ≈ 1698
+# patients (vs single-cohort UCSF-PDGM = 356).
+#
+# Paired comparison axes (match VENA's reference run exactly):
+#   seed=1337, fold=0, max_epochs=10000, patience=100, walltime 7d, batch 4,
+#   workers 8, checkpoint every 25 epochs.
+#
+# Competitor-internal hyperparameters preserved from Eidex et al. 2025 §4:
+#   AdamW(lr=1e-5, betas=(0.9,0.999), wd=1e-4), L1 velocity loss, no EMA,
+#   no augmentation, no gradient clipping. AMP enabled (upstream code uses it
+#   even though the paper text is silent on it — see UPSTREAM.md §Differences).
+#
+# Citation: Eidex, Z. et al., "An Efficient 3D Latent Diffusion Model for
+# T1-contrast Enhanced MRI Generation," arXiv:2509.24194, 2025.
+runtime:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/t1c_rflow
+  platform: picasso
+  tag: full_multicohort
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  input_latents: [t1pre, flair]
+  target_latent: t1c
+  max_patients_per_cohort: null   # use the full fold-0 train union per cohort
+
+hp:
+  # unet_arch_config defaults to the vendored config_maisi3d-rflow.json under
+  # src/external/t1c_rflow/upstream/maisi/configs/.
+  latent_channels: 4
+  cond_latents: 2
+  nfe_train_timesteps: 1000
+  lr: 1.0e-5
+  weight_decay: 1.0e-4
+  batch_size: 4
+  max_epochs: 10000
+  patience: 100
+  save_epoch_freq: 25
+  log_every: 200
+  num_workers: 8
+  use_amp: true

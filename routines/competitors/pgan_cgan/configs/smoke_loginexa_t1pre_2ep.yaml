@@ -1,0 +1,44 @@
+# Loginexa smoke — pGAN single-modality t1pre → t1c (paper-faithful).
+# 1 patient per cv cohort × 2 epochs, batch 16, V100 sm_70 (vena-v100 env).
+runtime:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/VENA/experiments/competitors/pgan_cgan
+  platform: loginexa
+  tag: smoke_t1pre_2ep
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  input_modalities: [t1pre]        # single source modality — paper-faithful
+  target_modality: t1c
+  image_size: 256
+  min_brain_voxels: 1000
+  max_patients_per_cohort: 1
+
+hp:
+  input_nc: 1                       # one channel (one modality, one slice)
+  output_nc: 1
+  ngf: 64
+  ndf: 64
+  n_layers_D: 3
+  norm: instance
+  init_type: normal
+  no_dropout: false
+  pool_size: 0
+  lambda_A: 100.0
+  lambda_vgg: 100.0
+  lambda_adv: 1.0
+  lr: 0.0002
+  beta1: 0.5
+  lr_policy: lambda
+  lr_decay_iters: 50
+  epoch_count: 1
+  niter: 1
+  niter_decay: 1
+  batchSize: 16                     # 1-channel input → ample V100 headroom
+  save_epoch_freq: 1
+  log_every: 25
+  num_workers: 4                    # 4 was deadlock-free in earlier smokes
+  max_epochs: 2
+  patience: 0

@@ -142,6 +142,55 @@ Hard constraints:
    should accept a `patience` knob (epochs without improvement → early stop) and a
    `max_epochs` cap that mirrors VENA's reference recipe.
 
+### Step 3.3 — One-to-one vs many-to-one input handling
+
+VENA's task is **multi-contrast** (`{T1pre, T2, FLAIR, …}` → `T1c`), but most
+published synthesis competitors are **one-to-one** (one source modality → one
+target). Before building the wrapper, identify which paradigm the competitor
+was trained for. Reading the upstream `--input_nc` flag is not enough; trace
+where it lands in the model:
+
+- **`input_nc` = number of source modalities** (channels are modalities) →
+  **many-to-one** model. McCaD, CFM (latent), TumorFlow, MM-GAN, MM-pix2pix
+  fall here. The wrapper hands the model `(B, M, H, W)` with M = number of
+  modalities; the comparison fits VENA's data on a single run.
+- **`input_nc` = number of neighbouring 2D slices of one modality** (channels
+  are axial neighbours of the same volume) → **one-to-one** model. **pGAN**
+  (Dar 2019), Replica, pix2pix-MR, plain CycleGAN are here. The model only
+  knows how to translate one modality. Feeding it stacked multi-modal inputs
+  is out-of-distribution and **not** what the authors validated.
+
+**Treat one-to-one models as a panel**, never as a single multi-modal run.
+For VENA's `{T1pre, T2, FLAIR} → T1c` task that means three independent
+training runs (`t1pre→t1c`, `t2→t1c`, `flair→t1c`), each with its own
+`picasso_full_<source>.yaml`, run id (`tag: full_<src>_<tgt>`), and inference
+output directory. Report results per-source in the paper's competitor table.
+Reviewers expect this; mixing modalities in `input_nc` would be a fairness
+red flag.
+
+### Step 3.3.5 — Image-domain vs latent-domain competitor
+
+A second axis (orthogonal to one-to-one vs many-to-one) is whether the
+competitor operates in **image space** (pGAN, McCaD, Replica, Pix2pix) or
+**latent space** (T1C-RFlow, CFM, TumorFlow, latent DDPM). The two paths
+have a different data contract that flows through every layer:
+
+| Aspect | Image-domain | Latent-domain |
+|---|---|---|
+| Dataset reads | `cohort.image_h5` | `cohort.latent_h5` |
+| `__getitem__` returns | `(B, C, H, W[, D])` slices/volumes in `[-1, 1]` or `[0, 1]` | `{patient_id, z_<mod>: (C, h, w, d)}` from `latents/<mod>` |
+| `image_size`, padding, percentile-norm | live in the dataset | **absent** — latents are pre-shaped by VENA's encoder |
+| Training-time augmentation pressure | available (be disciplined: turn it OFF) | available via stochastic `z = μ + σε` per step — paper-faithful for some upstreams, off by default in VENA's stored z (document this deviation) |
+| Sampler | model forward only | model forward + scheduler step loop (FM/diffusion) |
+| **Inference decode for image-space metrics** | none — model already lives in image space | mandatory — see Step 3.6 |
+| `corpus_path_overrides` keyed on | `image_h5` | `latent_h5` |
+| Multi-cohort skip-with-WARNING | "image_h5 missing" | "latent_h5 missing" *or* "no `latent_h5` field in registry entry" (some test_only cohorts only carry image_h5) |
+
+The latent-domain reader skeleton is shorter than the image-domain one (no
+`_pad_to`, no per-patient percentile cache, no slice index — one item =
+one patient). Reuse `T1CRFlowLatentDataset` from
+`src/vena/competitors/t1c_rflow/dataset.py` as the canonical template.
+
 ### Step 3.4 — Cohort schema heterogeneity (real, hit on pGAN integration)
 
 The VENA corpus is **not** schema-uniform. Two failure modes silently drop
@@ -201,6 +250,125 @@ Mitigation by config:
   full epoch.
 - The dataset's `_open()` must open in plain `"r"` mode (no SWMR).
 
+### Step 3.6 — Latent-domain inference primitives (real, hit on T1C-RFlow integration)
+
+When a latent-domain competitor needs to decode predicted latents back to
+image space for PSNR/SSIM, the canonical decode pipeline is
+**`vena.common.MaisiDecoder(load_autoencoder(ckpt))` + `decode_box`**, plus
+`build_crop_spec_from_h5` / `load_real_t1c_box` from
+`vena.model.fm.eval.exhaustive` for the real-T1c reference. Three traps
+along that path cost ~10 min of ssh round-trip the first time they hit:
+
+1. **`vena.common.load_autoencoder(checkpoint_path, …)` has no default
+   checkpoint.** It accepts `(checkpoint_path, device, arch_config, arch_overrides)`
+   as positional/keyword. Surface the path in the wrapper's
+   `infer_cli.py` as `--vae-checkpoint` (required, with a clear error from
+   `run_inference` if absent) and document the per-platform path in the
+   validation note. Canonical paths live in `src/external/LINKS.md`:
+   - server-3: `/media/hddb/mario/checkpoints/MAISI_V2_RM/NV-Generate-MR/models/autoencoder_v2.pt`
+   - Picasso: `/mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt`
+
+2. **`AutoencoderHandle` is *not* a decoder.** It carries `model`,
+   `device`, `checkpoint_path`, `checkpoint_sha256`, `arch_kwargs` — no
+   `.decoder` attribute. Wrap it: `vae_decoder = MaisiDecoder(handle)`.
+   `MaisiDecoder` accepts sliding-ROI / overlap / mode / precision kwargs;
+   the defaults `(20, 20, 8)`, `0.4`, `gaussian`, `autocast` match VENA's
+   exhaustive-val.
+
+3. **`vena.common.percentile_normalise` expects a 5-D `(B, C, H, W, D)`
+   tensor** when `foreground_only=True`, but `load_real_t1c_box` returns
+   3-D `(H, W, D)`. Wrap before, unwrap after:
+   `percentile_normalise(real[None, None], lower=0, upper=99.5,
+   foreground_only=True)[0, 0]`. Without the wrap you get a cryptic
+   `expects (B,C,H,W,D); got shape (192, 224, 192)` and **the patient is
+   skipped** — the inference run completes successfully with 0 rows in
+   `metrics.csv`, which reads like a silent success. Guard against this
+   with a post-condition: `assert summary["n_patients_succeeded"] > 0` in
+   the wrapper or the validation watcher.
+
+These three are pre-emptable in the inference.py skeleton; copy
+`src/vena/competitors/t1c_rflow/inference.py` verbatim for the next
+latent-domain competitor.
+
+### Step 3.7 — Upstream code vs paper text incoherency check (real, hit on T1C-RFlow integration)
+
+Many synthesis papers ship code where the released script does **not**
+match what the paper text claims. **VENA policy (locked 2026-06-15):
+follow the peer-reviewed paper text. The code is not peer-reviewed.**
+When the wrapper diverges from the upstream-as-released, that is by
+design — and it is the *code* that is suspect, not the wrapper. The
+load-bearing axis to check is whether the code does something more
+favourable than the paper text claims, since that is method laundering
+even when unintentional.
+
+Open `UPSTREAM.md` with a *Differences between upstream paper text and
+upstream code* section. Tabulate every divergence with:
+
+| Column | What goes in it |
+|---|---|
+| Axis | what is disagreeing (architecture, scheduler kwarg, loss, optimiser, etc.) |
+| Paper text | verbatim quote + section number |
+| Released code | line reference in `src/external/<name>/upstream/<file>.py` |
+| Load-bearing? | YES / NO / MARGINAL — does this affect reported metrics? |
+| Direction of advantage | which version gives better numbers, and roughly how much |
+
+Backbone-required overrides (config-flag-bug fixed at runtime, e.g.
+T1C-RFlow's `use_discrete_timesteps`) are **not** load-bearing — call them
+out anyway. Architectural divergences (channel counts, attention) and
+training-data choices (un-announced VAE retraining on test-adjacent
+data) **are** load-bearing — those are the ones that change the result.
+
+When following the paper, document the wrapper's architecture choice in
+the validation note's paired-axes table and in
+`decision.json["competitor"]["deviations"]` with a key like
+`unet_architecture: paper_faithful_3level`. The code-version may be
+re-introduced later as a **separate ablation row**, never as the headline
+number.
+
+Triage protocol — once vendored, before writing the runner:
+
+```bash
+# Quick diff between paper claim and code reality.
+grep -nE "in_channels|num_channels|attention|num_train_timesteps|use_discrete|sample_method|autocast|GradScaler|lr|weight_decay|EMA|num_res_blocks" \
+    src/external/<name>/upstream/train_*.py \
+    src/external/<name>/upstream/**/configs/*.json
+```
+
+Every line that contradicts a number in the paper text gets a row in the
+incoherency table. If the load-bearing column has any YES, the user must
+be flagged: the wrapper's defaults follow paper text on those rows; ask
+the user to confirm before writing any "follow the code instead" override.
+
+#### T1C-RFlow incoherency table (worked example)
+
+| # | Axis | Paper text | Released code | Load-bearing? | Direction |
+|---|---|---|---|---|---|
+| 1 | U-Net | `[128, 128, 256]`, 3 levels, 2 res-blocks, no attention | `[64, 128, 256, 512]`, 4 levels, attention at last 2, **178.6 M params** | **HIGH** | code > paper text (≥1-2 dB) |
+| 2 | `use_discrete_timesteps` | implies discrete | JSON `false`, script forces `True` | NO | backbone constraint |
+| 3 | AMP | §4 silent | `GradScaler` + `autocast(fp16)` | LOW | ≤0.1 dB |
+| 4 | VAE | cites Guo 2024 MAISI | ships `autoencoder_epoch273.pt` (their retraining) | **HIGH** | code > paper text, ceiling-shift |
+
+Wrapper takes rows 1 and 4 from the paper (architecture: **49.6 M params**;
+VAE: VENA's MAISI-V2 — symmetric to our own model). Rows 2 and 3 keep
+the code's runtime behaviour because both are forced by the backbone /
+hardware.
+
+### Step 3.8 — Direct MONAI scheduler instantiation (real, hit on T1C-RFlow integration)
+
+VENA's `vena.model.fm.sampler.rflow.RFlowEngine` is a thin wrapper around
+`monai.networks.schedulers.rectified_flow.RFlowScheduler` that **does not
+expose** `use_timestep_transform` or `base_img_size_numel`. Several
+latent-flow upstream scripts (including T1C-RFlow's
+`train_rflow.py:136-143`) set both. Instantiate the MONAI scheduler
+directly in the wrapper's `runner.py` and pin the paper's exact kwargs.
+Do **not** extend `RFlowEngine` — it serves VENA's FM trainer and is not
+meant to grow per-competitor knobs.
+
+Same call site for inference: build the scheduler in `inference.py` with
+the same kwargs and use `scheduler.set_timesteps(num_inference_steps=K,
+input_img_size_numel=numel(z_curr))` per the upstream's `test_*.py`
+pattern (T1C-RFlow `test_rflow.py:269-283`).
+
 ### Step 4 — Build the routine
 
 ```
@@ -233,6 +401,17 @@ Register the console script in `pyproject.toml [project.scripts]` exactly as
 `vena-competitor-<name> = "routines.competitors.<name>.cli:main"` and the inference
 sibling as `vena-competitor-<name>-infer`.
 
+**Picasso path case-sensitivity (real, hit on T1C-RFlow integration).**
+`experiments_root` on Picasso must use `…/execs/vena/experiments/…`
+(**lowercase** `vena`). The directory `…/execs/VENA/…` (uppercase) does
+not exist. The engine's `_preflight` fails fast on
+`experiments_root.parent.parent.exists()` so the mismatch surfaces
+immediately, but a sibling pGAN config under the same routine tree may
+use the wrong case and template-copy errors will silently propagate. When
+copying YAMLs across competitors, grep for `execs/VENA` and lowercase
+every occurrence. (The log directory under `…/execs/VENA/logs/` is fine —
+launchers `mkdir -p` it on the fly.)
+
 ### Step 5 — Per-platform launchers
 
 The three platforms have different transports. Match the templates exactly.
@@ -240,9 +419,19 @@ The three platforms have different transports. Match the templates exactly.
 **Server-3 (ICAI workstation, RTX 4090, no SLURM).**
 - Pattern: rsync repo → ssh → `screen -dmS <session>` → return.
 - Use `screen` (tmux not installed). Session anchor: `vena-<name>-smoke`.
-- Pre-warm any pretrained-weight cache on icai-server (it has internet).
+- Pre-warm any pretrained-weight cache on icai-server (it has internet). **No
+  VGG pre-warm needed for non-perceptual competitors** (FM-only, RFlow-only,
+  diffusion-only) — drop the step from copied launcher templates.
 - GPU 0 is the FM-train target; check which GPU is free with `nvidia-smi --query-gpu=memory.free --format=csv,noheader`.
 - Conda env: `~/.conda/envs/vena/bin/python` on `icai-server`.
+- **rsync excludes (real, hit on T1C-RFlow integration).** When the
+  vendored upstream ships Git LFS payloads (T1C-RFlow has an 80 MB VAE
+  checkpoint at `src/external/<name>/upstream/checkpoints/`), add
+  `--exclude="src/external/<name>/upstream/checkpoints/"` to the launcher's
+  rsync excludes. VENA uses its own MAISI-V2 checkpoint via
+  `src/external/LINKS.md`; the upstream LFS payload is dead weight on the
+  remote and a slow first-rsync. Re-`pip install -e .` on the remote after
+  the first rsync of a new competitor so the entry points get registered.
 
 **Loginexa (Picasso V100-DGXS-32GB interactive node).**
 - Loginexa is NOT a SLURM partition. It is an SSH-accessible interactive node at
@@ -424,6 +613,21 @@ ssh picasso "/mnt/home/users/tic_163_uma/mpascual/fscratch/conda_envs/vena/bin/p
    competitor's vendored snapshot is independent.
 8. **Submitting the full Picasso run without the user's go-ahead.** Acceptance is the
    dry-run; the user gates the actual A100 spend.
+9. **Calling `load_autoencoder()` without `checkpoint_path`.** It has no
+   default. Surface the path in `--vae-checkpoint` (required) and read
+   from `src/external/LINKS.md` per platform. See Step 3.6.
+10. **Treating `AutoencoderHandle` as a decoder.** It is not. Wrap it:
+    `MaisiDecoder(handle)`. See Step 3.6.
+11. **Passing 3-D tensors to `percentile_normalise(foreground_only=True)`.**
+    It expects 5-D `(B, C, H, W, D)`. Wrap with `[None, None]` before and
+    `[0, 0]` after. The 3-D failure mode silently drops every patient and
+    your `metrics.csv` ends up empty — the inference job *exits 0* and
+    looks successful. See Step 3.6.
+12. **Skipping the post-inference success assertion.** After
+    `run_inference` returns, the wrapper (or the watcher) must verify
+    `summary.json["n_patients_succeeded"] > 0`. Without this, a per-patient
+    exception that hits every patient is invisible: the wall log says
+    "inference complete: wrote 0 rows" and exits 0.
 
 ## Mental checklist
 
@@ -436,6 +640,17 @@ ssh picasso "/mnt/home/users/tic_163_uma/mpascual/fscratch/conda_envs/vena/bin/p
 - [ ] Smoke configs set `num_workers: 0` (multi-cohort h5py deadlock).
 - [ ] Runner saves `best_net_*` on epoch-metric improvement and supports `patience`.
 - [ ] Unit tests pin: determinism, shape/range, multi-cohort concat, missing-cohort fallback, **longitudinal patient→scan resolver (BraTS-GLI, LUMIERE), flat-splits fallback (REMBRANDT)**.
+- [ ] **One-to-one vs many-to-one disambiguated** (see Step 3.3). If one-to-one, the picasso job count = number of source modalities (3 for VENA's standard input set), each with its own config + run id + inference dir.
+- [ ] **Image-domain vs latent-domain disambiguated** (see Step 3.3.5). Latent-domain reads `cohort.latent_h5`, returns `(C, h, w, d)` per patient, needs the Step 3.6 decode trio at inference.
+- [ ] **Upstream paper-vs-code incoherency table** in `UPSTREAM.md` enumerated (see Step 3.7). Wrapper follows the code.
+- [ ] **Latent-domain inference primitives wired correctly** (see Step 3.6):
+      `--vae-checkpoint` is required; `MaisiDecoder(load_autoencoder(ckpt))`;
+      `percentile_normalise(real[None,None], …)[0,0]`; post-condition
+      `summary.json["n_patients_succeeded"] > 0` asserted.
+- [ ] **Picasso `experiments_root` uses lowercase `…/execs/vena/…`**, not `VENA` (see Step 4 note).
+- [ ] **rsync excludes the upstream's LFS payload** at
+      `src/external/<name>/upstream/checkpoints/` if present (see Step 5
+      server-3 note).
 - [ ] Engine writes `decision.json` v1.0 with the competitor + corpus_registry block.
 - [ ] Three platform launchers exist and dry-run cleanly.
 - [ ] Console scripts registered in `pyproject.toml`.

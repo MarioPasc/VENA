@@ -1,0 +1,35 @@
+# T1C-RFlow (Eidex et al. 2025, arXiv:2509.24194) — multi-cohort smoke on the
+# ICAI server-3 workstation (RTX 4090 24GB).
+#
+# Reads VENA's server-3 corpus registry (latent_h5 path per cohort), capped at
+# 1 patient per cv cohort to keep the smoke under 10 min.
+runtime:
+  experiments_root: /media/hddb/mario/experiments/competitors/t1c_rflow
+  platform: server3
+  tag: smoke_4ep_multicohort
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  corpus_registry: /home/mariopascual/projects/VENA/routines/fm/train/configs/corpus/corpus_server3.json
+  fold: 0
+  input_latents: [t1pre, flair]
+  target_latent: t1c
+  max_patients_per_cohort: 1   # 1 patient per cv cohort
+
+hp:
+  # unet_arch_config defaults to the vendored config_maisi3d-rflow.json
+  latent_channels: 4
+  cond_latents: 2
+  nfe_train_timesteps: 1000
+  lr: 1.0e-5
+  weight_decay: 1.0e-4
+  batch_size: 1               # smoke — keep VRAM low on a shared 4090
+  max_epochs: 4
+  patience: 0                 # disable early stop for smoke
+  save_epoch_freq: 1
+  log_every: 5
+  # num_workers=0 — multi-cohort H5 hits an h5py + multiprocessing deadlock
+  # when several workers open the same family concurrently (skill §3.5).
+  num_workers: 0
+  use_amp: true

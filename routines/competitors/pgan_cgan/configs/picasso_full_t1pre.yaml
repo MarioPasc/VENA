@@ -1,0 +1,45 @@
+# Picasso A100 — pGAN t1pre → t1c (paper-faithful, one-to-one).
+# Mirrors picasso_s1_1000ep_fft.yaml on every axis where comparison is fair;
+# competitor-internal knobs left at paper defaults (Dar et al. 2019 §3).
+runtime:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/pgan_cgan
+  platform: picasso
+  tag: full_t1pre_t1c
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  input_modalities: [t1pre]
+  target_modality: t1c
+  image_size: 256
+  min_brain_voxels: 1000
+  max_patients_per_cohort: null
+
+hp:
+  input_nc: 1
+  output_nc: 1
+  ngf: 64
+  ndf: 64
+  n_layers_D: 3
+  norm: instance
+  init_type: normal
+  no_dropout: false
+  pool_size: 0
+  lambda_A: 100.0
+  lambda_vgg: 100.0
+  lambda_adv: 1.0
+  lr: 0.0002
+  beta1: 0.5
+  lr_policy: lambda
+  lr_decay_iters: 50
+  epoch_count: 1
+  niter: 5000
+  niter_decay: 5000
+  batchSize: 32         # 1-channel input → A100 40GB has ample headroom
+  save_epoch_freq: 25
+  log_every: 200
+  num_workers: 4        # 4 was deadlock-free; 8 surfaced contention earlier
+  max_epochs: 10000
+  patience: 100

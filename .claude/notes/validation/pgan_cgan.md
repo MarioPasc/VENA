@@ -129,9 +129,21 @@ load. Persistent inconsistencies show up in
 silent omissions.
 
 **SWAN is intentionally absent** — none of the VENA cv cohorts store SWAN in
-their image H5. The paper's original recipe used multi-contrast inputs anyway
-(T1↔T2↔PD); 3 modalities → T1c is the direct analogue for the
-gadolinium-synthesis task.
+their image H5.
+
+**pGAN is a one-to-one model.** `--input_nc=3` in the paper does NOT mean
+"three modalities stacked as channels"; it means *three neighbouring 2D
+slices of one modality* (current + previous + next, a 2.5-D context).
+Modalities live in different `.mat` files. An initial multimodal stacking
+(`{T1pre, T2, FLAIR}` → 3 channels) was tried on Picasso job 1075813 — it
+trains and the loss descends, but the model is operating out-of-distribution
+relative to what the authors validated. For the paper-faithful comparison
+we run three independent jobs (`picasso_full_t1pre.yaml`,
+`picasso_full_t2.yaml`, `picasso_full_flair.yaml`), each `input_nc=1`,
+each with its own `tag` in the run id, each evaluated separately. The
+paper's table format is "one row per source modality"; we follow that.
+See `.claude/skills/integrate-competitor/SKILL.md` §3.3 for the one-to-one
+vs many-to-one rule.
 
 **Early stopping + best-G tracking** (`src/vena/competitors/pgan_cgan/runner.py`):
 - The runner tracks epoch-mean `G_L1` and writes `best_net_G.pth` /

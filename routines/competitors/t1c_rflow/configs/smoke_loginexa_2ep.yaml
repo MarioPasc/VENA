@@ -1,0 +1,32 @@
+# T1C-RFlow (Eidex et al. 2025, arXiv:2509.24194) — multi-cohort smoke on the
+# Picasso loginexa V100 interactive node (V100-DGXS-32GB, sm_70).
+#
+# Uses the `vena-v100` env (torch 2.7.1+cu126). Reads VENA's Picasso corpus
+# registry via the shared Lustre mount.
+runtime:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/t1c_rflow
+  platform: loginexa
+  tag: smoke_2ep_multicohort
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  input_latents: [t1pre, flair]
+  target_latent: t1c
+  max_patients_per_cohort: 1
+
+hp:
+  latent_channels: 4
+  cond_latents: 2
+  nfe_train_timesteps: 1000
+  lr: 1.0e-5
+  weight_decay: 1.0e-4
+  batch_size: 1
+  max_epochs: 2
+  patience: 0
+  save_epoch_freq: 1
+  log_every: 5
+  num_workers: 0   # multi-cohort h5py + multiprocessing deadlock guard
+  use_amp: true

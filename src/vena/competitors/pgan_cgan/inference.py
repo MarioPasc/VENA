@@ -179,13 +179,15 @@ def _save_outputs(
     import matplotlib.pyplot as plt
 
     z_mid = pred.shape[-1] // 2
+    src_label = getattr(_save_outputs, "_src_label", "source")
+    tgt_label = getattr(_save_outputs, "_tgt_label", "T1c")
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     axes[0].imshow(source[:, :, z_mid].T, cmap="gray", vmin=0, vmax=1, origin="lower")
-    axes[0].set_title("source T1pre"); axes[0].axis("off")
+    axes[0].set_title(f"source {src_label}"); axes[0].axis("off")
     axes[1].imshow(real[:, :, z_mid].T, cmap="gray", vmin=0, vmax=1, origin="lower")
-    axes[1].set_title("real T1c"); axes[1].axis("off")
+    axes[1].set_title(f"real {tgt_label}"); axes[1].axis("off")
     axes[2].imshow(pred[:, :, z_mid].T, cmap="gray", vmin=0, vmax=1, origin="lower")
-    axes[2].set_title("pred T1c (pGAN)"); axes[2].axis("off")
+    axes[2].set_title(f"pred {tgt_label} (pGAN)"); axes[2].axis("off")
     fig.suptitle(f"{patient_id} — z={z_mid}")
     png_path = out_dir / f"{patient_id}_midslice.png"
     fig.tight_layout()
@@ -225,6 +227,18 @@ def run_inference(
     if decision_path.is_file():
         decision = json.loads(decision_path.read_text())
         hp = decision.get("hyperparams", {})
+        train_data = decision.get("data", {})
+        # Recover the EXACT modality set the generator was trained on. The
+        # caller's `input_modalities` default is multi-modal; a one-to-one run
+        # like t1pre→t1c has input_nc=1 and a single-element list. Loading the
+        # state_dict with the wrong channel count crashes at the first conv.
+        trained_mods = train_data.get("input_modalities") or list(input_modalities)
+        input_modalities = tuple(trained_mods)
+        target_modality = train_data.get("target_modality", target_modality)
+        image_size = train_data.get("image_size", image_size)
+        min_brain_voxels = train_data.get("min_brain_voxels", min_brain_voxels)
+        logger.info("decision.json: input_modalities=%s → %s, image_size=%d",
+                    input_modalities, target_modality, image_size)
     else:
         hp = {}
 
@@ -242,6 +256,9 @@ def run_inference(
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
     netG = _build_generator(ckpt, opt)
     logger.info("Loaded generator from %s (device=%s)", ckpt, device)
+    # Carry the modality labels into the PNG titles.
+    _save_outputs._src_label = "+".join(m.upper() for m in input_modalities)
+    _save_outputs._tgt_label = target_modality.upper()
 
     out_dir = out_dir or (run_dir / "inference" / f"epoch_{epoch}")
     out_dir.mkdir(parents=True, exist_ok=True)
