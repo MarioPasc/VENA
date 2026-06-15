@@ -1,0 +1,42 @@
+# 3D-DiT (Peebles & Xie 2023 backbone, Eidex 2025 §4 recipe) — multi-cohort
+# smoke on the ICAI server-3 workstation (RTX 4090 24GB).
+#
+# Reads VENA's server-3 corpus registry, capped at 1 patient per cv cohort to
+# keep the smoke under ~10 min on a 4090. DiT-B/4 (130M params) is heavier
+# than the paper-faithful T1C-RFlow U-Net (49.6M); batch_size=1 keeps VRAM in
+# the 12-16 GB range with AMP.
+runtime:
+  experiments_root: /media/hddb/mario/experiments/competitors/dit_3d
+  platform: server3
+  tag: smoke_4ep_multicohort
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  corpus_registry: /home/mariopascual/projects/VENA/routines/fm/train/configs/corpus/corpus_server3.json
+  fold: 0
+  input_latents: [t1pre, flair]
+  target_latent: t1c
+  max_patients_per_cohort: 1   # 1 patient per cv cohort
+
+hp:
+  # DiT-B/4 in 3D — paper-faithful Peebles & Xie 2023 base config.
+  latent_channels: 4
+  cond_latents: 2
+  dit_hidden_size: 768
+  dit_depth: 12
+  dit_num_heads: 12
+  dit_patch_size: 4
+  dit_mlp_ratio: 4.0
+  nfe_train_timesteps: 1000
+  lr: 1.0e-5
+  weight_decay: 1.0e-4
+  batch_size: 1               # smoke — keep VRAM low on a shared 4090
+  max_epochs: 4
+  patience: 0                 # disable early stop for smoke
+  save_epoch_freq: 1
+  log_every: 5
+  # num_workers=0 — multi-cohort H5 hits an h5py + multiprocessing deadlock
+  # when several workers open the same family concurrently (skill §3.5).
+  num_workers: 0
+  use_amp: true

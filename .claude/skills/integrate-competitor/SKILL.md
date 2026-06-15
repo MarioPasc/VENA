@@ -290,6 +290,114 @@ These three are pre-emptable in the inference.py skeleton; copy
 `src/vena/competitors/t1c_rflow/inference.py` verbatim for the next
 latent-domain competitor.
 
+### Step 3.6.1 — Persist architecture metadata inside the checkpoint (real, hit on 3D-DiT integration)
+
+When the model architecture cannot be inferred from the state-dict alone
+(transformer backbones with fixed-size positional embeddings, ViT-style
+patch counts, channel-counts that depend on conditioning, etc.), the
+inference path otherwise needs to consult the training YAML — which then
+becomes a load-bearing input at infer time, complicating the CLI surface
+and creating a YAML-vs-checkpoint drift risk. The cleaner pattern: dump
+the architecture kwargs as an ``arch_meta`` dict **inside the saved
+checkpoint** alongside the state dict.
+
+```python
+arch_meta = {
+    "input_size": list(latent_grid),
+    "in_channels": in_channels,
+    "out_channels": out_channels,
+    "hidden_size": hidden_size,
+    "depth": depth,
+    "num_heads": num_heads,
+    "patch_size": patch_size,
+    "mlp_ratio": mlp_ratio,
+}
+torch.save(
+    {"<model>_state_dict": model.state_dict(), "arch_meta": arch_meta, ...},
+    ckpt_path,
+)
+```
+
+At inference time, ``run_inference`` reads ``arch_meta`` and calls a
+``_rebuild_model_from_meta(arch_meta)`` factory that materialises the
+identical architecture. Pin the round-trip with a unit test that asserts
+``sorted(rebuilt.state_dict().keys()) == sorted(fresh.state_dict().keys())``
+for a small set of representative architecture kwargs.
+
+This collapses the infer CLI's required flags by one (T1C-RFlow needed
+``--unet-arch-config``; 3D-DiT does not) and removes the YAML-drift class
+of bug for free. Use it whenever the wrapper builds the model with
+non-trivial kwargs (anything beyond a fixed config file).
+
+### Step 3.6.2 — Fixed-shape positional embeddings: peek + validate (real, hit on 3D-DiT integration)
+
+A ViT / DiT backbone registers its positional embedding as a fixed-size
+non-trainable buffer at ``__init__`` time. Multi-cohort training cannot
+silently mix latent shapes the way a U-Net can.
+
+Pattern:
+
+1. Build the DataLoader first; **before** building the model, ``ds[0]``
+   to read the spatial shape of the target latent. Pin it as
+   ``latent_grid: tuple[int, int, int]``.
+2. Build the model with ``input_size=latent_grid``.
+3. On every training step, ``assert tuple(target.shape[2:]) == latent_grid``;
+   raise a clear ``RunnerError`` naming the bad cohort if the assertion
+   fails.
+4. In the YAML-validating Pydantic class, enforce any 3D-sin-cos
+   ``embed_dim % 3 == 0`` and ``patch_size`` divides ``input_size`` upfront
+   so the user gets a fail-fast at YAML-load time rather than a cryptic
+   shape error mid-epoch.
+
+VENA's schema-2.0.0 trunk-÷8 constraint ensures all cohorts encode to the
+same latent grid ``(4, 48, 56, 48)``. If a future cohort breaks that
+invariant, this guard surfaces immediately at the multi-cohort smoke.
+
+### Step 3.6.3 — Vendor the same upstream twice when two competitors share a repo (real, hit on 3D-DiT integration)
+
+The Eidex *et al.* 2025 repository ships **two** distinct competitor methods
+that VENA benchmarks separately: T1C-RFlow (the headline method,
+``train_rflow.py`` + U-Net) and DiT-3D (the §4 transformer baseline,
+``dit3d.py`` + ``dit3d_wrapper.py``). Skill anti-pattern 7 forbids reaching
+into a sibling competitor's vendored snapshot, so the right move is to
+vendor a **fresh independent copy** of the relevant files under
+``src/external/<new_competitor>/upstream/`` — same SHA, scope of use
+restricted to the subset the new wrapper actually invokes. Both
+``UPSTREAM.md`` files cross-reference each other in a "Why a separate
+vendoring from <sibling>" paragraph so a future reader knows the
+duplication is intentional, not a vendoring bug. Disk cost is trivial
+(only the few files in scope, not the whole repo); independence cost is
+zero.
+
+### Step 3.6.4 — Import vendored modules at runtime via sys.path (real, hit on 3D-DiT integration)
+
+For vendored upstreams whose model code is short enough that re-implementing
+it in the wrapper would be wasteful duplication (e.g. the 10-line
+``DiT3DWrapper`` class), import directly from the snapshot at runtime:
+
+```python
+_REPO_ROOT = Path(__file__).resolve().parents[4]  # src/vena/competitors/<name>/runner.py → repo
+_UPSTREAM_DIR = _REPO_ROOT / "src" / "external" / "<name>" / "upstream"
+
+def _import_<thing>() -> Any:
+    if not _UPSTREAM_DIR.is_dir():
+        raise RunnerError(f"vendored upstream missing at {_UPSTREAM_DIR}")
+    path_str = str(_UPSTREAM_DIR)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+    from <upstream_module> import <Thing>  # type: ignore[import-not-found]
+    return <Thing>
+```
+
+This is **not** runtime monkey-patching (skill anti-pattern 2) — it imports
+the upstream class verbatim. Document the runtime import in the
+competitor's ``UPSTREAM.md`` under "What is invoked from VENA" so a future
+reader knows the symbol is live (not just a reference snapshot). Compare to
+the T1C-RFlow integration which reimplements everything via MONAI
+primitives — that is correct when the wrapper's architecture choice
+*differs* from upstream (paper-text vs code), but redundant when the
+wrapper consumes the upstream class as-is.
+
 ### Step 3.7 — Upstream code vs paper text incoherency check (real, hit on T1C-RFlow integration)
 
 Many synthesis papers ship code where the released script does **not**
