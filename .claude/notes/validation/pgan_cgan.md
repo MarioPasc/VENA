@@ -277,6 +277,42 @@ brain region is cropped back to the original `(240, 240, 155)` grid.
 10. **`screen` vs `tmux`**: server-3 has only `screen`, loginexa has both. Sniff first
     or pick `screen` since it's more portable.
 
+## Paper-budget rationale (2026-06-15)
+
+**Fairness criterion**: match the *total sample exposure*
+(`paper_train_slices × paper_epochs`) the paper trained on, scaled to our
+larger multi-cohort train union. Rationale: every published competitor's
+epoch count is tuned to its own paper's dataset size. Transplanting "200
+epochs" or "100 epochs" naively onto a corpus that is 60× larger gives that
+competitor 60× the compute and grossly biases the comparison. The
+defensible budget is "let the model see the same total number of training
+samples as in its paper", regardless of how many of *our* epochs that
+represents.
+
+Paper (Dar et al. 2019 §2.2.1, §2.4):
+
+| Field | Value | Source |
+|---|---|---|
+| Training set | MIDAS T1→T2 | Section 2.2.1, Table I |
+| Train slices/epoch | 3,774 | Section 2.2.1 |
+| Total epochs | 200 (`niter=100 + niter_decay=100`) | Section 2.4 + upstream `train_options.py` |
+| Batch size | 1 | Section 2.4 (Adam, batch 1) |
+| **Total sample passes** | **3,774 × 200 = 754,800** | derived |
+
+Our run:
+
+| Field | Value | Source |
+|---|---|---|
+| Train slices/epoch (corpus_picasso, role=cv) | 231,075 | computed across 6 cohorts (UCSF-PDGM 44.5k, BraTS-GLI 110.8k, UPENN-GBM 57.5k, IvyGAP 3.1k, LUMIERE 8.2k, REMBRANDT 6.9k) |
+| Required epochs to match | 754,800 / 231,075 ≈ 3.27 → **4** | rounded up |
+| `niter` / `niter_decay` split | 2 / 2 (50:50, paper-faithful) | mirrors paper's `100:100` |
+| Batch size | 32 (A100 40GB headroom; sample-pass count is batch-invariant) | engineering choice |
+| Patience | 0 (fixed schedule, no early-stop) | matches "fixed budget" interpretation |
+
+This locks the pGAN, T1C-RFlow, and SynDiff competitors onto the **same
+fairness contract** at the data-exposure level. See sibling notes for the
+other two competitors' numbers.
+
 ## Paired comparison axes (vs `picasso_s1_1000ep_fft.yaml`)
 
 | Axis | VENA FM trainer | pGAN competitor | match |
@@ -284,15 +320,16 @@ brain region is cropped back to the original `(240, 240, 155)` grid.
 | seed | 1337 | 1337 | ✅ |
 | fold | 0 | 0 | ✅ |
 | corpus | `corpus_picasso.json` (6 cv cohorts) | same | ✅ |
-| max_epochs | 10 000 | 10 000 | ✅ |
-| patience | 100 (on `train/total_epoch`) | 100 (on epoch-mean G_L1) | ✅ |
-| save cadence | every 25 epochs | every 25 epochs | ✅ |
-| batch_size (physical) | 4 | 4 | ✅ |
+| max_epochs | 10 000 (patience-bound) | **4** (paper-budget fixed) | ⚠ asymmetric by design — see "Paper-budget rationale" above |
+| patience | 100 (on `train/total_epoch`) | 0 (fixed budget) | ⚠ same |
+| niter / niter_decay | n/a | 2 / 2 (50:50 paper-faithful split) | — |
+| save cadence | every 25 epochs | every 1 epoch (4-epoch run) | adapted |
+| batch_size (physical) | 4 | 32 | engineering — sample-pass invariant |
 | num_workers | 8 | 8 | ✅ |
-| walltime | 7d on A100 | 7d on A100 | ✅ |
-| input modalities | `{T1pre, T2, FLAIR, …}` + masks | `{T1pre, T2, FLAIR}` (paper-faithful) | ⚠ |
+| walltime | 7d on A100 | ≤ 1 h on A100 (very short budget) | ⚠ |
+| input modalities | `{T1pre, T2, FLAIR, …}` + masks | one source modality per run (panel of 3) | ⚠ paper-faithful |
 | output | latent T1c via MAISI VAE | image-domain T1c (paper-faithful) | ⚠ |
-| target metric | `mse_latent`/`bg`/`5 NFE` | epoch-mean G_L1 (for early-stop) | ⚠ |
+| target metric | `mse_latent`/`bg`/`5 NFE` | epoch-mean G_L1 (training-only) | ⚠ |
 
 The last three rows differ by design — adapting the competitor to VENA's latent
 space, mask conditioning, or NFE-based metric would change its identity as a

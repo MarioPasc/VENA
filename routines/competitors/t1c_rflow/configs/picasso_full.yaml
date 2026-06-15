@@ -40,8 +40,8 @@ hp:
   lr: 1.0e-5
   weight_decay: 1.0e-4
   batch_size: 4
-  max_epochs: 10000
-  patience: 100
+  max_epochs: 164
+  patience: 0
   save_epoch_freq: 25
   log_every: 200
   num_workers: 8

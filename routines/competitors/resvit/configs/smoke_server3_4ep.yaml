@@ -1,0 +1,54 @@
+# Multi-cohort ResViT smoke on the ICAI server-3 workstation (RTX 4090).
+# Reads VENA's server-3 corpus registry (6 cv cohorts), capped at 1 patient per
+# cohort to keep the smoke under ~10 min on the 4090.
+#
+# Two-stage curriculum: pretrain (1+1 ep) → finetune (1+1 ep). Total 4 epochs.
+# Both stages run in one engine.run() call; stage 1 saves
+# latest_pretrain_net_{G,D}.pth, stage 2 saves best_/latest_net_{G,D}.pth.
+runtime:
+  experiments_root: /media/hddb/mario/experiments/competitors/resvit
+  platform: server3
+  tag: smoke_4ep_multicohort
+  gpu_ids: [0]
+  seed: 1337
+  vit_init_npz: null   # default → repo-vendored src/external/resvit/upstream/checkpoints/R50+ViT-B_16.npz
+
+data:
+  corpus_registry: /home/mariopascual/projects/VENA/routines/fm/train/configs/corpus/corpus_server3.json
+  fold: 0
+  input_modalities: [t1pre, t2, flair]
+  target_modality: t1c
+  image_size: 256
+  min_brain_voxels: 1000
+  max_patients_per_cohort: 1   # ≈ 6 patients total
+
+hp:
+  input_nc: 3
+  output_nc: 1
+  ngf: 64
+  ndf: 64
+  n_layers_D: 3
+  norm: instance
+  init_type: normal
+  no_dropout: false
+  vit_name: Res-ViT-B_16
+  upstream_model: resvit_one   # channel-parametric; see src/external/resvit/UPSTREAM.md table
+  pool_size: 0
+  lambda_A: 100.0
+  lambda_adv: 1.0
+  # Stage 1 — CNN pretrain (lr 2e-4)
+  pretrain_niter: 1
+  pretrain_niter_decay: 1
+  pretrain_lr: 2.0e-4
+  # Stage 2 — ART fine-tune (lr 1e-3)
+  niter: 1
+  niter_decay: 1
+  lr: 1.0e-3
+  beta1: 0.5
+  lr_decay_iters: 50
+  batchSize: 1
+  log_every: 50
+  # num_workers=0 — multi-cohort h5py + multiprocessing deadlock when several
+  # workers open the same files concurrently. Same rationale as pgan/syndiff.
+  num_workers: 0
+  patience: 0   # disable early-stop for smoke

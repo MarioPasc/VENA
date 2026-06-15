@@ -1,0 +1,48 @@
+# Multi-cohort ResViT smoke on Picasso loginexa V100 (32 GB) interactive node.
+# Conda env: vena-v100 (sm_70 / torch 2.7.1+cu126).
+#
+# Two-stage curriculum collapsed to 1+0 ep pretrain → 1+0 ep finetune (2 ep
+# total) for the 30-min loginexa convention.
+runtime:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/resvit
+  platform: loginexa
+  tag: smoke_2ep_multicohort
+  gpu_ids: [0]
+  seed: 1337
+  vit_init_npz: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/src/external/resvit/upstream/checkpoints/R50+ViT-B_16.npz
+
+data:
+  corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  input_modalities: [t1pre, t2, flair]
+  target_modality: t1c
+  image_size: 256
+  min_brain_voxels: 1000
+  max_patients_per_cohort: 1
+
+hp:
+  input_nc: 3
+  output_nc: 1
+  ngf: 64
+  ndf: 64
+  n_layers_D: 3
+  norm: instance
+  init_type: normal
+  no_dropout: false
+  vit_name: Res-ViT-B_16
+  upstream_model: resvit_one
+  pool_size: 0
+  lambda_A: 100.0
+  lambda_adv: 1.0
+  pretrain_niter: 1
+  pretrain_niter_decay: 1     # Pydantic requires ≥1; 1+0 not supported by validator. 1+1 = 2 ep stage 1.
+  pretrain_lr: 2.0e-4
+  niter: 1
+  niter_decay: 1
+  lr: 1.0e-3
+  beta1: 0.5
+  lr_decay_iters: 50
+  batchSize: 1
+  log_every: 50
+  num_workers: 0
+  patience: 0

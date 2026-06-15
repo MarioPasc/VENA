@@ -10,7 +10,7 @@
 #SBATCH --output=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/syndiff_picasso_full_t1pre_%j.out
 #SBATCH --error=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/syndiff_picasso_full_t1pre_%j.err
 
-set -euo pipefail
+set -eo pipefail
 
 START_TIME=$(date +%s)
 

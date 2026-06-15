@@ -1,0 +1,94 @@
+# Picasso A100 full ResViT training — multi-cohort, fair-comparison with VENA's
+# routines/fm/train/configs/runs/picasso_s1_1000ep_fft.yaml.
+#
+# Reads the same corpus registry VENA uses (corpus_picasso.json: 6 cv cohorts —
+# UCSF-PDGM + BraTS-GLI + UPENN-GBM + IvyGAP + LUMIERE + REMBRANDT), same fold,
+# same seed.
+#
+# Paper recipe (§III.B, IEEE TMI 2022) — paper's data:
+#   BRATS many-to-one: 25 train subjects × 100 slices = 2500 slices/epoch
+#   Stage 1 (Res_CNN, lr 2e-4): 50 ep + 50 ep linear decay = 100 ep
+#                              → 100 × 2500 = 250 000 slices seen
+#   Stage 2 (ResViT, lr 1e-3):  25 ep + 25 ep linear decay = 50 ep
+#                              → 50 × 2500 = 125 000 slices seen
+#   Total paper exposure: 375 000 slice-passes.
+#
+# VENA's multi-cohort fold-0 train union has 287 117 slices/epoch (measured
+# 2026-06-15 on the Picasso corpus_picasso.json). Running the paper's 150
+# epochs verbatim would expose ResViT to ~43 M slice-passes — 114× the paper
+# budget, which makes the comparison unfair to VENA. Instead, we cap each
+# stage's slice-exposure to the paper's budget via the engine's
+# `pretrain_max_slices` / `max_slices` knobs:
+#
+#   Stage 1: pretrain_max_slices = 250 000  →  ~0.871 our-epochs
+#   Stage 2: max_slices          = 125 000  →  ~0.435 our-epochs
+#   Total:                                       ~1.306 our-epochs
+#
+# The cap breaks the per-stage epoch loop mid-epoch once the slice budget is
+# exhausted. The LR scheduler stays at paper-recipe values (niter / niter_decay),
+# but in practice we never enter the decay phase — neither does the paper, by
+# epoch 0.87 / 0.43. Each stage's `latest_*_net_G.pth` checkpoint is written
+# on the partial epoch that trips the cap.
+#
+# Both stages run in a single Python process inside this Picasso job. The
+# transition is automatic — stage 1 saves checkpoints/latest_pretrain_net_{G,D}.pth
+# which stage 2 then warm-starts from before the ART blocks are added.
+#
+# Paired comparison axes vs VENA:
+#   seed=1337, fold=0, multi-cohort (same registry), no augmentation.
+#   Slice-budget cap = paper's BRATS many-to-one training exposure.
+#
+# Expected wallclock at batch=4, A100, optimistic ~120 ms/step:
+#   Stage 1: 250 000 / 4 = 62 500 steps × 120 ms ≈ 2.1 h
+#   Stage 2: 125 000 / 4 = 31 250 steps × 200 ms (heavier ART) ≈ 1.7 h
+#   Total ≈ 4 h. Worker reserves 12 h to absorb step-time variance.
+runtime:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/resvit
+  platform: picasso
+  tag: full_multicohort
+  gpu_ids: [0]
+  seed: 1337
+  vit_init_npz: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/src/external/resvit/upstream/checkpoints/R50+ViT-B_16.npz
+
+data:
+  corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  input_modalities: [t1pre, t2, flair]
+  target_modality: t1c
+  image_size: 256
+  min_brain_voxels: 1000
+  max_patients_per_cohort: null   # full fold-0 train union per cohort
+
+hp:
+  input_nc: 3
+  output_nc: 1
+  ngf: 64
+  ndf: 64
+  n_layers_D: 3
+  norm: instance
+  init_type: normal
+  no_dropout: false
+  vit_name: Res-ViT-B_16
+  upstream_model: resvit_one
+  pool_size: 0
+  lambda_A: 100.0
+  lambda_adv: 1.0
+  # Stage 1 — CNN pretrain. LR schedule is paper-recipe (lambda lr policy
+  # over niter + niter_decay), but the slice cap (below) exits long before
+  # the constant phase ends — so the LR is effectively constant at pretrain_lr
+  # for the whole stage, matching the paper's first ~0.87 epoch regime.
+  pretrain_niter: 50
+  pretrain_niter_decay: 50
+  pretrain_lr: 2.0e-4
+  pretrain_max_slices: 250000   # paper's stage 1 exposure (100 ep × 2500 slc)
+  # Stage 2 — ART fine-tune. Same story — slice cap exits before LR decay.
+  niter: 25
+  niter_decay: 25
+  lr: 1.0e-3
+  max_slices: 125000            # paper's stage 2 exposure (50 ep × 2500 slc)
+  beta1: 0.5
+  lr_decay_iters: 50
+  batchSize: 4
+  log_every: 200
+  num_workers: 8
+  patience: 0   # paper recipe is fixed-budget; disable early stopping

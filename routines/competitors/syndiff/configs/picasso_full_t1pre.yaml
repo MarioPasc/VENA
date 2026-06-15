@@ -46,9 +46,9 @@ hp:
   ema_decay: 0.999
   no_lr_decay: false
   # Training schedule — paper budget is 50 epochs
-  max_epochs: 50
+  max_epochs: 1
   patience: 0          # no early-stop (short fixed schedule)
-  save_epoch_freq: 5
+  save_epoch_freq: 1
   log_every: 200
-  batch_size: 1        # SynDiff README + paper use batch_size 1 (8 networks per step)
-  num_workers: 4
+  batch_size: 4        # A100 40GB; >1 deviates from paper but keeps step budget feasible
+  num_workers: 8

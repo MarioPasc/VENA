@@ -34,11 +34,11 @@ hp:
   lr_policy: lambda
   lr_decay_iters: 50
   epoch_count: 1
-  niter: 5000
-  niter_decay: 5000
+  niter: 2
+  niter_decay: 2
   batchSize: 32
-  save_epoch_freq: 25
+  save_epoch_freq: 1
   log_every: 200
-  num_workers: 4
-  max_epochs: 10000
-  patience: 100
+  num_workers: 8
+  max_epochs: 4
+  patience: 0

@@ -446,6 +446,203 @@ platform, the agent's correct move is to:
 Do **not** attempt to run `pip install` on a remote platform yourself —
 the user owns env lifecycle for these forked envs.
 
+### Step 3.10 — Multi-stage curricula in a single routine (real, hit on ResViT integration)
+
+Some upstream methods publish a **multi-stage training curriculum** that the
+authors execute as two (or more) separate invocations of `train.py` with
+different flags — e.g. ResViT's "CNN pretrain → ART fine-tune" (Dalmaz et al.
+2022, §III.B): stage 1 trains `Res_CNN` at lr=2e-4 for 50+50 epochs, then
+stage 2 inserts ART blocks (`which_model_netG='resvit'`), warm-starts the CNN
+backbone via `pre_trained_resnet=1 --pre_trained_path=<stage1 ckpt>`,
+loads the ImageNet ViT transformer via `pre_trained_transformer=1`, and
+trains at lr=1e-3 for 25+25 epochs.
+
+**Do NOT** split the stages across two Picasso jobs. The pattern is one
+`engine.run()` that drives both stages back-to-back; the user pays one
+sbatch and the run reads as one experiment in `decision.json`. Pattern
+encoded in `vena.competitors.resvit.runner.train_resvit`:
+
+```python
+def train_resvit(cfg, run_dir):
+    # Open one (train_step.csv, train_epoch.csv) pair with a `stage` column.
+    step_writer, epoch_writer = _open_csvs(run_dir)
+
+    # Stage 1
+    opt1 = _build_opt(cfg, run_dir, stage="stage1_pretrain",
+                      which_model_netG="res_cnn",
+                      pre_trained_path="/dev/null",  # unused for res_cnn branch
+                      pre_trained_resnet=0, pre_trained_transformer=0,
+                      niter=cfg.pretrain_niter, niter_decay=cfg.pretrain_niter_decay,
+                      lr=cfg.pretrain_lr)
+    _train_one_stage(opt=opt1,
+                     save_label_latest="latest_pretrain",
+                     save_label_best=None,            # paper recipe — no "best"
+                     use_patience=False)              # fixed-budget warm-up
+    stage1_ckpt = run_dir / "checkpoints" / "latest_pretrain_net_G.pth"
+    if not stage1_ckpt.is_file():
+        raise RunnerError(f"stage 1 finished but {stage1_ckpt} was not written")
+
+    # Free GPU before stage 2 builds a new (bigger) generator.
+    del model; torch.cuda.empty_cache()
+
+    # Stage 2
+    opt2 = _build_opt(cfg, run_dir, stage="stage2_finetune",
+                      which_model_netG="resvit",
+                      pre_trained_path=stage1_ckpt,
+                      pre_trained_resnet=1, pre_trained_transformer=1,
+                      niter=cfg.niter, niter_decay=cfg.niter_decay,
+                      lr=cfg.lr)
+    _train_one_stage(opt=opt2,
+                     save_label_latest="latest",
+                     save_label_best="best",          # stage 2 is the deliverable
+                     use_patience=True)               # patience-based early stop
+    logger.info("resvit-train completed")
+```
+
+Invariants for this pattern:
+
+- **Stage-1 ckpt filenames are distinct.** Use `latest_pretrain_net_{G,D}.pth`
+  (or another stage-name prefix) so stage 2's `latest_/best_net_{G,D}.pth`
+  saves do not overwrite the hand-off artefact. The user must be able to
+  invoke `infer_cli --epoch latest_pretrain` to probe the stage-1 backbone.
+- **GPU is freed between stages.** `del model; torch.cuda.empty_cache()` —
+  stage 2 builds a strictly larger generator (CNN + 9 ART blocks + ViT).
+- **CSVs span both stages with a `stage` column.** One per-step CSV, one
+  per-epoch CSV. The reviewer should be able to plot loss vs epoch and
+  see the stage transition as a discontinuity.
+- **The stage-1 ckpt path is validated before stage 2 starts.** If stage 1
+  exited early (e.g. patience tripped on a smoke config), the runner must
+  hard-fail with the exact missing path. Silent fall-through to stage 2
+  with a random-init Res_CNN warm-start would invalidate the whole run.
+- **The transition is in-process — no subprocess, no second sbatch.**
+  Re-importing the model factory + re-building the dataloader is cheap
+  compared to the sbatch queue wait.
+- **Patience-based early stopping applies to stage 2 only** when the paper
+  treats stage 1 as a fixed-budget warm-up.
+
+### Step 3.10.1 — Runtime config-dict override (alternative to monkey-patching)
+
+When the upstream has a **hardcoded resource path** baked into a
+`ml_collections.ConfigDict` (or any other mutable config object), do **not**
+patch the source file. The patched file has the path baked in for every
+host; rsync to a sibling cluster would break.
+
+**Pattern**: mutate the config-dict field at runtime, before the upstream
+factory is invoked. Example from ResViT
+(`vena.competitors.resvit.runner._set_vit_pretrained_path`):
+
+```python
+def _set_vit_pretrained_path(vit_npz: Path) -> None:
+    sys.path.insert(0, str(_UPSTREAM_DIR))
+    try:
+        from models import residual_transformers
+    finally:
+        sys.path.pop(0)
+    residual_transformers.CONFIGS["Res-ViT-B_16"].pretrained_path = str(vit_npz)
+```
+
+This is **not** runtime monkey-patching (which the skill forbids): it
+mutates a public attribute on a public `ConfigDict` instance, which is
+the declared API surface of `ml_collections`. The mutation is documented
+in `PATCHES.md` under "Pre-trained ViT path override (runtime, not
+patched)". Subsequent `models.create_model(opt)` then sees the absolute
+path.
+
+The same pattern applies to any `@dataclass`-style config object in the
+upstream that exposes mutable fields (`config.pretrained_path`,
+`config.checkpoint_dir`, etc.).
+
+### Step 3.11 — Paper-budget slice cap (fairness policy, locked 2026-06-15)
+
+**User policy.** Every competitor must receive **only the paper's total
+training exposure** (measured in seen slices, or seen patches if the paper
+operates on patches) — *not* the paper's epoch count multiplied by VENA's
+much larger dataset. The published model was state-of-the-art at the
+paper's compute budget; giving it 100× that budget on our data makes the
+comparison against VENA artificially unflattering to VENA. This applies
+to **every** competitor at full-training time, on every platform.
+
+**The math.**
+
+```
+paper_slices_per_epoch   = N_paper_train_subjects × paper_slices_per_subject
+paper_stage_X_exposure   = paper_stage_X_epochs × paper_slices_per_epoch
+our_slices_per_epoch     = measured via a dataset probe on Picasso (see below)
+our_stage_X_max_slices   = paper_stage_X_exposure  (the cap; the LR schedule
+                                                    stays at paper niter+niter_decay)
+```
+
+Concrete example (ResViT, IEEE TMI 2022, BRATS many-to-one):
+
+- paper slices/epoch = 25 train subj × 100 slices = **2 500**
+- stage 1 = 100 ep × 2 500 = **250 000** slices
+- stage 2 = 50 ep × 2 500 = **125 000** slices
+
+Our multi-cohort fold-0 train union has **287 117 slices/epoch** (measured
+2026-06-15). Picasso config gets `pretrain_max_slices: 250000`,
+`max_slices: 125000`. Stage 1 exits at ~0.871 of an our-epoch, stage 2 at
+~0.435 — both far before the LR-decay phase the paper-recipe scheduler
+was configured to enter.
+
+**How to measure `our_slices_per_epoch`.**
+
+Run a one-shot probe on the platform whose corpus you'll use (typically
+Picasso, since that hosts the full multi-cohort registry):
+
+```bash
+ssh picasso "cd /mnt/.../fscratch/repos/VENA && /mnt/.../conda_envs/vena/bin/python -c \"
+from vena.competitors.<name>.dataset import MultiCohortImageSliceDataset  # or the latent equivalent
+ds = MultiCohortImageSliceDataset(
+    corpus_registry='/mnt/.../corpus_picasso.json',
+    fold=0, phase='train',
+    input_modalities=('t1pre','t2','flair'),
+    target_modality='t1c',
+    image_size=256, min_brain_voxels=1000,
+)
+print('TOTAL_SLICES=', len(ds))
+for n, s in zip(ds.cohort_names, ds.cohort_sizes):
+    print(f'{n}: {s} slices')
+\""
+```
+
+Record the result verbatim in the validation note's paper-budget table.
+Re-probe when the corpus registry changes (new cohort added, different
+preprocessing).
+
+**Engine + runner pattern.** Add two `int | None = None` fields to
+`HyperParamsCfg` — one per training stage. None means "unlimited"
+(smoke configs leave it at None; production configs set explicit caps).
+The runner's inner step loop maintains a `slices_seen_this_stage`
+counter that increments by `batch["A"].shape[0]` per step, and breaks
+out when `slices_seen_this_stage >= max_slices`. The break must still
+allow the epoch-end work to run (write the partial epoch's CSV row,
+save the stage's `latest_*_net_*.pth`, save `best_*_net_*.pth` if the
+metric improved). The LR scheduler is configured with the paper-recipe
+`niter + niter_decay` so we stay in the paper's pre-decay regime
+during the capped exposure.
+
+Canonical implementation:
+`routines/competitors/resvit/engine.py::HyperParamsCfg`
+(`pretrain_max_slices`, `max_slices`) +
+`src/vena/competitors/resvit/runner.py::_train_one_stage`
+(slice counter + break).
+
+**Decision-log deviation.** The engine's `_write_decision` must record
+the cap under `competitor.deviations.slice_budget_cap` so the reviewer
+can verify the policy was applied (and what cap values were used) by
+reading `decision.json` alone, without consulting the YAML config.
+
+**Wallclock impact.** Estimated wallclock collapses by roughly the
+inverse of `our_slices_per_epoch / paper_slices_per_epoch`. For
+ResViT this dropped a >7-day budget to ~4 h. Set SLURM `--time` to
+~3–9× the estimate to absorb step-time variance.
+
+**Other competitors.** If you retune an existing competitor
+(pgan_cgan / syndiff / t1c_rflow) with the same policy, lift the
+implementation pattern from ResViT verbatim — same field names, same
+runner counter shape, same `decision.json` deviation key. Cross-
+competitor parity matters for reviewer trust.
+
 ### Step 4 — Build the routine
 
 ```
@@ -488,6 +685,49 @@ use the wrong case and template-copy errors will silently propagate. When
 copying YAMLs across competitors, grep for `execs/VENA` and lowercase
 every occurrence. (The log directory under `…/execs/VENA/logs/` is fine —
 launchers `mkdir -p` it on the fly.)
+
+### Step 4.1 — Paper-budget fairness for picasso configs (real, hit on SynDiff integration)
+
+When sizing the `picasso_full*.yaml` schedules, do **not** copy the paper's
+epoch count directly onto VENA's larger multi-cohort corpus. Every
+competitor's "200 / 100 / 50 epochs" was tuned to *its* paper's dataset
+size; running the same N on our 231,075-slice (image) / 1,751-volume
+(latent) train union gives that competitor 50–600× the data exposure the
+paper had, and biases the head-to-head against any competitor not given
+the same treatment.
+
+**Fairness contract** (locked 2026-06-15 across pgan_cgan, t1c_rflow,
+syndiff): match the *total sample exposure*
+(`paper_train_samples × paper_epochs`) scaled to our train union.
+
+```
+our_epochs = ceil(paper_train_samples × paper_epochs / our_train_samples_per_epoch)
+```
+
+batch size is invariant under this contract (sample count is what's
+matched, not optimiser-step count) — pick a batch that fits A100 40GB
+comfortably and document the choice in `decision.json` under
+`competitor.deviations`.
+
+**Worked examples** (see the validation notes for the full derivations):
+
+| Competitor | Paper train samples × epochs | Total paper passes | Our train samples/epoch | Our `max_epochs` |
+|---|---|---|---|---|
+| pGAN-cGAN | 3,774 × 200 (MIDAS) | 754,800 | 231,075 (slices) | 4 (niter=2 + niter_decay=2) |
+| T1C-RFlow | 2,860 × 100 (BraTS-2024) | 286,000 | 1,751 (latent vols) | 164 |
+| SynDiff | ~2,500 × 50 (IXI) | ~125,000 | 231,075 (slices) | 1 (single pass already 1.85× paper budget) |
+
+`patience: 0` accompanies the fixed budget — early-stopping doesn't apply
+to a deliberately-fixed schedule. Record the paper's `(train_samples,
+epochs, batch)` in the validation note under a "Paper-budget rationale"
+section so a reviewer can audit the conversion.
+
+This contract makes the comparison defensible against the
+"undertrained-competitor" charge: every model gets the same data
+exposure budget as its own paper had. The corollary is that competitor
+runs may finish in 1 hour while VENA's main FM run takes 7 days — that
+asymmetry is the *point*; we are comparing each method at *its* training
+budget, not at our budget for ours.
 
 ### Step 5 — Per-platform launchers
 

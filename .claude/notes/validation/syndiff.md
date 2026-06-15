@@ -248,6 +248,41 @@ SLURM resource request: `--constraint=dgx --gres=gpu:1 --time=4-00:00:00
 --mem=64G --cpus-per-task=8`. At 50 epochs and batch_size=1, expected
 wallclock 24-48 h on A100 (8 networks per step, R1 penalty every 10 steps).
 
+## Paper-budget rationale (2026-06-15)
+
+**Fairness criterion**: match the *total sample exposure*
+(`paper_train_slices × paper_epochs`) the paper trained on, scaled to our
+larger multi-cohort train union. See `pgan_cgan.md` for the broader
+fairness argument and `t1c_rflow.md` for the latent-space sibling.
+
+Paper (Özbey et al. 2023 §IV.B):
+
+| Field | Value | Source |
+|---|---|---|
+| Training set (primary) | IXI T1↔T2 | §IV.B, Table II |
+| Subjects in train | 25 | §IV.B |
+| Axial slices per subject | ~100 | §IV.B ("100 axial cross-sections per subject") |
+| Train slices/epoch | ~2,500 | derived |
+| Total epochs | 50 | §IV.B |
+| Batch size | 1 | §IV.B |
+| **Total sample passes** | **~125,000** | derived |
+
+Our run:
+
+| Field | Value | Source |
+|---|---|---|
+| Train slices/epoch (corpus_picasso, role=cv) | 231,075 | union across 6 cohorts |
+| Required passes to match | 125,000 | from paper |
+| Required epochs to match | 125,000 / 231,075 ≈ 0.54 → **1** | rounded up (single pass already exceeds the paper budget by 1.85× — partial epoch is awkward, so 1 is the closest defensible setting) |
+| Batch size | 4 (A100 40GB; paper used 1 but sample-pass count is batch-invariant) | engineering choice |
+| Patience | 0 (fixed schedule, no early-stop) | matches "fixed budget" interpretation |
+
+SynDiff is uniquely affected by the multi-cohort scale-up: 1 full pass over
+our data already exceeds the paper's total step budget. This is recorded
+explicitly so reviewers cannot claim SynDiff was undertrained relative to
+its own paper — the metric is "samples seen", not "epochs over the
+training set".
+
 ## Paired comparison axes (vs VENA FM run)
 
 | Axis | Value | Match |
@@ -259,6 +294,9 @@ wallclock 24-48 h on A100 (8 networks per step, R1 penalty every 10 steps).
 | Source modality | t1pre / t2 / flair (panel) | one source per run (paper limit) |
 | Image space | image-domain 2D | competitor-specific (paper limit) |
 | Augmentation | none | ✓ (deterministic dataset) |
+| max_epochs | **1** (paper-budget fixed) | ⚠ — see "Paper-budget rationale" above |
+| patience | 0 (fixed budget) | matches pgan/t1c_rflow fairness contract |
+| batch_size | 4 (paper used 1; sample-pass count batch-invariant) | engineering choice |
 | Eval split | `splits/cv/fold_0/val` (smoke); `splits/test` (final) | ✓ |
 
 ## Things to watch

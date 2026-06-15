@@ -208,6 +208,37 @@ differs.
 NFE panel default `{50, 100, 200}`. Paper default = 200; the panel reveals
 the speed/quality trade-off VENA highlights as the rectified-flow win.
 
+## Paper-budget rationale (2026-06-15)
+
+**Fairness criterion**: match the *total sample exposure*
+(`paper_train_volumes × paper_epochs`) the paper trained on, scaled to our
+larger multi-cohort latent train union. See `pgan_cgan.md` for the broader
+fairness argument.
+
+Paper (Eidex et al. 2025 §2.1, §2.5):
+
+| Field | Value | Source |
+|---|---|---|
+| Training set | BraTS-2024 (GLI + MEN + MET) combined | §2.1 |
+| Train latent volumes/epoch | 2,860 | §2.1, patient-disjoint stratified split (2860/612/614 train/val/test) |
+| Total epochs | 100 | §2.5 |
+| Batch size | 4 | §2.5 (single A6000 ADA 48 GB) |
+| **Total volume passes** | **2,860 × 100 = 286,000** | derived |
+| **Total optimiser steps** | 286,000 / 4 = 71,500 | derived |
+
+Our run:
+
+| Field | Value | Source |
+|---|---|---|
+| Train latent volumes/epoch (corpus_picasso, role=cv) | 1,751 | union across 6 cohorts |
+| Required epochs to match | 286,000 / 1,751 ≈ 163.3 → **164** | rounded up |
+| Batch size | 4 (paper-faithful) | matches §2.5 |
+| Patience | 0 (fixed schedule, no early-stop) | matches "fixed budget" interpretation |
+
+This sets T1C-RFlow on the **same fairness contract** as pGAN and SynDiff
+(matched data-exposure budget), per the 2026-06-15 harmonisation. The
+earlier (max_epochs=10000, patience=100) configuration is superseded.
+
 ## Paired comparison axes (vs `picasso_s1_1000ep_fft.yaml`)
 
 | Axis | VENA reference | T1C-RFlow wrapper | Match |
@@ -215,8 +246,8 @@ the speed/quality trade-off VENA highlights as the rectified-flow win.
 | seed | 1337 | 1337 | ✅ exact |
 | fold | 0 | 0 | ✅ exact |
 | corpus_registry | corpus_picasso.json | corpus_picasso.json | ✅ exact |
-| max_epochs | 10000 | 10000 | ✅ exact |
-| patience | 100 (on train loss) | 100 (on train loss) | ✅ exact (different metric internally — single L1 vs FM CFM) |
+| max_epochs | 10000 (patience-bound) | **164** (paper-budget fixed) | ⚠ asymmetric by design — see "Paper-budget rationale" above |
+| patience | 100 (on train loss) | 0 (fixed budget) | ⚠ same |
 | save cadence | every 25 epochs | every 25 epochs | ✅ exact |
 | batch_size | 4 | 4 | ✅ exact |
 | num_workers | 8 | 8 | ✅ exact |

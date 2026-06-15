@@ -19,7 +19,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR_REMOTE="${REPO_DIR_REMOTE:-/mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA}"
-CONDA_SH="${CONDA_SH:-/mnt/home/users/tic_163_uma/mpascual/fscratch/miniconda3/etc/profile.d/conda.sh}"
+CONDA_SH="${CONDA_SH:-/mnt/home/soft/miniconda/programs/x86_64/miniconda3_py310_23.1.0/etc/profile.d/conda.sh}"
 CONDA_ENV_PATH="${CONDA_ENV_PATH:-/mnt/home/users/tic_163_uma/mpascual/fscratch/conda_envs/vena-v100-syndiff}"
 CONFIG_PATH="${REPO_DIR_REMOTE}/routines/competitors/syndiff/configs/smoke_loginexa_t1pre_2ep.yaml"
 LOG_DIR="${LOG_DIR:-/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/competitors/syndiff}"
@@ -53,22 +53,32 @@ ssh loginexa "test -d '${CONDA_ENV_PATH}'" || {
     exit 1
 }
 
-# conda activate in the remote shell so ninja / nvcc / cpp_extension
-# subprocesses find them via PATH; set CUDA_HOME=$CONDA_PREFIX so the JIT
-# extension build links against the in-env cuda-toolkit.
-REMOTE_CMD="source '${CONDA_SH}' && conda activate '${CONDA_ENV_PATH}' \
-&& cd '${REPO_DIR_REMOTE}' \
-&& export PYTHONPATH='${REPO_DIR_REMOTE}/src:${REPO_DIR_REMOTE}:'\$PYTHONPATH \
-&& export PYTHONUNBUFFERED=1 \
-&& export CUDA_VISIBLE_DEVICES=${GPU_ID} \
-&& export CUDA_HOME=\$CONDA_PREFIX \
-&& export CC=\$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-gcc \
-&& export CXX=\$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++ \
-&& export TORCH_CUDA_ARCH_LIST=7.0 \
-&& export TORCH_EXTENSIONS_DIR='${TORCH_EXTENSIONS_DIR}' \
-&& python -m routines.competitors.syndiff.cli '${CONFIG_PATH}' 2>&1 | tee -a '${LOG_DIR}/${SESSION}.log'"
+# Write a tiny helper script on loginexa, then tmux-launch *it*. This avoids
+# the layered-quote escaping problem of inlining the whole pipeline through
+# `tmux new-session -d -s X "..."` (which silently nukes the session if any
+# nested quote eats a `&&`).
+HELPER="/tmp/vena_syndiff_loginexa_runner.sh"
+ssh loginexa "cat > '${HELPER}' <<'EOF'
+#!/usr/bin/env bash
+# Drop -u: conda's gxx_linux-64 activate script references SYS_SYSROOT without
+# guarding for unset (\${SYS_SYSROOT:-}); set -u would kill activation.
+set -eo pipefail
+source '${CONDA_SH}'
+conda activate '${CONDA_ENV_PATH}'
+cd '${REPO_DIR_REMOTE}'
+export PYTHONPATH='${REPO_DIR_REMOTE}/src:${REPO_DIR_REMOTE}:'\${PYTHONPATH:-}
+export PYTHONUNBUFFERED=1
+export CUDA_VISIBLE_DEVICES=${GPU_ID}
+export CUDA_HOME=\$CONDA_PREFIX
+export CC=\$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-gcc
+export CXX=\$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++
+export TORCH_CUDA_ARCH_LIST=7.0
+export TORCH_EXTENSIONS_DIR='${TORCH_EXTENSIONS_DIR}'
+python -m routines.competitors.syndiff.cli '${CONFIG_PATH}' 2>&1 | tee -a '${LOG_DIR}/${SESSION}.log'
+EOF
+chmod +x '${HELPER}'"
 
-ssh loginexa "tmux new-session -d -s '${SESSION}' \"${REMOTE_CMD}\""
+ssh loginexa "tmux new-session -d -s '${SESSION}' '${HELPER}'"
 
 echo ""
 echo "Submitted ✓"

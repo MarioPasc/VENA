@@ -60,6 +60,11 @@ dependencies = [
     # The wheel must match the installed torch's CUDA tag; pick at install
     # time via --extra-index-url like torch.
     "torchvision>=0.20",
+    # ml_collections is required by the ResViT competitor (Dalmaz et al. 2022)
+    # for its transformer_configs.py — vendored upstream uses ml_collections
+    # ConfigDict to describe the Res-ViT-B_16 / Res-ViT-L_16 architectures.
+    # See routines/competitors/resvit/.
+    "ml_collections>=0.1.1",
     # Optimally Oriented Flux (Law & Chung 2008) is consumed through ITK +
     # ITK-TubeTK Python bindings. ITK ships the Hessian / oriented-flux
     # primitives; ITK-TubeTK adds the curated vessel-enhancement filters
@@ -156,6 +161,8 @@ vena-competitor-t1c-rflow = "routines.competitors.t1c_rflow.cli:main"
 vena-competitor-t1c-rflow-infer = "routines.competitors.t1c_rflow.infer_cli:main"
 vena-competitor-syndiff = "routines.competitors.syndiff.cli:main"
 vena-competitor-syndiff-infer = "routines.competitors.syndiff.infer_cli:main"
+vena-competitor-resvit = "routines.competitors.resvit.cli:main"
+vena-competitor-resvit-infer = "routines.competitors.resvit.infer_cli:main"
 
 # ----------------------------------------------------------------------------
 # Setuptools layout — src/-layout for the library, flat-layout for routines/
