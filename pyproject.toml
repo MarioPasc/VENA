@@ -154,6 +154,8 @@ vena-competitor-pgan = "routines.competitors.pgan_cgan.cli:main"
 vena-competitor-pgan-infer = "routines.competitors.pgan_cgan.infer_cli:main"
 vena-competitor-t1c-rflow = "routines.competitors.t1c_rflow.cli:main"
 vena-competitor-t1c-rflow-infer = "routines.competitors.t1c_rflow.infer_cli:main"
+vena-competitor-syndiff = "routines.competitors.syndiff.cli:main"
+vena-competitor-syndiff-infer = "routines.competitors.syndiff.infer_cli:main"
 
 # ----------------------------------------------------------------------------
 # Setuptools layout — src/-layout for the library, flat-layout for routines/

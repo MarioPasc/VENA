@@ -369,6 +369,83 @@ the same kwargs and use `scheduler.set_timesteps(num_inference_steps=K,
 input_img_size_numel=numel(z_curr))` per the upstream's `test_*.py`
 pattern (T1C-RFlow `test_rflow.py:269-283`).
 
+### Step 3.9 — Dedicated conda env for build-time native deps (real, hit on SynDiff integration)
+
+Some competitors ship custom CUDA / C++ extensions that compile at first
+import via `torch.utils.cpp_extension.load(...)` (StyleGAN2 fused ops in
+SynDiff: `utils/op/upfirdn2d_kernel.cu`, `fused_bias_act_kernel.cu`). This
+adds two requirements that the main `vena` / `vena-v100` envs do not carry:
+
+1. `ninja` in the env (build driver).
+2. A `torch` wheel whose bundled CUDA matches the system driver — the
+   fused extension links against the same CUDA the wheel was compiled
+   with, so a mismatched env raises a cryptic linker error rather than
+   building.
+
+**Decision rule.** If the upstream has any of:
+
+- `utils/op/*.cpp` / `*.cu` source files,
+- `torch.utils.cpp_extension.load(...)` at module top,
+- a `setup.py` with `ext_modules = [CUDAExtension(...)]`,
+
+then **fork a dedicated env** rather than polluting the shared one. Naming
+convention: `vena-<comp>` for A100 / Ada (server-3 RTX 4090 + Picasso) and
+`vena-v100-<comp>` for loginexa V100 (sm_70 requires cu121 wheels).
+
+**Env recipe template** (mirror in `.claude/notes/validation/<comp>.md`
+so the user can re-create it on each platform):
+
+```bash
+mamba create -n vena-<comp> python=3.10 -y     # Ada/A100 platforms
+conda activate vena-<comp>
+pip install torch==2.4.* torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install ninja h5py numpy scipy scikit-image nibabel rich pydantic omegaconf pyyaml pytest matplotlib
+cd <REPO_DIR> && pip install -e ".[dev]" --no-deps     # --no-deps keeps pinned torch
+
+# V100 (loginexa) variant — only the wheel index differs
+pip install torch==2.4.* torchvision --index-url https://download.pytorch.org/whl/cu121
+```
+
+**Launcher contract.** Pin `TORCH_EXTENSIONS_DIR` to a stable
+platform-local path so the build cache persists between jobs (otherwise
+each smoke re-compiles for ~30-60 s). Pattern:
+
+```bash
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/media/hddb/mario/.cache/torch_extensions/vena-<comp>}"
+mkdir -p "${TORCH_EXTENSIONS_DIR}"
+```
+
+**Sanity-check the build** before queuing a 4-day SLURM job — failing on
+the login node is cheap, failing inside a 4-day sbatch is not:
+
+```bash
+TORCH_EXTENSIONS_DIR="$HOME/.cache/torch_extensions/vena-<comp>" \
+    "${REMOTE_PYTHON}" -c "
+import sys; sys.path.insert(0, '${REPO_DIR}/src/external/<comp>/upstream')
+from utils.op import upfirdn2d, fused_act
+print('fused ops built OK')
+"
+```
+
+**Fallback (contingency C1 in `PATCHES.md`).** When the CUDA build fails
+on a platform you do not control (Picasso CUDA module bumps, driver
+mismatches), monkey-patch the upstream's `utils/op/__init__.py` to use
+the pure-PyTorch reference implementations bundled in the same module
+(slower but builds nowhere). Document the activation per platform in the
+validation note; don't enable it by default.
+
+**Hand-off pattern.** When the user has not yet built the env on a target
+platform, the agent's correct move is to:
+
+1. Write the integration code through Step 6 in scope.
+2. Surface the env recipe + the launcher command to the user in a single
+   turn.
+3. Pause for confirmation that the env exists.
+4. Then trigger the smoke.
+
+Do **not** attempt to run `pip install` on a remote platform yourself —
+the user owns env lifecycle for these forked envs.
+
 ### Step 4 — Build the routine
 
 ```

@@ -1,0 +1,57 @@
+# Server-3 multi-cohort smoke: SynDiff t1pre → t1c.
+# 1 patient per cv cohort × 4 epochs, batch 1, RTX 4090 (vena-syndiff env).
+# SynDiff trains 8 networks per step so each epoch is heavier than pGAN —
+# expect ~3-6 min per epoch on RTX 4090 even with one patient per cohort.
+runtime:
+  experiments_root: /media/hddb/mario/experiments/competitors/syndiff
+  platform: server3
+  tag: smoke_t1pre_4ep
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  corpus_registry: /home/mariopascual/projects/VENA/routines/fm/train/configs/corpus/corpus_server3.json
+  fold: 0
+  source_modality: t1pre
+  target_modality: t1c
+  image_size: 256                   # 256 is hard-baked in NCSN++ via attn_resolutions=(16,)
+  min_brain_voxels: 1000
+  max_patients_per_cohort: 1
+
+hp:
+  # NCSN++ trunk — README example values
+  num_channels_dae: 64
+  ch_mult: [1, 1, 2, 2, 4, 4]
+  num_res_blocks: 2
+  attn_resolutions: [16]
+  dropout: 0.0
+  embedding_type: positional
+  nz: 100
+  z_emb_dim: 256
+  t_emb_dim: 256
+  n_mlp: 3
+  ngf: 64
+  # Diffusion schedule — paper §IV.B: T=1000, k=250 → T/k=4 reverse steps
+  num_timesteps: 4
+  beta_min: 0.1
+  beta_max: 20.0
+  # Optimisation
+  lr_g: 1.6e-4
+  lr_d: 1.0e-4
+  beta1: 0.5
+  beta2: 0.9
+  r1_gamma: 1.0
+  lazy_reg: 10
+  lambda_l1_loss: 0.5
+  use_ema: true
+  ema_decay: 0.999
+  no_lr_decay: false
+  # Smoke knobs
+  max_epochs: 4
+  patience: 0                        # disable early-stop for smoke
+  save_epoch_freq: 2
+  log_every: 25
+  batch_size: 1
+  # num_workers=0 — multi-cohort H5 hits the h5py + multiprocessing deadlock
+  # path (skill sub-step 3.5). Smoke is fast enough in-process.
+  num_workers: 0

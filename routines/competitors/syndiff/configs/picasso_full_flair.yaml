@@ -1,0 +1,48 @@
+# Picasso A100 — SynDiff flair → t1c (panel run; mirrors pgan_cgan/picasso_full_flair.yaml).
+runtime:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/syndiff
+  platform: picasso
+  tag: full_flair_t1c
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  source_modality: flair
+  target_modality: t1c
+  image_size: 256
+  min_brain_voxels: 1000
+  max_patients_per_cohort: null
+
+hp:
+  num_channels_dae: 64
+  ch_mult: [1, 1, 2, 2, 4, 4]
+  num_res_blocks: 2
+  attn_resolutions: [16]
+  dropout: 0.0
+  embedding_type: positional
+  nz: 100
+  z_emb_dim: 256
+  t_emb_dim: 256
+  n_mlp: 3
+  ngf: 64
+  num_timesteps: 4
+  beta_min: 0.1
+  beta_max: 20.0
+  lr_g: 1.6e-4
+  lr_d: 1.0e-4
+  beta1: 0.5
+  beta2: 0.9
+  r1_gamma: 1.0
+  lazy_reg: 10
+  lambda_l1_loss: 0.5
+  use_ema: true
+  ema_decay: 0.999
+  no_lr_decay: false
+  max_epochs: 50
+  patience: 0
+  save_epoch_freq: 5
+  log_every: 200
+  batch_size: 1
+  num_workers: 4
