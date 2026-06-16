@@ -78,13 +78,20 @@ logger = logging.getLogger(__name__)
 #                                       untouched. The s1→s2 experiment path.
 # * absolute ``.ckpt``    → WARM_START : same as above for external checkpoints.
 # * anything else         → raise InvalidResumeFromError (no silent fallback).
+#
+# WARM_START → CONTINUE auto-promotion: if the YAML carries a WARM_START
+# ``resume_from`` and a recipe-matching sibling dir (``*_{stage}_{tag}_*/``)
+# already exists with ``checkpoints/last.ckpt``, the resolver promotes to
+# CONTINUE on that sibling. This is the Picasso walltime-resubmit case — the
+# first launch creates the warm-started dir; subsequent launches of the same
+# YAML continue in place rather than re-warm-starting from the external
+# source. ``decision.json``'s ``resume_source`` still records the original
+# YAML value so the audit trail of intent is preserved.
 # =============================================================================
 
 
 # 4-field run_id: <UTC>_<stage>_<tag>_<sha>; tag/stage are ``[a-z0-9_]+``.
-_RUN_ID_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[a-z0-9_]+_[a-z0-9_]+_[0-9a-f]{6,}$"
-)
+_RUN_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[a-z0-9_]+_[a-z0-9_]+_[0-9a-f]{6,}$")
 
 
 class ResumeMode(str, Enum):
@@ -686,9 +693,7 @@ class FMTrainRoutineEngine:
             (run_dir / sub).mkdir(parents=True, exist_ok=True)
         return run_id, run_dir
 
-    def _resolve_run_dir(
-        self, resume_ckpt: str | None, mode: ResumeMode
-    ) -> tuple[str, Path, bool]:
+    def _resolve_run_dir(self, resume_ckpt: str | None, mode: ResumeMode) -> tuple[str, Path, bool]:
         """Choose the run directory based on the resume mode.
 
         * CONTINUE — reuse the dir of the prior run we resolved a checkpoint
@@ -892,7 +897,12 @@ class FMTrainRoutineEngine:
           job inherited an s1 ``last.ckpt``.
         * WARM_START → either ``experiments_root/<run_id>/checkpoints/last.ckpt``
           (for a literal run_id) or the explicit absolute ``.ckpt`` path. The
-          source run may live under any recipe — that's the point.
+          source run may live under any recipe — that's the point. Before
+          resolving the source, the WARM_START branch checks for a sibling
+          dir under the *current* recipe; if one exists with ``last.ckpt``
+          the resolver returns ``(<sibling>/last.ckpt, CONTINUE)`` so the
+          walltime-resubmit case continues in place instead of repeatedly
+          warm-starting from the external source.
         * Unrecognised → ``InvalidResumeFromError`` (no silent fallback).
 
         ``exclude_dir`` skips a just-created run dir whose ``checkpoints/`` is
@@ -925,12 +935,43 @@ class FMTrainRoutineEngine:
             logger.info(
                 "CONTINUE (%s): no checkpoint under %s matching recipe %s/%s; "
                 "treating as BASELINE (fresh run from MAISI trunk).",
-                rf, root, cfg.run.stage, cfg.run.tag,
+                rf,
+                root,
+                cfg.run.stage,
+                cfg.run.tag,
             )
             return None, ResumeMode.BASELINE
 
         # WARM_START
         assert mode is ResumeMode.WARM_START and rf is not None
+
+        # Auto-promotion: a WARM_START YAML resubmitted after the first launch
+        # (Picasso walltime kill is the canonical case) should CONTINUE the
+        # already-created warm-started run rather than re-warm-start from the
+        # original external source. If a recipe-matching sibling dir
+        # ``*_{stage}_{tag}_*/`` already carries ``checkpoints/last.ckpt``,
+        # promote to CONTINUE on that dir; ``resume_source`` in decision.json
+        # still records the original YAML value so the audit trail of "what
+        # the user asked for" survives. Skip the just-minted run dir so a
+        # CONTINUE promotion never targets an empty sibling.
+        glob_pat = f"*_{cfg.run.stage}_{cfg.run.tag}_*/"
+        skip = exclude_dir.resolve() if exclude_dir is not None else None
+        sibling_dirs = sorted(
+            (d for d in root.glob(glob_pat) if d.is_dir() and d.resolve() != skip),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for d in sibling_dirs:
+            cand = d / "checkpoints" / "last.ckpt"
+            if cand.is_file():
+                logger.info(
+                    "WARM_START -> CONTINUE auto-promotion: sibling %s has last.ckpt; "
+                    "original resume_from=%s preserved in decision.json's resume_source.",
+                    d.name,
+                    rf,
+                )
+                return str(cand), ResumeMode.CONTINUE
+
         if _RUN_ID_RE.match(rf):
             cand = root / rf / "checkpoints" / "last.ckpt"
             if not cand.is_file():
@@ -942,9 +983,7 @@ class FMTrainRoutineEngine:
 
         p = Path(rf)
         if not p.is_file():
-            raise InvalidResumeFromError(
-                f"WARM_START: explicit path {rf!r} does not exist."
-            )
+            raise InvalidResumeFromError(f"WARM_START: explicit path {rf!r} does not exist.")
         logger.info("WARM_START: weights from explicit path %s", p)
         return str(p), mode
 
@@ -985,9 +1024,11 @@ class FMTrainRoutineEngine:
             resume_source = cfg.run.resume_from
             resume_source_run_id = (
                 resume_source
-                if (resume_mode is ResumeMode.WARM_START
+                if (
+                    resume_mode is ResumeMode.WARM_START
                     and resume_source is not None
-                    and _RUN_ID_RE.match(resume_source))
+                    and _RUN_ID_RE.match(resume_source)
+                )
                 else None
             )
             decision_path.write_text(

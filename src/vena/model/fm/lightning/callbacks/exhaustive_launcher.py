@@ -188,9 +188,23 @@ class ExhaustiveValLauncher(pl.Callback):
         """
         if self.prune_snapshots_keep <= 0:
             return
+
+        # Sort by numeric epoch, not by directory name. ``_launch`` writes the
+        # dir as f"epoch_{epoch:03d}" (min-width 3), so ``epoch_975`` and
+        # ``epoch_1000`` are both valid but lex-sort places ``epoch_1000``
+        # between ``epoch_100`` and ``epoch_125``. With ``prune_snapshots_keep=2``
+        # the freshly-launched ≥1000 epoch dir then falls outside the keep
+        # window and its ``ema_snapshot.pt`` is deleted before the spawned
+        # subprocess can ``torch.load`` it (FileNotFoundError on long runs).
+        def _epoch_key(p: Path) -> int:
+            try:
+                return int(p.name.removeprefix("epoch_"))
+            except ValueError:
+                return -1
+
         epoch_dirs = sorted(
             (d for d in self.out_root.glob("epoch_*") if d.is_dir()),
-            key=lambda p: p.name,
+            key=_epoch_key,
         )
         if len(epoch_dirs) <= self.prune_snapshots_keep:
             return

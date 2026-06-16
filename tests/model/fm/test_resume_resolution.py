@@ -17,7 +17,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from routines.fm.train.engine import (
     FMTrainRoutineConfig,
     FMTrainRoutineEngine,
@@ -92,9 +91,7 @@ def test_baseline_when_empty_string(tmp_path: Path) -> None:
 
 def test_continue_picks_same_recipe(tmp_path: Path) -> None:
     root = tmp_path / "experiments"
-    prior = _make_run(
-        root, "2026-01-01_00-00-00_s1_fft_cfm_aaaaaaaa", ["last.ckpt"]
-    )
+    prior = _make_run(root, "2026-01-01_00-00-00_s1_fft_cfm_aaaaaaaa", ["last.ckpt"])
     eng = FMTrainRoutineEngine(_cfg(root, "latest", stage="s1", tag="fft_cfm"))
     path, mode = eng._resolve_resume_ckpt()
     assert path == str(prior / "checkpoints" / "last.ckpt")
@@ -130,9 +127,7 @@ def test_continue_ignores_different_stage(tmp_path: Path) -> None:
 
 def test_continue_skips_empty_current_dir(tmp_path: Path) -> None:
     root = tmp_path / "experiments"
-    prior = _make_run(
-        root, "2026-01-01_00-00-00_s1_fft_cfm_aaaaaaaa", ["last.ckpt"]
-    )
+    prior = _make_run(root, "2026-01-01_00-00-00_s1_fft_cfm_aaaaaaaa", ["last.ckpt"])
     current = _make_run(root, "2026-01-02_00-00-00_s1_fft_cfm_bbbbbbbb", [])
     eng = FMTrainRoutineEngine(_cfg(root, "latest", stage="s1", tag="fft_cfm"))
     path, mode = eng._resolve_resume_ckpt(exclude_dir=current)
@@ -187,9 +182,7 @@ def test_warm_start_from_run_id(tmp_path: Path) -> None:
     src = _make_run(root, src_run_id, ["last.ckpt"])
     # Destination recipe is different (s2 + lora_r16_contrastive) — that's the
     # whole point of WARM_START (s1→s2 experiment).
-    eng = FMTrainRoutineEngine(
-        _cfg(root, src_run_id, stage="s2", tag="lora_r16_contrastive")
-    )
+    eng = FMTrainRoutineEngine(_cfg(root, src_run_id, stage="s2", tag="lora_r16_contrastive"))
     path, mode = eng._resolve_resume_ckpt()
     assert path == str(src / "checkpoints" / "last.ckpt")
     assert mode is ResumeMode.WARM_START
@@ -208,9 +201,7 @@ def test_warm_start_missing_run_id_raises(tmp_path: Path) -> None:
     """A run_id that doesn't exist under experiments_root must FAIL LOUD."""
     root = tmp_path / "experiments"
     root.mkdir(parents=True, exist_ok=True)
-    eng = FMTrainRoutineEngine(
-        _cfg(root, "2026-01-01_00-00-00_s1_fft_cfm_aaaaaaaa")
-    )
+    eng = FMTrainRoutineEngine(_cfg(root, "2026-01-01_00-00-00_s1_fft_cfm_aaaaaaaa"))
     with pytest.raises(InvalidResumeFromError):
         eng._resolve_resume_ckpt()
 
@@ -230,3 +221,131 @@ def test_unrecognised_string_raises(tmp_path: Path) -> None:
     eng = FMTrainRoutineEngine(_cfg(tmp_path / "experiments", "garbage"))
     with pytest.raises(InvalidResumeFromError):
         eng._resolve_resume_ckpt()
+
+
+# ---------------------------------------------------------------------------
+# WARM_START → CONTINUE auto-promotion
+#
+# Picasso walltime resubmit case: the first launch of a WARM_START YAML
+# creates a new dir + loads the external source; subsequent launches of the
+# same YAML find the just-created recipe-matching sibling and continue from
+# its ``last.ckpt`` rather than re-warm-starting from the source.
+# ---------------------------------------------------------------------------
+
+
+def test_warm_start_promoted_to_continue_when_sibling_has_last(tmp_path: Path) -> None:
+    root = tmp_path / "experiments"
+    ckpt = tmp_path / "external.ckpt"
+    ckpt.write_text("x")
+    # The first launch already minted this dir + wrote last.ckpt.
+    sibling = _make_run(
+        root,
+        "2026-02-01_00-00-00_s2_fft_contrastive_s1warm_cccccccc",
+        ["last.ckpt"],
+    )
+    eng = FMTrainRoutineEngine(_cfg(root, str(ckpt), stage="s2", tag="fft_contrastive_s1warm"))
+    path, mode = eng._resolve_resume_ckpt()
+    assert path == str(sibling / "checkpoints" / "last.ckpt")
+    assert mode is ResumeMode.CONTINUE
+
+
+def test_warm_start_not_promoted_when_sibling_missing_last(tmp_path: Path) -> None:
+    """Sibling dir exists but has no last.ckpt → genuine first-time WARM_START."""
+    root = tmp_path / "experiments"
+    ckpt = tmp_path / "external.ckpt"
+    ckpt.write_text("x")
+    _make_run(
+        root,
+        "2026-02-01_00-00-00_s2_fft_contrastive_s1warm_cccccccc",
+        [],  # no last.ckpt → empty dir does not satisfy promotion
+    )
+    eng = FMTrainRoutineEngine(_cfg(root, str(ckpt), stage="s2", tag="fft_contrastive_s1warm"))
+    path, mode = eng._resolve_resume_ckpt()
+    assert path == str(ckpt)
+    assert mode is ResumeMode.WARM_START
+
+
+def test_warm_start_not_promoted_by_different_recipe_sibling(tmp_path: Path) -> None:
+    """A sibling of a DIFFERENT recipe must not trigger promotion.
+
+    Regression for the tag-isolation contract: the ``*_s1warm`` tag used by
+    Picasso warm-start YAMLs is intentionally distinct from the BASELINE tag
+    (e.g. ``s2_fft_contrastive``); the promotion glob must respect that.
+    """
+    root = tmp_path / "experiments"
+    ckpt = tmp_path / "external.ckpt"
+    ckpt.write_text("x")
+    _make_run(
+        root,
+        "2026-01-01_00-00-00_s2_fft_contrastive_aaaaaaaa",
+        ["last.ckpt"],
+    )
+    eng = FMTrainRoutineEngine(_cfg(root, str(ckpt), stage="s2", tag="fft_contrastive_s1warm"))
+    path, mode = eng._resolve_resume_ckpt()
+    assert path == str(ckpt)
+    assert mode is ResumeMode.WARM_START
+
+
+def test_warm_start_promotion_picks_newest_sibling(tmp_path: Path) -> None:
+    import os
+
+    root = tmp_path / "experiments"
+    ckpt = tmp_path / "external.ckpt"
+    ckpt.write_text("x")
+    older = _make_run(
+        root,
+        "2026-01-01_00-00-00_s2_fft_contrastive_s1warm_aaaaaaaa",
+        ["last.ckpt"],
+    )
+    newer = _make_run(
+        root,
+        "2026-02-01_00-00-00_s2_fft_contrastive_s1warm_bbbbbbbb",
+        ["last.ckpt"],
+    )
+    # Pin mtimes so the test is independent of FS resolution.
+    os.utime(older, (1000.0, 1000.0))
+    os.utime(newer, (2000.0, 2000.0))
+    eng = FMTrainRoutineEngine(_cfg(root, str(ckpt), stage="s2", tag="fft_contrastive_s1warm"))
+    path, mode = eng._resolve_resume_ckpt()
+    assert path == str(newer / "checkpoints" / "last.ckpt")
+    assert mode is ResumeMode.CONTINUE
+
+
+def test_warm_start_promotion_skips_excluded_dir(tmp_path: Path) -> None:
+    """The just-minted (still-empty) run dir is excluded; promotion still works
+    against the older sibling that has last.ckpt."""
+    root = tmp_path / "experiments"
+    ckpt = tmp_path / "external.ckpt"
+    ckpt.write_text("x")
+    sibling = _make_run(
+        root,
+        "2026-01-01_00-00-00_s2_fft_contrastive_s1warm_aaaaaaaa",
+        ["last.ckpt"],
+    )
+    current = _make_run(
+        root,
+        "2026-02-01_00-00-00_s2_fft_contrastive_s1warm_bbbbbbbb",
+        [],  # freshly-minted, no checkpoint yet
+    )
+    eng = FMTrainRoutineEngine(_cfg(root, str(ckpt), stage="s2", tag="fft_contrastive_s1warm"))
+    path, mode = eng._resolve_resume_ckpt(exclude_dir=current)
+    assert path == str(sibling / "checkpoints" / "last.ckpt")
+    assert mode is ResumeMode.CONTINUE
+
+
+def test_warm_start_promotion_applies_to_run_id_source_too(tmp_path: Path) -> None:
+    """Auto-promotion fires regardless of the WARM_START source form
+    (abs path vs. literal run_id)."""
+    root = tmp_path / "experiments"
+    src_run_id = "2026-01-01_00-00-00_s1_fft_cfm_aaaaaaaa"
+    _make_run(root, src_run_id, ["last.ckpt"])
+    # A recipe-matching sibling already exists in the destination recipe.
+    sibling = _make_run(
+        root,
+        "2026-02-01_00-00-00_s2_fft_contrastive_s1warm_cccccccc",
+        ["last.ckpt"],
+    )
+    eng = FMTrainRoutineEngine(_cfg(root, src_run_id, stage="s2", tag="fft_contrastive_s1warm"))
+    path, mode = eng._resolve_resume_ckpt()
+    assert path == str(sibling / "checkpoints" / "last.ckpt")
+    assert mode is ResumeMode.CONTINUE

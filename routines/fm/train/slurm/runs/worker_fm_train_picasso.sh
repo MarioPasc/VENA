@@ -9,10 +9,14 @@
 #   REPO_DIR         absolute path to the VENA repo on fscratch
 #   CONFIG_PATH      absolute path to the run YAML
 #
-# Auto-resubmits itself once on SIGTERM if the YAML has ``run.resume_from:
-# latest`` set — the run dir will be reused and the LoRA / FFT trunk +
-# ControlNet + EMA + optimiser state restore natively from the last
-# checkpoint.
+# Auto-resubmits itself on SIGTERM whenever the YAML carries a
+# ``run.resume_from`` value other than ``baseline`` / null. For
+# ``resume_from: latest`` (CONTINUE) the run dir is reused natively.
+# For ``resume_from: <run_id>`` or ``resume_from: <abs path>``
+# (WARM_START) the engine auto-promotes to CONTINUE on resubmit when
+# the recipe-matching sibling dir already exists with ``last.ckpt`` —
+# so the second launch continues in place rather than re-warm-starting
+# from the external source.
 
 #SBATCH --time=7-00:00:00
 #SBATCH --ntasks=1
@@ -81,21 +85,31 @@ set -e
 # ============================================================================
 # AUTO-RESUBMIT ON SIGTERM (124) OR TIME LIMIT (142)
 # ============================================================================
-# Picasso may kill the job at the time cap; if the YAML has resume_from set
-# (we set ``resume_from: latest`` in every production YAML) the worker
-# resubmits itself once so the training chain picks up at the last
-# checkpoint. RC values: 124 = python timeout, 137 = SIGKILL, 143 = SIGTERM.
+# Picasso may kill the job at the time cap. We resubmit on any
+# ``resume_from`` value other than ``baseline`` / null:
+#   * ``latest`` / ``best``   → CONTINUE (engine reuses dir).
+#   * ``<run_id>`` / abs path → WARM_START on first launch, auto-promoted to
+#                                CONTINUE on the resubmit by the engine (a
+#                                recipe-matching sibling dir now carries
+#                                ``last.ckpt``).
+# RC values: 124 = python timeout, 137 = SIGKILL, 143 = SIGTERM.
 RESUBMIT_RC_SET="124 137 143"
 if echo " ${RESUBMIT_RC_SET} " | grep -q " ${RC} "; then
-    if grep -qE "^[[:space:]]*resume_from:[[:space:]]*latest" "${CONFIG_PATH}"; then
-        echo "[auto-resubmit] python exited rc=${RC}; resubmitting self with resume_from=latest"
-        sbatch \
-            -J "${SLURM_JOB_NAME:-fm-train}" \
-            --export=ALL,CONDA_ENV_NAME="${CONDA_ENV_NAME}",REPO_DIR="${REPO_DIR}",CONFIG_PATH="${CONFIG_PATH}" \
-            "$0" || echo "[auto-resubmit] sbatch failed; manual resubmission required"
-    else
-        echo "[auto-resubmit] python exited rc=${RC} but CONFIG lacks resume_from: latest; not resubmitting"
-    fi
+    RESUME_VAL=$(grep -E "^[[:space:]]*resume_from:[[:space:]]" "${CONFIG_PATH}" \
+                 | head -n 1 | sed -E "s/^[[:space:]]*resume_from:[[:space:]]*//; s/[[:space:]]+$//" \
+                 | tr -d "\"'")
+    case "${RESUME_VAL}" in
+        ""|"baseline"|"null"|"~")
+            echo "[auto-resubmit] python exited rc=${RC} but CONFIG resume_from='${RESUME_VAL}'; not resubmitting"
+            ;;
+        *)
+            echo "[auto-resubmit] python exited rc=${RC}; resubmitting self (resume_from='${RESUME_VAL}')"
+            sbatch \
+                -J "${SLURM_JOB_NAME:-fm-train}" \
+                --export=ALL,CONDA_ENV_NAME="${CONDA_ENV_NAME}",REPO_DIR="${REPO_DIR}",CONFIG_PATH="${CONFIG_PATH}" \
+                "$0" || echo "[auto-resubmit] sbatch failed; manual resubmission required"
+            ;;
+    esac
 fi
 
 # ============================================================================
