@@ -1,0 +1,38 @@
+# 3D-Latent-Pix2Pix (Isola 2017 + Eidex 2025 §4) — multi-cohort smoke on
+# the ICAI server-3 workstation (RTX 4090 24GB). Kept on disk for
+# reproducibility — the user opted to skip server-3 testing for this
+# competitor and go directly to loginexa (2026-06-17).
+runtime:
+  experiments_root: /media/hddb/mario/experiments/competitors/lpix2pix_3d
+  platform: server3
+  tag: smoke_4ep_multicohort
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  corpus_registry: /home/mariopascual/projects/VENA/routines/fm/train/configs/corpus/corpus_server3.json
+  fold: 0
+  input_latents: [t1pre, flair]
+  target_latent: t1c
+  max_patients_per_cohort: 1
+
+hp:
+  latent_channels: 4
+  cond_latents: 2
+  disc_ndf: 64
+  disc_num_layers: 4
+  lambda_l1: 100.0
+  lr_g: 1.0e-4
+  lr_d: 1.0e-4
+  beta1: 0.5
+  beta2: 0.999
+  weight_decay: 1.0e-4
+  batch_size: 1               # smoke — keep VRAM low on a shared 4090
+  max_epochs: 4
+  patience: 0                 # disable early stop for smoke
+  save_epoch_freq: 1
+  log_every: 5
+  # num_workers=0 — multi-cohort H5 hits an h5py + multiprocessing deadlock
+  # when several workers open the same family concurrently (skill §3.5).
+  num_workers: 0
+  use_amp: true

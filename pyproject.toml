@@ -170,6 +170,10 @@ vena-competitor-resvit = "routines.competitors.resvit.cli:main"
 vena-competitor-resvit-infer = "routines.competitors.resvit.infer_cli:main"
 vena-competitor-dit-3d = "routines.competitors.dit_3d.cli:main"
 vena-competitor-dit-3d-infer = "routines.competitors.dit_3d.infer_cli:main"
+vena-competitor-lpix2pix-3d = "routines.competitors.lpix2pix_3d.cli:main"
+vena-competitor-lpix2pix-3d-infer = "routines.competitors.lpix2pix_3d.infer_cli:main"
+vena-competitor-lddpm-3d = "routines.competitors.lddpm_3d.cli:main"
+vena-competitor-lddpm-3d-infer = "routines.competitors.lddpm_3d.infer_cli:main"
 
 # ----------------------------------------------------------------------------
 # Setuptools layout — src/-layout for the library, flat-layout for routines/

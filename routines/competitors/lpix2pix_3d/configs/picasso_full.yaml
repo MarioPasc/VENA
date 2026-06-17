@@ -1,0 +1,70 @@
+# Picasso A100 full 3D-Latent-Pix2Pix training — multi-cohort, fair-comparison
+# with VENA's routines/fm/train/configs/runs/picasso_s1_1000ep_fft.yaml and
+# the sibling latent-baseline competitors (T1C-RFlow, 3D-DiT).
+#
+# Reads the same corpus registry VENA uses (corpus_picasso.json: 6 cv cohorts —
+# UCSF-PDGM + BraTS-GLI + UPENN-GBM + IvyGAP + LUMIERE + REMBRANDT), same fold,
+# same seed.
+#
+# Paired-comparison axes (match VENA's reference run on the matchable ones):
+#   seed=1337, fold=0, batch=4, workers=8, checkpoint every 25 epochs.
+#
+# Paper-budget fairness (skill §3.11, locked 2026-06-15):
+#   The Eidex 2025 paper trained ALL its baselines (DDPM, Pix2pix, DiT-3D,
+#   T1C-RFlow) on the same BraTS-2024 budget: 2,860 train samples × 100
+#   epochs = 286,000 sample exposures. Our multi-cohort train union has
+#   1,751 latent volumes/epoch. To match the paper's data exposure:
+#       max_epochs = ceil(286,000 / 1,751) ≈ 164.
+#   Same cap T1C-RFlow and 3D-DiT use — keeps the three latent-baseline
+#   competitors on identical budgets so their head-to-head numbers are
+#   comparable. `patience: 0` because the budget is deliberately fixed.
+#
+# Competitor-internal hyperparameters:
+#   * Generator: paper-faithful MAISI 3-level U-Net (same as T1C-RFlow's
+#     U-Net config: [128, 128, 256], 2 res-blocks, no self-attention).
+#     Wrapped to feed zero timesteps so the diffusion U-Net runs as a
+#     deterministic conditional generator (Isola 2017 §3 / vendored
+#     train_pix2pix_t1n_t2f.py:98-106).
+#   * Discriminator: 3D PatchGAN (ndf=64, 4 strided conv layers).
+#   * Loss: BCE adversarial + λ_L1 * L1, λ_L1=100 (Isola §3.2).
+#   * Optimiser: AdamW(lr_G=lr_D=1e-4, betas=(0.5, 0.999), wd=1e-4) for both.
+#   * AMP: enabled (upstream code-faithful; matches T1C-RFlow / DiT-3D).
+#   * No EMA, no gradient clipping, no augmentation — paper-faithful.
+#
+# Citations: Isola, P., Zhu, J.-Y., Zhou, T., & Efros, A. A.
+# "Image-to-Image Translation with Conditional Adversarial Networks." CVPR
+# 2017. arXiv:1611.07004. Eidex, Z. et al. "An Efficient 3D Latent
+# Diffusion Model for T1-contrast Enhanced MRI Generation."
+# arXiv:2509.24194, 2025.
+runtime:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/lpix2pix_3d
+  platform: picasso
+  tag: full_multicohort
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  input_latents: [t1pre, flair]
+  target_latent: t1c
+  max_patients_per_cohort: null   # full fold-0 train union per cohort
+
+hp:
+  latent_channels: 4
+  cond_latents: 2
+  disc_ndf: 64
+  disc_num_layers: 4
+  lambda_l1: 100.0
+  lr_g: 1.0e-4
+  lr_d: 1.0e-4
+  beta1: 0.5
+  beta2: 0.999
+  weight_decay: 1.0e-4
+  batch_size: 4
+  max_epochs: 164
+  patience: 0
+  save_epoch_freq: 25
+  log_every: 200
+  num_workers: 8
+  use_amp: true

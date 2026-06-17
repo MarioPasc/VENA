@@ -1,0 +1,40 @@
+# 3D-LDDPM (Ho et al. 2020 DDPM + Eidex 2025 §4 baseline recipe) — multi-cohort
+# smoke on the ICAI server-3 workstation (RTX 4090 24GB).
+#
+# Reads VENA's server-3 corpus registry, capped at 1 patient per cv cohort to
+# keep the smoke under ~10 min on a 4090. Uses the paper-faithful MAISI U-Net
+# (~49.6M params) so VRAM is well under 24GB with AMP and batch_size=1.
+runtime:
+  experiments_root: /media/hddb/mario/experiments/competitors/lddpm_3d
+  platform: server3
+  tag: smoke_4ep_multicohort
+  gpu_ids: [0]
+  seed: 1337
+
+data:
+  corpus_registry: /home/mariopascual/projects/VENA/routines/fm/train/configs/corpus/corpus_server3.json
+  fold: 0
+  input_latents: [t1pre, flair]
+  target_latent: t1c
+  max_patients_per_cohort: 1   # 1 patient per cv cohort
+
+hp:
+  latent_channels: 4
+  cond_latents: 2
+  # DDPM scheduler kwargs — train_ddpm.py:113-119 verbatim.
+  num_train_timesteps: 1000
+  beta_start: 0.0015
+  beta_end: 0.0195
+  beta_schedule: scaled_linear_beta
+  clip_sample: false
+  lr: 1.0e-5
+  weight_decay: 1.0e-4
+  batch_size: 1               # smoke — keep VRAM low on a shared 4090
+  max_epochs: 4
+  patience: 0                 # disable early stop for smoke
+  save_epoch_freq: 1
+  log_every: 5
+  # num_workers=0 — multi-cohort H5 hits an h5py + multiprocessing deadlock
+  # when several workers open the same family concurrently (skill §3.5).
+  num_workers: 0
+  use_amp: true
