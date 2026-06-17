@@ -1,0 +1,41 @@
+# Picasso full inference YAML — all test patients × all cohorts × full NFE
+# sweep per method's nfe_list. Runs on a single A100; total wallclock ~3 days
+# (dominated by C6-LDDPM at NFE=1000).
+
+run_id_tag: picasso_full
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/benchmarks/inference
+corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
+fold: 0
+device: cuda:0
+# Validation §5.2 requires 5 untimed warmup passes per method before the
+# timed run. Enabled here; disabled in smoke.
+warmup_passes: 5
+
+cohorts:
+  cv_test: [UCSF-PDGM, BraTS-GLI, IvyGAP, LUMIERE, REMBRANDT, UPENN-GBM]
+  test_only: [BraTS-Africa-Glioma, BraTS-Africa-Other]
+  exclude: []
+
+methods:
+  include: null
+  # SynDiff (C3) runs in its own SLURM job via launcher_inference_picasso_syndiff.sh
+  # (vena-syndiff env, Python 3.10 + torch 2.5.1+cu121 + JIT-compiled
+  # fused / upfirdn2d CUDA extensions). Both jobs share the same
+  # `run_id_tag` so their predictions trees merge into one benchmark.
+  exclude: [C3-SynDiff-t1pre, C3-SynDiff-t2, C3-SynDiff-flair]
+
+smoke:
+  enabled: false
+  n_patients_per_cohort: 1
+  use_selection_nfe_only: false
+
+# Full sweep — use each method's declared nfe_list.
+nfe_override: null
+
+figure:
+  enabled: true
+  n_slices: 7
+  slice_offset: 10
+
+log_level: INFO

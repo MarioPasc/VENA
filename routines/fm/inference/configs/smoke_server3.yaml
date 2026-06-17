@@ -1,0 +1,34 @@
+# Server3 smoke YAML — 1 patient per cohort × all methods × selection NFE.
+# Server3 has no wallclock and 1× RTX 4070, so this is a longer-running
+# pipeline-validation pass that does not need the loginexa C6/C7 exclusion.
+
+run_id_tag: smoke_server3
+output_root: /media/hddb/mario/execs/vena/benchmarks/inference
+corpus_registry: /media/hddb/mario/repos/VENA/routines/fm/train/configs/corpus/corpus_server3.json
+models_yaml: /media/hddb/mario/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
+fold: 0
+device: cuda:0
+warmup_passes: 0
+
+cohorts:
+  cv_test: [UCSF-PDGM, BraTS-GLI, IvyGAP, LUMIERE, REMBRANDT, UPENN-GBM]
+  test_only: [BraTS-Africa-Glioma, BraTS-Africa-Other]
+  exclude: []
+
+methods:
+  include: null
+  exclude: [C6-3D-LDDPM, C7-3D-Latent-Pix2Pix]
+
+smoke:
+  enabled: true
+  n_patients_per_cohort: 1
+  use_selection_nfe_only: true
+
+nfe_override: null
+
+figure:
+  enabled: true
+  n_slices: 7
+  slice_offset: 10
+
+log_level: INFO

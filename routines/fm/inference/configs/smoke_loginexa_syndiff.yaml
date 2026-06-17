@@ -1,0 +1,36 @@
+# Companion loginexa smoke for SynDiff — runs in the vena-v100-syndiff env
+# (Python 3.10 + torch 2.5.1+cu121 + ninja + the cached fused/upfirdn2d CUDA
+# extensions baked at SynDiff training time). The main `smoke_loginexa.yaml`
+# runs every other method in vena-v100 (Python 3.11 + torch 2.7.1+cu126).
+# Both write to the same `run_id_tag` so per-method predictions land in a
+# single tree.
+
+run_id_tag: smoke_loginexa
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/benchmarks/inference
+corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
+fold: 0
+device: cuda:0
+warmup_passes: 0
+
+cohorts:
+  cv_test: [UCSF-PDGM, BraTS-GLI, IvyGAP, LUMIERE, REMBRANDT, UPENN-GBM]
+  test_only: [BraTS-Africa-Glioma, BraTS-Africa-Other]
+  exclude: []
+
+methods:
+  include: [C3-SynDiff-t1pre, C3-SynDiff-t2, C3-SynDiff-flair]
+  exclude: []
+
+smoke:
+  enabled: true
+  n_patients_per_cohort: 1
+  use_selection_nfe_only: true
+
+nfe_override: null
+
+figure:
+  enabled: false  # The unified-env smoke renders the figure across all
+                  # methods; this companion run only adds SynDiff H5s.
+
+log_level: INFO

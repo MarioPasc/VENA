@@ -1,0 +1,164 @@
+# Model registry for the unified VENA validation-inference routine.
+#
+# Each entry is consumed by vena.inference.get_inference_factory(type)
+# with `name` and the kwargs block. The `nfe_list` and `selection_nfe`
+# fields are validated against InferenceModel.__init__ — see
+# .claude/notes/validation/validation_proposal.md §5.1 for the per-family
+# selection NFE rationale.
+#
+# Paths are Picasso defaults. The corresponding server3 paths live in
+# the smoke YAMLs.
+#
+# C6-3D-LDDPM and C7-3D-Latent-Pix2Pix run_dir fields point at the
+# expected Picasso run dirs; if those training jobs have not completed,
+# add their names to `methods.exclude` in the job YAML.
+
+schema_version: "1.0"
+methods:
+
+  # ----------------------------------------------------------------- C0
+  - name: C0-Identity
+    type: identity
+    kwargs:
+      nfe_list: [1]
+      selection_nfe: 1
+
+  # ----------------------------------------------------------------- C1-pGAN panel (one-to-one)
+  - name: C1-pGAN-t1pre
+    type: pgan
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/pgan_cgan/2026-06-15T14-09-19_competitor_pgan_full_t1pre_t1c_68a229e
+      source_modality: t1pre
+      target_modality: t1c
+      checkpoint_epoch: best
+      nfe_list: [1]
+      selection_nfe: 1
+  - name: C1-pGAN-t2
+    type: pgan
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/pgan_cgan/2026-06-15T14-09-19_competitor_pgan_full_t2_t1c_68a229e
+      source_modality: t2
+      target_modality: t1c
+      checkpoint_epoch: best
+      nfe_list: [1]
+      selection_nfe: 1
+  - name: C1-pGAN-flair
+    type: pgan
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/pgan_cgan/2026-06-15T14-09-20_competitor_pgan_full_flair_t1c_68a229e
+      source_modality: flair
+      target_modality: t1c
+      checkpoint_epoch: best
+      nfe_list: [1]
+      selection_nfe: 1
+
+  # ----------------------------------------------------------------- C2-ResViT (multi-modal 3-channel)
+  - name: C2-ResViT
+    type: resvit
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/resvit/2026-06-15T15-31-02_competitor_resvit_full_multicohort_68a229e
+      source_modalities: [t1pre, t2, flair]
+      target_modality: t1c
+      checkpoint_epoch: best
+      nfe_list: [1]
+      selection_nfe: 1
+
+  # ----------------------------------------------------------------- C3-SynDiff panel (one-to-one)
+  - name: C3-SynDiff-t1pre
+    type: syndiff
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/syndiff/2026-06-15T14-10-18_competitor_syndiff_full_t1pre_t1c_68a229e
+      source_modality: t1pre
+      target_modality: t1c
+      checkpoint_epoch: best
+      nfe_list: [4]
+      selection_nfe: 4
+  - name: C3-SynDiff-t2
+    type: syndiff
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/syndiff/2026-06-15T14-10-19_competitor_syndiff_full_t2_t1c_68a229e
+      source_modality: t2
+      target_modality: t1c
+      checkpoint_epoch: best
+      nfe_list: [4]
+      selection_nfe: 4
+  - name: C3-SynDiff-flair
+    type: syndiff
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/syndiff/2026-06-15T14-10-19_competitor_syndiff_full_flair_t1c_68a229e
+      source_modality: flair
+      target_modality: t1c
+      checkpoint_epoch: best
+      nfe_list: [4]
+      selection_nfe: 4
+
+  # ----------------------------------------------------------------- C4-3D-DiT
+  - name: C4-3D-DiT
+    type: dit_3d
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/dit_3d/2026-06-16T00-20-33_competitor_dit_3d_full_multicohort_68a229e
+      vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+      checkpoint_epoch: best
+      input_latents: [t1pre, flair]
+      nfe_list: [50, 100, 200]
+      selection_nfe: 100
+
+  # ----------------------------------------------------------------- C5-T1C-RFlow
+  - name: C5-T1C-RFlow
+    type: t1c_rflow
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/t1c_rflow/2026-06-15T14-04-17_competitor_t1c_rflow_full_multicohort_68a229e
+      unet_arch_config: /home/mpascual/research/code/VENA/src/external/t1c_rflow/upstream/maisi/configs/config_maisi3d-rflow.json
+      vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+      checkpoint_epoch: best
+      input_latents: [t1pre, flair]
+      nfe_list: [50, 100, 200]
+      selection_nfe: 100
+
+  # ----------------------------------------------------------------- C6-3D-LDDPM
+  # NFE policy: only NFE=1000 (paper-faithful Ho et al. 2020 default).
+  # Drops the {200, 500} sweep points to cut ~18 h off the Picasso wallclock
+  # and preserves the C5-RFlow-at-NFE=5 vs C6-DDPM-at-NFE=1000 head-to-head
+  # (the central claim of T1C-RFlow, Eidex 2025 §5). The {200, 500} cost-
+  # quality curve can be filled in as a supplementary table from a separate
+  # short job later.
+  - name: C6-3D-LDDPM
+    type: lddpm_3d
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/lddpm_3d/2026-06-17T09-55-42_competitor_lddpm_3d_full_multicohort_a1dd749
+      vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+      checkpoint_epoch: best
+      input_latents: [t1pre, flair]
+      nfe_list: [1000]
+      selection_nfe: 1000
+
+  # ----------------------------------------------------------------- C7-3D-Latent-Pix2Pix
+  - name: C7-3D-Latent-Pix2Pix
+    type: lpix2pix_3d
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/lpix2pix_3d/2026-06-17T09-55-18_competitor_lpix2pix_3d_full_multicohort_a1dd749
+      vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+      checkpoint_epoch: best
+      input_latents: [t1pre, flair]
+      nfe_list: [1]
+      selection_nfe: 1
+
+  # ----------------------------------------------------------------- A1-VENA-S1-FFT
+  - name: A1-VENA-S1-FFT
+    type: vena_fm
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/2026-06-12_01-27-55_s1_fft_cfm_c9b97556
+      checkpoint: ema_best.ckpt
+      vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+      nfe_list: [1, 2, 5, 10, 20]
+      selection_nfe: 5
+
+  # ----------------------------------------------------------------- VENA-S2-FFT
+  - name: VENA-S2-FFT
+    type: vena_fm
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/2026-06-12_06-32-25_s2_fft_contrastive_a27962e7
+      checkpoint: ema_best.ckpt
+      vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+      nfe_list: [1, 2, 5, 10, 20]
+      selection_nfe: 5

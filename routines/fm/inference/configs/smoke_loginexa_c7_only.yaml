@@ -1,0 +1,32 @@
+# Companion C7-only smoke — Pix2Pix is single-shot so 8 cohorts × 1 patient
+# ≈ 40 seconds. Used to recover after C6+C7 smoke timed out post-C6 last
+# cohort and never reached C7 setup.
+
+run_id_tag: smoke_loginexa
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/benchmarks/inference
+corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
+fold: 0
+device: cuda:0
+warmup_passes: 0
+
+cohorts:
+  cv_test: [UCSF-PDGM, BraTS-GLI, IvyGAP, LUMIERE, REMBRANDT, UPENN-GBM]
+  test_only: [BraTS-Africa-Glioma, BraTS-Africa-Other]
+  exclude: []
+
+methods:
+  include: [C7-3D-Latent-Pix2Pix]
+  exclude: []
+
+smoke:
+  enabled: true
+  n_patients_per_cohort: 1
+  use_selection_nfe_only: true
+
+nfe_override: null
+
+figure:
+  enabled: false
+
+log_level: INFO

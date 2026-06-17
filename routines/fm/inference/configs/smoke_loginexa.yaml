@@ -1,0 +1,56 @@
+# Loginexa smoke YAML — validates the unified pipeline shape on Picasso's
+# V100-DGXS-32GB login node (30-min wallclock, no queue) BEFORE submitting
+# the full Picasso A100 inference job. Per .claude/skills/test-picasso-loginexa.
+#
+# Scope: 1 patient per cohort × 8 cohorts (Ring A 6 cv + Ring B 2 test_only)
+# × all 16 method-rows × ONLY each method's selection NFE.
+#
+# Wallclock budget rationale: a single C6-3D-LDDPM at NFE=500 on V100 is ~10
+# minutes; 8 cohorts × 10 minutes = 80 minutes > 25-minute timeout. If C6 has
+# not finished training (no run_dir on disk yet) it MUST be excluded; otherwise
+# either (a) exclude C6 explicitly here and run it standalone on server3, or
+# (b) drop C6's selection_nfe to 200 in benchmark_full.yaml first.
+
+run_id_tag: smoke_loginexa
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/benchmarks/inference
+corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
+fold: 0
+device: cuda:0
+warmup_passes: 0
+
+cohorts:
+  cv_test: [UCSF-PDGM, BraTS-GLI, IvyGAP, LUMIERE, REMBRANDT, UPENN-GBM]
+  test_only: [BraTS-Africa-Glioma, BraTS-Africa-Other]
+  exclude: []
+
+methods:
+  include: null
+  # Exclude C3-SynDiff in this smoke: SynDiff was trained against an older
+  # torch / Python 3.10 env (vena-v100-syndiff) with custom CUDA extensions
+  # (fused / upfirdn2d) that do not load under vena-v100 (torch 2.7 /
+  # Python 3.11). SynDiff is run as a separate companion smoke
+  # (smoke_loginexa_syndiff.yaml) that uses vena-v100-syndiff and writes
+  # to the same run_id_tag tree so the predictions merge.
+  # C6 + C7 are INCLUDED in this smoke now that their training runs finished
+  # and their run_dir is wired into benchmark_full.yaml. C6 only runs at
+  # NFE=1000 per the registry, so the per-patient cost is ~400 s on V100 ×
+  # 8 cohorts ≈ 53 min — over the 30-min loginexa wallclock. If you cannot
+  # afford that, add C6 back to this exclude list and validate it in the
+  # companion `smoke_loginexa_c6_only.yaml` on its own loginexa session
+  # (or on server-3 where the wallclock is unbounded).
+  exclude: [C3-SynDiff-t1pre, C3-SynDiff-t2, C3-SynDiff-flair]
+
+smoke:
+  enabled: true
+  n_patients_per_cohort: 1
+  use_selection_nfe_only: true
+
+nfe_override: null
+
+figure:
+  enabled: true
+  n_slices: 7
+  slice_offset: 10
+
+log_level: INFO

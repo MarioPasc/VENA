@@ -1,0 +1,41 @@
+# Companion loginexa smoke for C6-3D-LDDPM + C7-3D-Latent-Pix2Pix —
+# runs in the vena-v100 env on a free GPU, parallel to the SynDiff
+# smoke (which uses vena-v100-syndiff). Shares run_id_tag with the main
+# smoke so per-method predictions merge into one tree.
+#
+# Wallclock note: C6 at NFE=1000 on V100 ≈ 400 s/scan; 8 cohorts × 1
+# patient ≈ 53 min — over the 30-min loginexa hard wallclock. C7 is
+# single-shot (~3 min for 8 cohorts). The engine writes per-(method ×
+# cohort × NFE) H5s incrementally, so a timeout produces partial
+# results for C6; rerun this YAML with cohorts.cv_test / test_only
+# narrowed to the still-missing cohorts.
+
+run_id_tag: smoke_loginexa
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/benchmarks/inference
+corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
+fold: 0
+device: cuda:0
+warmup_passes: 0
+
+cohorts:
+  cv_test: [UCSF-PDGM, BraTS-GLI, IvyGAP, LUMIERE, REMBRANDT, UPENN-GBM]
+  test_only: [BraTS-Africa-Glioma, BraTS-Africa-Other]
+  exclude: []
+
+methods:
+  include: [C6-3D-LDDPM, C7-3D-Latent-Pix2Pix]
+  exclude: []
+
+smoke:
+  enabled: true
+  n_patients_per_cohort: 1
+  use_selection_nfe_only: true
+
+nfe_override: null
+
+figure:
+  enabled: false  # The main smoke renders the cross-method figure; this
+                  # companion only adds C6 + C7 H5s to the tree.
+
+log_level: INFO
