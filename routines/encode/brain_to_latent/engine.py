@@ -267,6 +267,7 @@ class BrainToLatentRoutineEngine:
     ) -> int:
         n_written = 0
         with h5py.File(target_h5, "a") as f:
+            f.attrs["produced_by_brain_to_latent"] = True
             ids = self._read_id_array(f)
             n = len(ids)
             ds = self._ensure_writable_dataset(f, n_rows=n)
@@ -287,39 +288,100 @@ class BrainToLatentRoutineEngine:
         target_h5: Path,
         brain_cache: dict[str, np.ndarray],
     ) -> tuple[int, int]:
+        """Populate ``masks/brain_latent`` on an augmented latent H5.
+
+        Resolves the producing aug-image H5 via the aug-latent's
+        ``source_aug_image_h5_path`` root attr. When that aug-image H5
+        carries per-row ``masks/brain`` (the post-2026-06-19 schema with the
+        brain LabelMap warped jointly with the modalities), every variant —
+        including v4 — gets its true warped brain mask. The legacy code path
+        (aug-image H5 produced before the fix) is preserved: v1/v2/v3 use
+        ``brain_cache`` from the clean source image H5, and v4 falls back to
+        synthesised ones with an explicit warning. The dataset attr
+        ``v4_brain_synthesised_ones`` records the per-run policy.
+        """
         n_written = 0
         n_v4_ones = 0
         ones = np.ones((1, *LATENT_SPATIAL), dtype=np.int8)
         with h5py.File(target_h5, "a") as f:
+            f.attrs["produced_by_brain_to_latent"] = True
             ids = self._read_id_array(f)
             variants = [x.decode() if isinstance(x, bytes) else str(x) for x in f["variants"][:]]
             n = len(ids)
             ds = self._ensure_writable_dataset(f, n_rows=n)
-            ds.attrs["v4_brain_synthesised_ones"] = True  # one-time flag
-            for row, (pid, variant) in enumerate(zip(ids, variants, strict=True)):
-                if not self.cfg.overwrite and bool((ds[row] != 0).any()):
-                    continue
-                if variant == "v4":
-                    ds[row] = ones
-                    n_v4_ones += 1
+
+            aug_image_path: Path | None = None
+            raw = f.attrs.get("source_aug_image_h5_path")
+            if raw is not None:
+                raw_str = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
+                candidate = Path(raw_str)
+                if candidate.exists():
+                    aug_image_path = candidate
                 else:
-                    if pid not in brain_cache:
-                        raise KeyError(
-                            f"aug patient_id {pid!r} (row {row}, variant {variant}) "
-                            f"absent from source image H5"
-                        )
-                    ds[row] = brain_cache[pid]
-                n_written += 1
-        if n_v4_ones:
-            logger.warning(
-                "%s: %d v4 rows written with synthesised-ones brain mask. "
-                "Replay of the elastic+affine deformation from aug_params_json "
-                "is a follow-up; the contrastive degrades to a full-volume Lp "
-                "on those rows.",
-                target_h5,
-                n_v4_ones,
-            )
-        return n_written, n_v4_ones
+                    logger.warning(
+                        "aug-latent H5 declares source_aug_image_h5_path=%s but the "
+                        "file is missing; falling back to clean brain cache.",
+                        candidate,
+                    )
+
+            aug_image_has_brain = False
+            if aug_image_path is not None:
+                with h5py.File(aug_image_path, "r") as fa:
+                    aug_image_has_brain = "masks/brain" in fa
+                    if aug_image_has_brain:
+                        aug_image_n = int(fa["ids"].shape[0])
+                        if aug_image_n != n:
+                            raise ValueError(
+                                f"aug-image H5 {aug_image_path} has {aug_image_n} rows "
+                                f"but aug-latent H5 has {n}; refusing to align by row index."
+                            )
+
+            if not aug_image_has_brain:
+                # Legacy code path — keep current behaviour with explicit flag.
+                ds.attrs["v4_brain_synthesised_ones"] = True
+                for row, (pid, variant) in enumerate(zip(ids, variants, strict=True)):
+                    if not self.cfg.overwrite and bool((ds[row] != 0).any()):
+                        continue
+                    if variant == "v4":
+                        ds[row] = ones
+                        n_v4_ones += 1
+                    else:
+                        if pid not in brain_cache:
+                            raise KeyError(
+                                f"aug patient_id {pid!r} (row {row}, variant {variant}) "
+                                f"absent from source image H5"
+                            )
+                        ds[row] = brain_cache[pid]
+                    n_written += 1
+                if n_v4_ones:
+                    logger.warning(
+                        "%s: %d v4 rows written with synthesised-ones brain mask "
+                        "(legacy aug-image H5 had no `masks/brain`). Re-run the bank "
+                        "builder with the brain LabelMap fix to repair v4 rows.",
+                        target_h5,
+                        n_v4_ones,
+                    )
+                return n_written, n_v4_ones
+
+            # Modern path: read the warped per-row brain mask straight from the aug-image H5.
+            ds.attrs["v4_brain_synthesised_ones"] = False
+            ds.attrs["brain_source"] = f"aug_image_h5:{aug_image_path}"
+            crop_box = _read_crop_box(aug_image_path)
+            with h5py.File(aug_image_path, "r") as fa:
+                origins = fa["crop/origin"]
+                brain_ds = fa["masks/brain"]
+                for row in range(n):
+                    if not self.cfg.overwrite and bool((ds[row] != 0).any()):
+                        continue
+                    crop_origin = tuple(int(v) for v in origins[row])
+                    brain = np.asarray(brain_ds[row])
+                    ds[row] = _encode_brain_mask(
+                        brain,
+                        crop_origin=crop_origin,  # type: ignore[arg-type]
+                        target_shape=crop_box,
+                    )
+                    n_written += 1
+            return n_written, n_v4_ones
 
     def _write_decision(
         self,

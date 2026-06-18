@@ -139,10 +139,14 @@ class FMLightningModule(pl.LightningModule):
         nan_tolerance: dict[str, int] | None = None,
         conditioning_dropout_p: float = 0.0,
         conditioning_dropout_keys: Iterable[str] | None = None,
+        lpl_config: Any = None,  # vena.model.fm.lpl.LplConfig (lazy import)
+        lpl_vae_checkpoint: Path | None = None,
     ) -> None:
         super().__init__()
         # Lightning saves these into checkpoint hparams. We exclude unpicklables.
-        self.save_hyperparameters(ignore=["trunk_config", "region_resolver", "vae_decoder"])
+        self.save_hyperparameters(
+            ignore=["trunk_config", "region_resolver", "vae_decoder", "lpl_config"]
+        )
 
         self.trunk_config = trunk_config
         self.stage = stage
@@ -203,8 +207,49 @@ class FMLightningModule(pl.LightningModule):
         self.ema: WarmupEMA = WarmupEMA(self.controlnet, **self.ema_cfg)
         # Trunk EMA only exists in the unfrozen-trunk ablation; it is built in
         # setup() once the trunk is loaded (the trunk does not exist in
-        # __init__). This path is single-shot (not resume-safe), by design.
+        # __init__). Resume-safety is delivered by the R6 path: the engine
+        # sets ``_pending_trunk_ema_snapshot`` via
+        # :meth:`set_pending_trunk_ema_snapshot` *before* ``trainer.fit``, and
+        # :meth:`setup` reloads the saved shadow into the freshly-built
+        # ``trunk_ema`` so a S1→S3 warm-start continues the same EMA average.
         self.trunk_ema: WarmupEMA | None = None
+        # Path to a ``trunk_ema_shadow_state_dict`` saved by
+        # :class:`TrunkEMASnapshotCallback`. ``None`` (default) → leave
+        # ``trunk_ema`` at its fresh init (legacy behaviour). Set publicly via
+        # :meth:`set_pending_trunk_ema_snapshot` from the engine when a
+        # warm-start is resolved.
+        self._pending_trunk_ema_snapshot: Path | None = None
+        # ----- S3 LPL artefacts (per ``model-coding-standards.md`` §4.5) -----
+        # Built only when the stage is S3 AND the engine passed an
+        # ``LplConfig``. The VAE handle is loaded lazily in :meth:`setup`
+        # to keep the build cheap when LPL is off.
+        self.lpl_config = lpl_config
+        self.lpl_vae_checkpoint: Path | None = (
+            Path(lpl_vae_checkpoint) if lpl_vae_checkpoint else None
+        )
+        self.feature_stats: Any = None  # vena.model.fm.lpl.FeatureStatsEMA
+        self.lpl_loss: Any = None  # vena.model.fm.lpl.LplLoss
+        self._lpl_vae_handle: Any = None  # AutoencoderHandle, loaded in setup
+        if self.lpl_config is not None and stage.upper() == "S3":
+            from vena.common import LATENT_CHANNELS
+            from vena.model.fm.lpl import FeatureStatsEMA, LplLoss
+
+            # Per-block channels — discovered statically from the design
+            # doc's §3.5 geometry table (block→channels): {0,1,2}=256,
+            # {3,4,5}=128. The VAE is frozen so the channel counts cannot
+            # drift between init and setup.
+            _CH = {0: 256, 1: 256, 2: 256, 3: 128, 4: 128, 5: 128}
+            stats_channels = {blk: _CH[blk] for blk in self.lpl_config.A}
+            self.feature_stats = FeatureStatsEMA(channels=stats_channels)
+            self.lpl_loss = LplLoss(self.lpl_config, self.feature_stats)
+            logger.info(
+                "S3 LPL artefacts built: A=%s w_l=%s t_min=%.3f lambda_img=%.3f",
+                self.lpl_config.A,
+                self.lpl_config.w_l,
+                self.lpl_config.t_min,
+                self.lpl_config.lambda_img,
+            )
+            _ = LATENT_CHANNELS  # silence the unused-import noise on lint
 
         # Validation/region wiring.
         self.region_resolver = region_resolver
@@ -250,8 +295,76 @@ class FMLightningModule(pl.LightningModule):
         if self.trunk_config.trainable and self.trunk_ema is None:
             self.trunk_ema = WarmupEMA(self.trunk, **self.ema_cfg).to(self.device)
             logger.info("Trunk EMA shadow created (unfrozen-trunk ablation).")
+            self._maybe_load_trunk_ema_snapshot()
         if self.image_metrics is None and self.vae_decoder is not None:
             self.image_metrics = ImageMetrics()
+        # Lazy VAE handle load for the S3 LPL gated branch.
+        if (
+            self.lpl_loss is not None
+            and self._lpl_vae_handle is None
+            and self.lpl_vae_checkpoint is not None
+        ):
+            from vena.common import load_autoencoder
+
+            self._lpl_vae_handle = load_autoencoder(
+                self.lpl_vae_checkpoint, device=str(self.device)
+            )
+            logger.info("S3 LPL VAE handle loaded for in-process decoder-feature extraction.")
+
+    def set_pending_trunk_ema_snapshot(self, path: Path | None) -> None:
+        """Public setter for the warm-start trunk-EMA snapshot path (R6).
+
+        Called by the engine *before* ``trainer.fit`` when a WARM_START
+        resume mode is resolved. ``setup`` reads this attribute and reloads
+        the saved shadow state_dict into ``self.trunk_ema.ema_model``,
+        keeping the EMA average continuous across the S1→S3 boundary.
+
+        A value of ``None`` (default) means "no snapshot — leave the
+        freshly-built trunk_ema at its current state". This is the legacy
+        path; callers must not raise just because the snapshot is missing.
+        """
+        self._pending_trunk_ema_snapshot = path
+
+    def _maybe_load_trunk_ema_snapshot(self) -> None:
+        """Restore the trunk-EMA shadow from the R6 snapshot when set.
+
+        No-op when the pending path is ``None``. Warns (does not raise)
+        when ``trunk_config.trainable`` is on but the file is missing —
+        that's the documented "pre-R6 S1 checkpoint" path which should
+        still run (with the caveat that the trunk-EMA starts fresh).
+        """
+        snapshot = self._pending_trunk_ema_snapshot
+        if snapshot is None:
+            return
+        if not snapshot.exists():
+            logger.warning(
+                "Trunk EMA snapshot expected at %s but not found; trunk_ema"
+                " starts fresh (legacy pre-R6 warm-start path).",
+                snapshot,
+            )
+            return
+        assert self.trunk_ema is not None, "snapshot load needs trunk_ema built"
+        shadow_sd = torch.load(snapshot, map_location=self.device, weights_only=True)
+        missing, unexpected = self.trunk_ema.ema_model.load_state_dict(shadow_sd, strict=False)
+        if unexpected:
+            logger.warning(
+                "Trunk EMA snapshot %s contained %d unexpected keys: %s",
+                snapshot,
+                len(unexpected),
+                list(unexpected)[:8],
+            )
+        if missing:
+            logger.warning(
+                "Trunk EMA snapshot %s missing %d keys vs live shadow: %s",
+                snapshot,
+                len(missing),
+                list(missing)[:8],
+            )
+        logger.info(
+            "Trunk EMA shadow restored from %s (%d tensors loaded).",
+            snapshot,
+            len(shadow_sd) - len(missing),
+        )
 
     def _setup_trunk_and_controlnet(self) -> None:
         ckpt = Path(self.trunk_config.checkpoint)
@@ -474,6 +587,49 @@ class FMLightningModule(pl.LightningModule):
             global_step=int(self.global_step),
             total_steps=total_steps,
         )
+        # ----- S3 LPL gated branch -----
+        # Computes the decoder-feature perceptual term per
+        # ``.claude/notes/changes/decoder_perceptual_loss_s3.md``. The gate
+        # (``t > t_min``) is inside :meth:`LplLoss.forward`; this block only
+        # decides whether to assemble the feature dicts. Skipped silently
+        # when LPL is off (every stage except S3) or the VAE handle is not
+        # loaded yet (smoke before setup).
+        if (
+            self.lpl_loss is not None
+            and self._lpl_vae_handle is not None
+            and m_wt is not None
+            and m_brain is not None
+        ):
+            from vena.model.fm.lpl import decoder_feature_extractor
+
+            # One-step image-aware target: x̂_1 = x_t + (1 - t) * v_orig.
+            t_view = timesteps.view(-1, *([1] * (x_t.ndim - 1)))
+            x1_hat = x_t + (1.0 - t_view) * v_orig
+            blocks = frozenset(int(b) for b in self.lpl_config.A)
+            max_block = int(max(self.lpl_config.A))
+            grad_ckpt = bool(self.lpl_config.grad_checkpoint_segments >= 2)
+            try:
+                with decoder_feature_extractor(
+                    self._lpl_vae_handle,
+                    blocks=blocks,
+                    max_block=max_block,
+                    grad_checkpoint=grad_ckpt,
+                ) as extract:
+                    phi_pred = extract(x1_hat)
+                    with torch.no_grad():
+                        phi_tgt = extract(x1.detach())
+                self.feature_stats.update(phi_pred)
+                lpl_scalar, lpl_break = self.lpl_loss(phi_pred, phi_tgt, m_wt, m_brain, timesteps)
+                total = total + float(self.lpl_config.lambda_img) * lpl_scalar
+                per_term["lpl"] = lpl_scalar.detach()
+                # Expose the breakdown to the train-CSV via per_term so the
+                # existing column-discovery picks them up at first step.
+                for k, v in lpl_break.items():
+                    per_term[k] = (
+                        torch.as_tensor(v, device=total.device) if not torch.is_tensor(v) else v
+                    )
+            except RuntimeError as exc:  # OOM or shape mismatch — log and skip
+                logger.warning("S3 LPL step skipped: %s", exc)
         # Per-cohort CFM breakdown (P1.2). The multi-cohort dataset attaches a
         # ``cohort`` string per sample; the DataLoader collates strings into a
         # list. When all samples are from one cohort the .mean() across that
@@ -1122,25 +1278,23 @@ class FMLightningModule(pl.LightningModule):
             raise FileNotFoundError(f"warm-start checkpoint not found: {p}")
         ckpt = torch.load(p, map_location="cpu", weights_only=False)
         if "state_dict" not in ckpt:
-            raise KeyError(
-                f"warm-start: {p} is not a Lightning checkpoint (no 'state_dict' key)."
-            )
+            raise KeyError(f"warm-start: {p} is not a Lightning checkpoint (no 'state_dict' key).")
         src_state = ckpt["state_dict"]
         own_state = self.state_dict()
         # Filter to shape-compatible overlapping keys; everything else is
         # surfaced in the missing/unexpected log line.
         loadable = {
-            k: v for k, v in src_state.items()
-            if k in own_state and own_state[k].shape == v.shape
+            k: v for k, v in src_state.items() if k in own_state and own_state[k].shape == v.shape
         }
         result = self.load_state_dict(loadable, strict=False)
         missing = list(result.missing_keys)
-        unexpected = list(result.unexpected_keys) + [
-            k for k in src_state if k not in loadable
-        ]
+        unexpected = list(result.unexpected_keys) + [k for k in src_state if k not in loadable]
         logger.info(
             "load_warm_start: src=%s loaded=%d missing=%d unexpected=%d",
-            p, len(loadable), len(missing), len(unexpected),
+            p,
+            len(loadable),
+            len(missing),
+            len(unexpected),
         )
         if missing:
             logger.info("  first missing (cn-only / new heads): %s", missing[:5])

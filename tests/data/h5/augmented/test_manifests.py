@@ -76,6 +76,10 @@ def _write_minimal_aug_image_h5(
             manifest.get("masks/tumor"), n=n_rows, spatial_shape=AUG_IMAGE_CROP_BOX
         )
         mdset[:] = np.zeros((n_rows, *AUG_IMAGE_CROP_BOX), dtype=np.int8)
+        bdset = w.create_stacked(
+            manifest.get("masks/brain"), n=n_rows, spatial_shape=AUG_IMAGE_CROP_BOX
+        )
+        bdset[:] = np.zeros((n_rows, *AUG_IMAGE_CROP_BOX), dtype=np.int8)
 
         crop_origin = f.create_dataset("crop/origin", shape=(n_rows, 3), dtype=np.int32)
         crop_origin[:] = 0 if crop_origin_zero else 7
@@ -91,7 +95,14 @@ def test_build_aug_image_manifest_round_trip() -> None:
     assert m.domain == "image"
     assert m.expected_shape == AUG_IMAGE_CROP_BOX
     paths = {d.path for d in m.datasets}
-    assert {"ids", "source_row_index", "variants", "aug_params_json", "masks/tumor"} <= paths
+    assert {
+        "ids",
+        "source_row_index",
+        "variants",
+        "aug_params_json",
+        "masks/tumor",
+        "masks/brain",
+    } <= paths
     for slug in _MODS:
         assert f"images/{slug}" in paths
     assert m == type(m).from_json(m.to_json())

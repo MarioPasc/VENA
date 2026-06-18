@@ -1,0 +1,103 @@
+# decoder_lpl_profile — production sweep config (loginexa 4-shard run).
+#
+# Drives the §4.1 (per-block magnitude / outlier_k) + §4.2 (pre/post + error
+# concentration + t-sweep) + §4.7b (drift gate) sweeps documented in
+# .claude/notes/changes/decoder_perceptual_loss_s3.md.
+#
+# Runtime: 4-way shard over loginexa V100-DGXS-32GB, ~6 min wallclock per
+# shard. Aggregation step (single-stream) emits decision.json v1.0.
+
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/artifacts/preflights/decoder_lpl_profile
+
+# Frozen MAISI-V2 VAE — the partial decoder we read features from.
+vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+
+# Production S1+FFT warm-start anchor (the run the future S3 finetune
+# will warm-start from). The trunk_ema_snapshot is mandatory under R6;
+# pre-R6 S1 runs leave it null and accept the documented caveat.
+s1_checkpoint: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/2026-06-12_01-27-55_s1_fft_cfm_c9b97556/checkpoints/ema_best.ckpt
+s1_trunk_ema_snapshot: null
+
+# S1 trunk + controlnet spec — mirrors routines/fm/train/configs/runs/picasso_continue_s1_fft_cfm.yaml
+# so the FMLightningModule we reconstruct here matches the training-time
+# architecture byte-for-byte. Conditioning order matters (the
+# ConditioningAssembler builds a concat tensor in this order).
+s1_model:
+  trunk:
+    checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides: {}
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+    trainable: true
+    regime: fft
+    peft: null
+  controlnet:
+    conditioning_inputs:
+      - latent:t1pre
+      - latent:t2
+      - latent:flair
+      - mask:wt:identity
+    arch_overrides: {}
+  rflow:
+    num_train_timesteps: 1000
+    use_discrete_timesteps: true
+    sample_method: logit-normal
+  ema:
+    decay: 0.9999
+    update_after_step: 0
+    update_every: 1
+    inv_gamma: 10.0
+    power: 1.0
+    min_value: 0.0
+
+cohorts:
+  - name: UCSF-PDGM
+    latent_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSF_PDGM/h5/UCSFPDGM_latents.h5
+    latent_aug_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSF_PDGM/h5/ucsf_pdgm_latents_aug.h5
+  - name: BraTS-GLI
+    latent_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_latents.h5
+    latent_aug_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/BRATS_GLI/PRE_OPERATIVE/h5/brats_gli_latents_aug.h5
+  - name: UPENN-GBM
+    latent_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/upenn_gbm/h5/UPENN-GBM_latents.h5
+    latent_aug_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/upenn_gbm/h5/upenn_gbm_latents_aug.h5
+  - name: IvyGAP
+    latent_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/ivy_gap/h5/IvyGAP_latents.h5
+    latent_aug_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/ivy_gap/h5/ivy_gap_latents_aug.h5
+  - name: LUMIERE
+    latent_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/lumiere/h5/LUMIERE_latents.h5
+    latent_aug_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/lumiere/h5/lumiere_latents_aug.h5
+  - name: REMBRANDT
+    latent_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/rembrandt/h5/REMBRANDT_latents.h5
+    latent_aug_h5: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/rembrandt/h5/rembrandt_latents_aug.h5
+
+seed: 42
+device: cuda:0           # overridden by the 4-shard launcher to cuda:0..3
+shard_id: null            # set per-shard at launch
+n_shards: 4
+
+patient_selection:
+  n_per_cohort: 3
+  cv_cohorts: [UCSF-PDGM, BraTS-GLI, UPENN-GBM, IvyGAP, LUMIERE, REMBRANDT]
+  volume_strata: [small, median, large]
+  variants: [v0, v1, v2, v3, v4]
+
+probe:
+  blocks: [0, 1, 2, 3, 4, 5]
+  max_block: 5
+  grad_checkpoint: false   # forward-only: K=5 ~10 GB on V100-32 GB
+
+phase2:
+  sampler: euler
+  nfe: 10
+  t_sweep: [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.85, 0.90, 0.95]
+  enabled: true
+
+phase3:
+  drift_threshold: 0.20
+  drift_fail_fraction: 0.25
+  inter_cohort_spread_threshold: 1.5
+
+emit:
+  composite_figures: true     # 90 figs = 18 × 5 (deliverable E)
+  per_channel_distribution: true

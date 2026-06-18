@@ -1,0 +1,139 @@
+# Picasso — S3 LPL FFT, warm-started from the converged S1+FFT run.
+#
+# WARM_START semantics (per .claude/rules/preflight-pattern.md):
+#   * resume_from is the S1 run_id → ResumeMode.WARM_START.
+#   * Lightning ckpt is loaded weights-only via _WarmStartCallback.on_fit_start.
+#   * Optimiser / scheduler / EMA / RNG state stay fresh — the S3 stage is
+#     a refinement, not a continuation.
+#   * The R6 TrunkEMASnapshotCallback (PR-1) writes
+#     <ckpt_dir>/trunk_ema_snapshot.pt every save, and the
+#     _WarmStartCallback.setup hook reloads it before module.setup() runs.
+#     The S1 source run pre-dates R6; trunk_ema starts fresh — this is the
+#     documented caveat (model-coding-standards.md §4.5).
+#
+# S3 gates (routines.fm.train.engine._assert_decoder_lpl_gate):
+#   * data.decoder_lpl_decision_path MUST be set and validate against
+#     vena.preflight.decoder_lpl_profile.DecoderLplDecisionV1 (schema 1.0).
+#   * Every variant in data.variant_weights with weight > 0 must appear in
+#     decision.allowed_variants. The 2026-06-19 post-fix decision allows
+#     {v0, v1, v2, v3, v4} — all variants enabled here.
+
+run:
+  stage: s3
+  tag: lpl_fft
+  resume_from: 2026-06-12_01-27-55_s1_fft_cfm_c9b97556
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
+
+data:
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  batch_size: 4
+  num_workers: 8
+  pin_memory: true
+  tau: 0.5
+  augmentation_config_path: routines/fm/train/configs/augmentations/equivariant_v1.yaml
+  preflight_decision_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/latent_aug_equivariance/LATEST/decision.json
+  dedup_decisions_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
+  use_offline_augmented_data: true
+  # All 5 variants allowed per the 2026-06-18T20:18Z post-fix preflight.
+  variant_weights:
+    v0: 0.2
+    v1: 0.2
+    v2: 0.2
+    v3: 0.2
+    v4: 0.2
+  # S3 gate input — schema v1.0 decision.json. Either point at a frozen
+  # timestamp dir or follow the LATEST symlink (both work).
+  decoder_lpl_decision_path: /mnt/home/users/tic_163_uma/mpascual/execs/vena/artifacts/preflights/decoder_lpl_profile/LATEST/decision.json
+
+model:
+  trunk:
+    checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides: {}
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+    trainable: true
+    regime: fft
+  controlnet:
+    conditioning_inputs:
+      - latent:t1pre
+      - latent:t2
+      - latent:flair
+      - mask:wt:identity
+    arch_overrides: {}
+    perturb_keys: []
+  # Mandatory for S3 — the LightningModule loads it in setup() for the
+  # in-process decoder-feature extraction.
+  vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+
+loss:
+  cfm:
+    weight: 1.0
+    reduction: mean
+    norm: l2
+  # S3-only loss block. The recipe knobs A / w_l / t_min / outlier_k /
+  # alpha come from the decision.json — they are NOT duplicated here. The
+  # YAML supplies only the outer coupling weight and the engineering knobs.
+  lpl:
+    lambda_img: 0.1                  # outer scalar; sweep {0.05, 0.1, 0.2}
+    soft_region: false               # true = sweep variant (per §2.6 sweep)
+    grad_checkpoint_segments: 2      # K=5+grad-ckpt; ~8 GB peak on A100
+
+rflow:
+  num_train_timesteps: 1000
+  use_discrete_timesteps: true
+  sample_method: logit-normal
+
+optim:
+  # Per §4.5 (warm-start refinement should land softly): 1e-4 → 5e-5 to
+  # avoid overwriting the S1 trajectory.
+  lr: 5.0e-5
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  warmup_steps: 500
+  scheduler: cosine
+
+ema:
+  # Per §4.5 (short refinement should reach the evaluated EMA weights at
+  # 100-200 epochs, not 10000). Production target is 100-200 epochs.
+  decay: 0.999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 100000
+  max_epochs: 200
+  batch_size: 4
+  grad_accum: 2
+  checkpoint_every_epochs: 10
+  log_train_every_steps: 50
+  best_metric_name: mse_latent
+  best_metric_region: bg
+  best_metric_nfe: 5
+  gradient_clip_val: 1.0
+  patience: 30
+
+validation:
+  every_epochs: 0
+
+exhaustive_val:
+  enabled: true
+  every_epochs: 25
+  n_patients: 60
+  nfe_levels: [1, 2, 5, 10, 20]
+  integrator: euler
+  device: cuda:1
+  python_executable: /mnt/home/users/tic_163_uma/mpascual/fscratch/conda_envs/vena/bin/python
+  block_until_complete: false
+  prune_snapshots_keep: 3
+
+output:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments
+  retention_n_checkpoints: 3

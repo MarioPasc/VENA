@@ -130,8 +130,11 @@ def _merge(patch: Path, target: Path, overwrite: bool) -> dict[str, int]:
         ds.attrs["units"] = "binary"
         ds.attrs["description"] = "brain mask in latent space (max-pool 4 of masks/brain)"
         ds.attrs["producer"] = "scripts.brain_latent_merge_patch:0.1.0"
-        if v4_flag:
-            ds.attrs["v4_brain_synthesised_ones"] = True
+        ds.attrs["v4_brain_synthesised_ones"] = bool(v4_flag)
+        # Aug-latent H5s gain `produced_by_brain_to_latent=True` so the
+        # conditional validator (vena.data.h5.augmented.latent_domain) picks
+        # up the dataset.
+        f_target.attrs["produced_by_brain_to_latent"] = True
         return {"n_written": len(target_rows), "n_target_rows": len(target_ids)}
 
 

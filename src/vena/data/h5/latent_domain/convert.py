@@ -231,6 +231,18 @@ class LatentH5Config(BaseModel):
             "``aug_config_sha256`` root attr so the FM trainer can gate."
         ),
     )
+    percentile_use_brain_mask: bool = Field(
+        default=True,
+        description=(
+            "When True (default), read ``masks/brain`` from the source image "
+            "H5 and pass it to :func:`percentile_normalise` so the foreground "
+            "percentiles are computed over real intra-brain voxels rather "
+            "than the ``x > 0`` heuristic. Required for cohorts that store "
+            "intra-brain z-scores (BraTS-Africa); harmless for raw "
+            "cohorts. Falls back to the heuristic if ``masks/brain`` is "
+            "missing from the source H5."
+        ),
+    )
 
     def to_json(self) -> str:
         # Paths serialise as strings via Pydantic v2 default.
@@ -737,6 +749,18 @@ class LatentH5Converter:
         # across cohorts. Same semantic class, just a renumbering.
         remap_brats2023_et = str(src.attrs.get("label_system", "")) == "BraTS2023"
 
+        # Brain-mask-aware percentile normalisation: when enabled and the
+        # source H5 carries ``masks/brain``, pass the per-row mask to the
+        # encoder so foreground percentiles are computed on real intra-brain
+        # voxels rather than ``x > 0`` (critical for z-score cohorts).
+        brain_mask_available = cfg.percentile_use_brain_mask and "masks/brain" in src
+        if cfg.percentile_use_brain_mask and not brain_mask_available:
+            logger.warning(
+                "percentile_use_brain_mask=True but source H5 %s lacks `masks/brain`; "
+                "falling back to the foreground-heuristic path.",
+                cfg.source_image_h5,
+            )
+
         for k, out_row in enumerate(out_rows):
             src_row = src_indices[out_row]
             pid = ids[out_row]
@@ -750,6 +774,15 @@ class LatentH5Converter:
                 native_shape=native_shape,
                 target_shape=tuple(box),  # type: ignore[arg-type]
             )
+            brain_t: torch.Tensor | None = None
+            if brain_mask_available:
+                brain_arr = np.asarray(src["masks/brain"][src_row], dtype=np.float32)
+                brain_t = (
+                    torch.from_numpy(brain_arr)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .to(device, non_blocking=True)
+                )
 
             # ---- latents ---------------------------------------------------
             for slug in cfg.modalities:
@@ -757,7 +790,7 @@ class LatentH5Converter:
                 t = torch.from_numpy(np.asarray(arr, dtype=np.float32))
                 t = t.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W, D)
                 t = t.to(device, non_blocking=True)
-                res = self.encoder.encode(t, mode=cfg.inference_mode, crop_spec=spec)
+                res = self.encoder.encode(t, mode=cfg.inference_mode, crop_spec=spec, mask=brain_t)
                 modes_seen[res.inference_mode] = modes_seen.get(res.inference_mode, 0) + 1
                 z = res.latent.detach().to("cpu", dtype=torch.float32).contiguous()
                 z_np = z[0].numpy()  # (C, h, w, d)

@@ -28,9 +28,8 @@ import torch
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from vena.data.h5.shared import now_iso_utc, resolve_git_sha
 from vena.data.h5.latent_domain import LatentH5Config, LatentH5Converter
-from vena.data.h5.ucsf_pdgm.latent_domain import UCSF_PDGM_IMAGE_NATIVE_SHAPE
+from vena.data.h5.shared import now_iso_utc, resolve_git_sha
 from vena.model.autoencoder.maisi import load_autoencoder
 from vena.model.autoencoder.maisi.decode import MaisiDecoder
 from vena.model.autoencoder.maisi.encode import MaisiEncoder, get_downsampler
@@ -147,6 +146,12 @@ class EncodeMaisiRoutineConfig(BaseModel):
     percentile_lower: float = 0.0
     percentile_upper: float = 99.5
     percentile_foreground_only: bool = True
+    # When True (default), pass the source ``masks/brain`` to
+    # :func:`percentile_normalise` instead of the ``x > 0`` foreground
+    # heuristic. Critical for z-score cohorts (BraTS-Africa); no-op for
+    # raw-intensity cohorts. Forwarded to ``LatentH5Config`` and persisted
+    # in ``decision.json``.
+    percentile_use_brain_mask: bool = True
 
     limit: int | None = None
     patient_ids: list[str] | None = None
@@ -306,10 +311,9 @@ class EncodeMaisiRoutineEngine:
             checkpoint_every=cfg.checkpoint_every,
             limit=cfg.limit,
             patient_ids=converter_patient_ids,
+            percentile_use_brain_mask=cfg.percentile_use_brain_mask,
         )
-        converter = LatentH5Converter(
-            cfg=conv_cfg, encoder=encoder, mask_downsampler=mask_ds
-        )
+        converter = LatentH5Converter(cfg=conv_cfg, encoder=encoder, mask_downsampler=mask_ds)
         latent_path = converter.run()
 
         # ---- QC --------------------------------------------------------------
@@ -318,6 +322,7 @@ class EncodeMaisiRoutineEngine:
             "latent_h5_path": str(latent_path),
             "git_sha": resolve_git_sha() or "unknown",
             "created_at": now_iso_utc(),
+            "percentile_use_brain_mask": bool(cfg.percentile_use_brain_mask),
             "n_patients_encoded": self._n_patients(latent_path),
             "modalities_encoded": list(cfg.modalities),
         }
@@ -587,8 +592,7 @@ class EncodeMaisiRoutineEngine:
 
         with h5py.File(src_path, "r") as src:
             all_ids = [
-                v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
-                for v in src["ids"][:]
+                v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in src["ids"][:]
             ]
             src_row = all_ids.index(pid)
             crop_origin: tuple[int, int, int] = tuple(  # type: ignore[assignment]

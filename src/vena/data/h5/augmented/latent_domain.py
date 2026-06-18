@@ -22,6 +22,7 @@ import logging
 from pathlib import Path
 
 import h5py
+import numpy as np
 
 from vena.data.h5.latent_domain.manifest import (
     LATENT_CHANNELS,
@@ -30,10 +31,21 @@ from vena.data.h5.latent_domain.manifest import (
 from vena.data.h5.shared import DatasetSpec, H5Manifest, validate_h5
 from vena.data.h5.shared.exceptions import H5ValidationError
 
+
+def _numpy_int8(dset: h5py.Dataset) -> bool:
+    return dset.dtype == np.dtype("int8")
+
+
 logger = logging.getLogger(__name__)
 
-AUG_LATENT_SCHEMA_VERSION: str = "0.1.0"
-"""Schema version of the augmented latent H5."""
+AUG_LATENT_SCHEMA_VERSION: str = "0.2.0"
+"""Schema version of the augmented latent H5.
+
+0.2.0 — 2026-06-19: added the conditional ``masks/brain_latent`` check
+(required when root attr ``produced_by_brain_to_latent == True``). Pre-0.2.0
+files are accepted as long as their ``masks/brain_latent``, if present,
+satisfies the (N, 1, *LATENT_SPATIAL) int8 layout.
+"""
 
 _AUG_LATENT_REQUIRED_AUG_ROOT_ATTRS: tuple[str, ...] = (
     "source_aug_image_h5_path",
@@ -141,6 +153,11 @@ def build_aug_latent_manifest(
             leading_dim="n_scans",
         )
     )
+    # `masks/brain_latent` is written by routines/encode/brain_to_latent as a
+    # separate post-pass, so it is NOT in the manifest's datasets list (its
+    # absence on a pre-post-pass H5 would otherwise trip the shared validator).
+    # `validate_aug_latent_h5` enforces its presence + shape conditionally on
+    # the root attr `produced_by_brain_to_latent == True`.
 
     return H5Manifest(
         schema_version=AUG_LATENT_SCHEMA_VERSION,
@@ -190,6 +207,24 @@ def validate_aug_latent_h5(
                     f"masks/tumor_latent: per-row shape {mdset.shape[1:]} "
                     f"!= {expected_mask_per_row}"
                 )
+        # Conditional check: when the producer recorded the brain-to-latent
+        # post-pass having run, `masks/brain_latent` must be present with the
+        # canonical (N, 1, *LATENT_SPATIAL) int8 layout.
+        if bool(f.attrs.get("produced_by_brain_to_latent", False)):
+            if "masks/brain_latent" not in f:
+                violations.append(
+                    "produced_by_brain_to_latent=True but `masks/brain_latent` is missing"
+                )
+            else:
+                bdset = f["masks/brain_latent"]
+                expected_brain_per_row = (1, *LATENT_SPATIAL)
+                if tuple(bdset.shape[1:]) != expected_brain_per_row:
+                    violations.append(
+                        f"masks/brain_latent: per-row shape {bdset.shape[1:]} "
+                        f"!= {expected_brain_per_row}"
+                    )
+                if not _numpy_int8(bdset):
+                    violations.append(f"masks/brain_latent: dtype {bdset.dtype} != int8")
         # Forbidden groups for the aug-latent H5 (splits / CSR live on the
         # clean latent H5 only).
         for forbidden in ("patients", "splits"):

@@ -108,3 +108,46 @@ def clean_brain_mask(
     out = mask.copy()
     out[~survivors] = 0
     return out
+
+
+def recompute_union_of_four(
+    image_h5_path: str | object,
+    *,
+    modalities: tuple[str, ...] = ("t1pre", "t1c", "t2", "flair"),
+    min_component_voxels: int = _DEFAULT_MIN_COMPONENT_VOXELS,
+):
+    """Yield ``(row_idx, scan_id, old_mask, new_mask)`` for every row.
+
+    Re-derives ``masks/brain`` as the union of the four modalities' nonzero
+    voxels and runs ``clean_brain_mask`` on the result. Used by
+    ``scripts/harmonize_brain_source_inplace.py`` to unify the brain-mask
+    source for BraTS-GLI + IvyGAP (currently ``t1pre > 0``) with the rest of
+    the VENA-computed cohorts (already union-of-4 + CC clean). The caller is
+    responsible for writing the new mask back; this generator stays pure so
+    a ``--dry-run`` path can inspect the deltas without mutating the file.
+    """
+    import h5py  # local import — avoids forcing every consumer to depend on h5py
+
+    with h5py.File(image_h5_path, "r") as f:
+        for mod in modalities:
+            if f"images/{mod}" not in f:
+                raise KeyError(
+                    f"{image_h5_path}: missing images/{mod}; cannot rebuild union-of-4 brain mask"
+                )
+        if "masks/brain" not in f:
+            raise KeyError(f"{image_h5_path}: missing masks/brain (cannot compute delta)")
+        ids_raw = f["ids"][:]
+        ids = [v.decode() if isinstance(v, bytes) else str(v) for v in ids_raw]
+        brain_ds = f["masks/brain"]
+        n = brain_ds.shape[0]
+        for i in range(n):
+            old_mask = np.asarray(brain_ds[i])
+            union = np.zeros_like(old_mask, dtype=bool)
+            for mod in modalities:
+                arr = np.asarray(f[f"images/{mod}"][i])
+                union |= arr != 0
+            new_mask = clean_brain_mask(
+                union.astype(old_mask.dtype, copy=False),
+                min_component_voxels=min_component_voxels,
+            )
+            yield i, ids[i], old_mask, new_mask

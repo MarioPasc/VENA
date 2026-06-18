@@ -13,7 +13,6 @@ No MAISI checkpoint is loaded; the encoder is stubbed with a fixed-shape tensor.
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -24,11 +23,10 @@ import pytest
 import torch
 
 from vena.data.h5.ucsf_pdgm.latent_domain.manifest import (
-    UCSF_PDGM_LATENT_SPATIAL,
     _UCSF_PDGM_METADATA_FIELDS,
+    UCSF_PDGM_LATENT_SPATIAL,
     build_latent_manifest,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers: build minimal source image H5 fixtures
@@ -135,9 +133,10 @@ def _make_source_h5(
 
         # manifest_json attr so the converter can detect metadata fields
         if has_metadata:
-            from vena.data.h5.ucsf_pdgm.latent_domain.manifest import _UCSF_PDGM_METADATA_FIELDS
-            from vena.data.h5.ucsf_pdgm.latent_domain.manifest import build_latent_manifest
             from vena.data.h5.shared import DatasetSpec, H5Manifest
+            from vena.data.h5.ucsf_pdgm.latent_domain.manifest import (
+                _UCSF_PDGM_METADATA_FIELDS,
+            )
 
             # Build a minimal image-domain manifest (just the metadata fields)
             meta_specs = [
@@ -247,14 +246,15 @@ def test_manifest_cohort_propagates() -> None:
 
 def _make_fake_encoder(latent_channels: int = 4) -> Any:
     """Return a stubbed MaisiEncoder whose encode() returns a fixed latent."""
-    from vena.model.autoencoder.maisi.preprocessing import CropPadSpec
     from vena.model.autoencoder.maisi.encode.engine import EncodeResult
+    from vena.model.autoencoder.maisi.preprocessing import CropPadSpec
 
     def _fake_encode(
         x: torch.Tensor,
         mode: str = "auto",
         crop_spec: CropPadSpec | None = None,
         normalise: bool = True,
+        mask: torch.Tensor | None = None,
     ) -> EncodeResult:
         # Return a (1, C, 48, 56, 48) latent regardless of input shape.
         z = torch.zeros(1, latent_channels, 48, 56, 48)

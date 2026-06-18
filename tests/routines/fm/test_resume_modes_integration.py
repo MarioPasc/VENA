@@ -22,14 +22,11 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
-
 from routines.fm.train.engine import (
     FMTrainRoutineConfig,
     FMTrainRoutineEngine,
-    ResumeMode,
     _WarmStartCallback,
 )
 
@@ -179,24 +176,18 @@ def stub_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     # 1. Stub trunk + controlnet setup so the LightningModule constructs.
     from vena.model.fm.lightning.module import FMLightningModule
 
-    monkeypatch.setattr(
-        FMLightningModule, "_setup_trunk_and_controlnet", lambda self: None
-    )
+    monkeypatch.setattr(FMLightningModule, "_setup_trunk_and_controlnet", lambda self: None)
     monkeypatch.setattr(FMLightningModule, "setup", lambda self, stage=None: None)
 
     # 2. Stub the registry loader.
-    monkeypatch.setattr(
-        "routines.fm.train.engine.load_registry", lambda p: _FakeRegistry()
-    )
+    monkeypatch.setattr("routines.fm.train.engine.load_registry", lambda p: _FakeRegistry())
 
     # 3. Stub MultiCohortLatentDataModule so it doesn't open any H5 files.
     class _FakeDM:
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-    monkeypatch.setattr(
-        "routines.fm.train.engine.MultiCohortLatentDataModule", _FakeDM
-    )
+    monkeypatch.setattr("routines.fm.train.engine.MultiCohortLatentDataModule", _FakeDM)
 
     # 4. Stub trainer.fit — just record what ckpt_path was passed.
     import pytorch_lightning as pl
@@ -216,10 +207,14 @@ def stub_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             self.dirpath = kwargs.get("dirpath")
 
     monkeypatch.setattr("routines.fm.train.engine.VENACheckpointCallback", _NoopCkpt)
-    monkeypatch.setattr("routines.fm.train.engine.BestCheckpointCallback", lambda *a, **k: _NoopCkpt())
+    monkeypatch.setattr(
+        "routines.fm.train.engine.BestCheckpointCallback", lambda *a, **k: _NoopCkpt()
+    )
     monkeypatch.setattr("routines.fm.train.engine.SigtermHandler", lambda *a, **k: _NoopCkpt())
     monkeypatch.setattr("routines.fm.train.engine.TrainMetricsCSV", lambda *a, **k: _NoopCkpt())
-    monkeypatch.setattr("routines.fm.train.engine.ExhaustiveValLauncher", lambda *a, **k: _NoopCkpt())
+    monkeypatch.setattr(
+        "routines.fm.train.engine.ExhaustiveValLauncher", lambda *a, **k: _NoopCkpt()
+    )
     monkeypatch.setattr("routines.fm.train.engine.AugmentationTracker", lambda *a, **k: _NoopCkpt())
     monkeypatch.setattr("routines.fm.train.engine.VariantTracker", lambda *a, **k: _NoopCkpt())
 
@@ -267,7 +262,7 @@ def test_baseline_creates_new_dir(stub_engine, tmp_path: Path) -> None:
 
     # Decision.json fields.
     d = _read_decision(run_dir)
-    assert d["schema_version"] == "0.8.0"
+    assert d["schema_version"] == "0.9.0"
     assert d["tag"] == "smoke_resume"
     assert d["resume_mode"] == "baseline"
     assert d["resume_source"] == "baseline"
@@ -309,9 +304,7 @@ def test_continue_reuses_dir(stub_engine, tmp_path: Path) -> None:
     assert not any(isinstance(cb, _WarmStartCallback) for cb in captured["callbacks"])
 
 
-def test_warm_start_creates_new_dir_and_injects_callback(
-    stub_engine, tmp_path: Path
-) -> None:
+def test_warm_start_creates_new_dir_and_injects_callback(stub_engine, tmp_path: Path) -> None:
     make, captured = stub_engine
     root = tmp_path / "experiments"
     registry = _write_registry(tmp_path / "registry.json")

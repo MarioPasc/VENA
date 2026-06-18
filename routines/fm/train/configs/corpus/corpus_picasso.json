@@ -117,6 +117,19 @@
       "n_scans": 63,
       "modalities": ["t1pre", "t1c", "t2", "flair"],
       "has_swan": false
+    },
+    {
+      "name": "BraTS-PED",
+      "pathology": "pediatric_glioma",
+      "label_system": "BraTS2023",
+      "role": "test_only",
+      "longitudinal": false,
+      "image_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/brats_ped/h5/BraTS_PED_image.h5",
+      "latent_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/brats_ped/h5/BraTS_PED_latents.h5",
+      "n_patients": 260,
+      "n_scans": 260,
+      "modalities": ["t1pre", "t1c", "t2", "flair"],
+      "has_swan": false
     }
   ]
 }

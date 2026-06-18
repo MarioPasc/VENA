@@ -224,6 +224,11 @@ class OfflineAugBankBuilder:
                 n=n_rows,
                 spatial_shape=AUG_IMAGE_CROP_BOX,
             )
+            brain_dset = w.create_stacked(
+                manifest.get("masks/brain"),
+                n=n_rows,
+                spatial_shape=AUG_IMAGE_CROP_BOX,
+            )
 
             # crop/origin is required by LatentH5Converter._assert_source_compatibility
             # but is the all-zeros vector for every row here.
@@ -250,6 +255,7 @@ class OfflineAugBankBuilder:
                     params_dset=params_dset,
                     image_dsets=image_dsets,
                     mask_dset=mask_dset,
+                    brain_dset=brain_dset,
                 )
 
         assert_aug_image_h5_valid(self.output_path, self.cohort, self.modalities)
@@ -362,9 +368,16 @@ class OfflineAugBankBuilder:
         params_dset: h5py.Dataset,
         image_dsets: dict[str, h5py.Dataset],
         mask_dset: h5py.Dataset,
+        brain_dset: h5py.Dataset,
     ) -> None:
         ids_raw = src["ids"][:]
         ids_all = [v.decode() if isinstance(v, (bytes, bytearray)) else str(v) for v in ids_raw]
+        if "masks/brain" not in src:
+            raise KeyError(
+                f"source image H5 {self.source_image_h5} lacks `masks/brain`; "
+                "every cohort image H5 must carry it (see h5-design-principles.md). "
+                "Run scripts/clean_brain_mask_inplace.py (or the cohort converter) first."
+            )
         out_row = 0
         n_total = len(rows) * len(self.variants)
         for src_idx in rows:
@@ -376,6 +389,8 @@ class OfflineAugBankBuilder:
                 volumes_boxed[slug] = _box_native(arr, crop_origin)
             mask_arr = np.asarray(src["masks/tumor"][src_idx], dtype=np.int8)
             mask_boxed = _box_native(mask_arr, crop_origin).astype(np.int8)
+            brain_arr = np.asarray(src["masks/brain"][src_idx], dtype=np.int8)
+            brain_boxed = _box_native(brain_arr, crop_origin).astype(np.int8)
 
             for variant in self.variants:
                 seed = _variant_seed(self.seed, self.rank, src_idx, variant)
@@ -385,7 +400,7 @@ class OfflineAugBankBuilder:
                 # (e.g. RandomMotion, RandomElasticDeformation); seed it too
                 # or those variants are not byte-reproducible across re-runs.
                 random.seed(seed)
-                subject = self._build_subject(volumes_boxed, mask_boxed)
+                subject = self._build_subject(volumes_boxed, mask_boxed, brain_boxed=brain_boxed)
                 transform = make_variant(variant, self.variant_hyperparams.get(variant))
                 augmented = transform(subject)
 
@@ -404,6 +419,11 @@ class OfflineAugBankBuilder:
                     out_row,
                     augmented["tumor"].data[0].numpy().astype(np.int8, copy=False),
                 )
+                assign_row(
+                    brain_dset,
+                    out_row,
+                    augmented["brain"].data[0].numpy().astype(np.int8, copy=False),
+                )
                 out_row += 1
                 if out_row % 32 == 0 or out_row == n_total:
                     logger.info(
@@ -419,12 +439,20 @@ class OfflineAugBankBuilder:
         self,
         volumes_boxed: dict[str, np.ndarray],
         mask_boxed: np.ndarray,
+        brain_boxed: np.ndarray | None = None,
     ) -> tio.Subject:
         members: dict[str, Any] = {}
         for slug in self.modalities:
             arr = volumes_boxed[slug]
             members[slug] = tio.ScalarImage(tensor=torch.from_numpy(arr).unsqueeze(0))
         members["tumor"] = tio.LabelMap(tensor=torch.from_numpy(mask_boxed).unsqueeze(0).long())
+        if brain_boxed is not None:
+            # LabelMap → warped jointly with images under v4's elastic+affine
+            # using nearest-neighbour interpolation. v1/v2/v3 are intensity-only
+            # and copy the brain mask verbatim.
+            members["brain"] = tio.LabelMap(
+                tensor=torch.from_numpy(brain_boxed).unsqueeze(0).long()
+            )
         return tio.Subject(**members)
 
     @staticmethod
@@ -575,6 +603,11 @@ def merge_aug_image_h5_shards(
             n=total_rows,
             spatial_shape=AUG_IMAGE_CROP_BOX,
         )
+        brain_dset = w.create_stacked(
+            manifest.get("masks/brain"),
+            n=total_rows,
+            spatial_shape=AUG_IMAGE_CROP_BOX,
+        )
         crop_origin_dset = f.create_dataset(
             "crop/origin",
             shape=(total_rows, 3),
@@ -600,6 +633,12 @@ def merge_aug_image_h5_shards(
                 for slug in modalities:
                     image_dsets[slug][out_row:end] = fs[f"images/{slug}"][:]
                 mask_dset[out_row:end] = fs["masks/tumor"][:]
+                if "masks/brain" in fs:
+                    brain_dset[out_row:end] = fs["masks/brain"][:]
+                else:
+                    raise KeyError(
+                        f"shard {s} lacks `masks/brain`; cannot merge into a brain-aware aug-image H5"
+                    )
                 out_row = end
 
     assert_aug_image_h5_valid(merged_path, cohort, modalities)

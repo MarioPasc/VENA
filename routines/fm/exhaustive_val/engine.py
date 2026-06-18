@@ -255,7 +255,18 @@ class ExhaustiveValEngine:
             def _decode(ds) -> list[str]:  # type: ignore[no-untyped-def]
                 return [b.decode() if isinstance(b, bytes) else str(b) for b in ds[:]]
 
-            val_patient_keys = _decode(f[f"splits/cv/fold_{self.cfg.fold}/val"])
+            # cv cohorts carry `splits/cv/fold_<fold>/val`; test-only cohorts
+            # carry only `splits/test` post-2026-06-19 schema unification (the
+            # legacy `splits/cv/fold_0/val` alias on test-only cohorts was
+            # dropped by normalize_splits). Try the cv path first, fall back
+            # to the test pool for the OOD evaluation case.
+            cv_key = f"splits/cv/fold_{self.cfg.fold}/val"
+            if cv_key in f:
+                val_patient_keys = _decode(f[cv_key])
+            elif "splits/test" in f:
+                val_patient_keys = _decode(f["splits/test"])
+            else:
+                raise KeyError(f"{latents_h5}: neither {cv_key!r} nor 'splits/test' present")
             offsets = f["patients/offsets"][:]
             csr_keys = _decode(f["patients/keys"])
             all_ids = _decode(f["ids"])

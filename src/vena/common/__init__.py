@@ -52,6 +52,13 @@ from vena.model.autoencoder.maisi.preprocessing import (
     invert_crop_pad,
 )
 
+from .decode import (
+    decode_box,
+    decode_depth_identity,
+    decoder_block_geometry,
+    partial_decode,
+)
+
 __all__ = [
     "LATENT_CHANNELS",
     "SPATIAL_COMPRESSION",
@@ -69,8 +76,12 @@ __all__ = [
     "ShapeContractError",
     "apply_crop_pad",
     "crop_to_original",
+    "decode_box",
+    "decode_depth_identity",
+    "decoder_block_geometry",
     "invert_crop_pad",
     "load_autoencoder",
     "pad_depth_to_multiple_of",
+    "partial_decode",
     "percentile_normalise",
 ]

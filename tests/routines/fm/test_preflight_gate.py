@@ -165,3 +165,122 @@ def test_allowed_augmentation_passes(tmp_path: Path) -> None:
 def test_load_preflight_decision_missing_raises(tmp_path: Path) -> None:
     with pytest.raises(PreflightGateError, match="missing"):
         _load_preflight_decision(tmp_path / "absent" / "decision.json")
+
+
+# ---------------------------------------------------------------------------
+# S3 decoder_lpl gate (schema 0.9.0)
+# ---------------------------------------------------------------------------
+
+
+def _build_s3_cfg(
+    *,
+    tmp_path: Path,
+    decoder_lpl_decision_path: Path | None,
+    variant_weights: dict[str, float] | None = None,
+) -> FMTrainRoutineConfig:
+    """S3-stage minimal config exercising the decoder_lpl gate."""
+    dummy_registry = tmp_path / "dummy_registry.json"
+    dummy_registry.write_text("{}")
+    dummy_ckpt = tmp_path / "trunk.pt"
+    dummy_ckpt.write_bytes(b"")
+    dummy_arch = tmp_path / "arch.json"
+    dummy_arch.write_text("{}")
+    cfg_dict = {
+        "run": {"stage": "s3", "tag": "lpl_fft", "seed": 42, "device": "cpu"},
+        "data": {
+            "corpus_registry": str(dummy_registry),
+            "decoder_lpl_decision_path": (
+                str(decoder_lpl_decision_path) if decoder_lpl_decision_path else None
+            ),
+            "variant_weights": variant_weights
+            or {"v0": 0.2, "v1": 0.2, "v2": 0.2, "v3": 0.2, "v4": 0.2},
+        },
+        "model": {
+            "trunk": {"checkpoint": str(dummy_ckpt), "arch_json": str(dummy_arch)},
+            "controlnet": {"conditioning_inputs": ["t1pre"]},
+        },
+        "rflow": {},
+        "optim": {"lr": 1e-4},
+        "ema": {"decay": 0.999},
+        "training": {"total_steps": 1},
+        "validation": {},
+        "exhaustive_val": {"enabled": False},
+        "output": {"experiments_root": str(tmp_path / "experiments")},
+    }
+    return FMTrainRoutineConfig.model_validate(cfg_dict)
+
+
+def _write_lpl_decision(
+    path: Path,
+    *,
+    allowed_variants: list[str],
+    A: tuple[int, ...] = (2, 3),
+) -> None:
+    payload = {
+        "schema_version": "1.0",
+        "produced_at": "2026-06-18T20:27:09Z",
+        "producer": "vena.preflight.decoder_lpl_profile:1.0",
+        "n_patients_run": 90,
+        "patients_per_cohort": {"UCSF-PDGM": 3},
+        "A_recommended": list(A),
+        "w_l": {str(k): 1.0 for k in A},
+        "t_min": 0.4,
+        "outlier_k": {str(k): 5.0 for k in A},
+        "region_recipe": {
+            "alpha_wt": 2.0,
+            "alpha_notwt": 3.0,
+            "soft_region": False,
+            "per_cohort_overrides": None,
+        },
+        "allowed_variants": allowed_variants,
+        "v4_brain_mask_status": "ok",
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload))
+
+
+def test_s3_requires_decoder_lpl_decision_path(tmp_path: Path) -> None:
+    cfg = _build_s3_cfg(tmp_path=tmp_path, decoder_lpl_decision_path=None)
+    with pytest.raises(PreflightGateError, match="decoder_lpl_decision_path"):
+        _assert_preflight_gates(cfg)
+
+
+def test_s3_missing_decision_file_raises(tmp_path: Path) -> None:
+    cfg = _build_s3_cfg(
+        tmp_path=tmp_path,
+        decoder_lpl_decision_path=tmp_path / "no_such" / "decision.json",
+    )
+    with pytest.raises(PreflightGateError, match="does not exist"):
+        _assert_preflight_gates(cfg)
+
+
+def test_s3_valid_decision_passes(tmp_path: Path) -> None:
+    decision = tmp_path / "decision.json"
+    _write_lpl_decision(decision, allowed_variants=["v0", "v1", "v2", "v3", "v4"])
+    cfg = _build_s3_cfg(tmp_path=tmp_path, decoder_lpl_decision_path=decision)
+    _assert_preflight_gates(cfg)  # no raise
+
+
+def test_s3_disallowed_variant_in_weights_raises(tmp_path: Path) -> None:
+    """If variant_weights uses v4 but the decision rejects it, gate fails."""
+    decision = tmp_path / "decision.json"
+    _write_lpl_decision(decision, allowed_variants=["v0", "v1", "v2", "v3"])  # no v4
+    cfg = _build_s3_cfg(
+        tmp_path=tmp_path,
+        decoder_lpl_decision_path=decision,
+        variant_weights={"v0": 0.2, "v1": 0.2, "v2": 0.2, "v3": 0.2, "v4": 0.2},
+    )
+    with pytest.raises(PreflightGateError, match="v4"):
+        _assert_preflight_gates(cfg)
+
+
+def test_s3_disallowed_variant_with_zero_weight_passes(tmp_path: Path) -> None:
+    """A zeroed disallowed variant in the weights is OK (operator masked it)."""
+    decision = tmp_path / "decision.json"
+    _write_lpl_decision(decision, allowed_variants=["v0", "v1", "v2", "v3"])  # no v4
+    cfg = _build_s3_cfg(
+        tmp_path=tmp_path,
+        decoder_lpl_decision_path=decision,
+        variant_weights={"v0": 0.25, "v1": 0.25, "v2": 0.25, "v3": 0.25, "v4": 0.0},
+    )
+    _assert_preflight_gates(cfg)  # no raise

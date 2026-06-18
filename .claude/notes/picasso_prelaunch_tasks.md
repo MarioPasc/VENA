@@ -1,6 +1,39 @@
 # Pre-launch Tasks — 7-day Picasso Training Run
 
-**Date:** 2026-06-05 (audit re-refreshed; 2026-06-01 entries marked historical).
+**Date:** 2026-06-05 (refreshed 2026-06-19 with the post-audit-fix data state).
+
+## 2026-06-19 update (post data-audit fix-up)
+
+Picasso production data is now consistent end-to-end:
+
+- **9 cohorts in `corpus_picasso.json`** (BraTS-PED re-included as
+  `test_only`, 260 patients; image H5 was retransferred 2026-06-18 to fix
+  the 3.95→5.1 GB truncation).
+- **Three audit-§0 critical findings closed**: v4 brain-mask synth-ones,
+  BraTS-Africa z-score skew, IvyGAP CC noise — see
+  `.claude/notes/data/2026-06-19_data_audit_v2.md`.
+- **Aug-image + aug-latent schema bumped to 0.2.0** (added `masks/brain`
+  to the aug-image manifest; conditional `masks/brain_latent` validator on
+  the aug-latent gated on root attr `produced_by_brain_to_latent`).
+- **Splits unified**: every cv cohort image + latent H5 carries
+  `splits/cv/fold_N/* + splits/test`; every test_only cohort carries
+  `splits/test`. REMBRANDT image H5 needed an in-place `splits/cv` copy
+  from the latent because the converter never wrote it natively.
+- **Loader fixes**: `routines/fm/exhaustive_val/engine.py::_cohort_val_patients`
+  now falls back to `splits/test` when `splits/cv/fold_<fold>/val` is
+  absent, so test_only cohorts (now without the legacy `splits/cv/fold_0/val`
+  alias) are still iterated. BraTS-PED is automatically picked up
+  (`registry.test_cohorts()` enumerates 3 cohorts now).
+- **Tests**: 771/771 pass (`pytest -m "not slow and not gpu"`); +15 new
+  unit tests across encoder mask, bank-builder brain LabelMap, conditional
+  validator, splits normalize, recompute_union_of_four, seed-replay.
+
+Pre-launch acceptance gate (below) is unchanged in shape — the launchers
+land cleanly because the FM training data path only reads
+`splits/cv/fold_<fold>/{train,val} + splits/test` on cv cohorts and that
+form is present everywhere.
+
+
 **Status:** Three 1000-epoch Picasso configurations (S1, S2+LoRA r=16, S2+FFT) are
 written and validated locally. SLURM scripts at `routines/fm/train/slurm/runs/`
 land cleanly with `bash launcher_picasso_<stage>.sh --dry-run`. All Picasso-side
@@ -33,7 +66,7 @@ Data on Picasso: `/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/<c
 | REMBRANDT (63) | ✅ | ✅ | ✅ | ✅ | cv | yes |
 | BraTS-Africa-Glioma (95) | ✅ | ✅ | — | — | test_only | yes |
 | BraTS-Africa-Other (51) | ✅ | ✅ | — | — | test_only | yes |
-| BraTS-PED (261) | ⚠️ truncated on Picasso (3.95 GB / 5.42 GB expected); **dropped from `corpus_picasso.json` 2026-06-05** | ✅ (2.0 GB intact) | — | — | test_only | deferred |
+| BraTS-PED (260) | ✅ 5.1 GB intact (retransferred 2026-06-18 via server3→/tmp→picasso) | ✅ (1.9 GB intact; `masks/brain_latent` populated 2026-06-18) | — | — | test_only | **yes — back in `corpus_picasso.json` 2026-06-19** |
 
 ### Assets
 

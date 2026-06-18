@@ -86,9 +86,7 @@ class MaisiEncoder:
         self.percentile_upper = percentile_upper
         self.percentile_foreground_only = percentile_foreground_only
         if precision_mode not in {"autocast", "fp32"}:
-            raise ValueError(
-                f"precision_mode must be 'autocast' or 'fp32'; got {precision_mode!r}"
-            )
+            raise ValueError(f"precision_mode must be 'autocast' or 'fp32'; got {precision_mode!r}")
         self.precision_mode = precision_mode
 
     # ------------------------------------------------------------------ API
@@ -100,6 +98,7 @@ class MaisiEncoder:
         mode: Literal["auto", "full", "sliding"] = "auto",
         crop_spec: CropPadSpec | None = None,
         normalise: bool = True,
+        mask: torch.Tensor | None = None,
     ) -> EncodeResult:
         """Encode an image batch to the MAISI latent.
 
@@ -121,23 +120,36 @@ class MaisiEncoder:
             Apply :func:`percentile_normalise` first. Disable only if the
             caller already normalised (e.g. when re-encoding from a cached
             ``[0,1]`` tensor).
+        mask : torch.Tensor | None
+            Optional brain mask of shape ``(B, 1, H, W, D)`` matching ``x``'s
+            native shape. When set together with ``crop_spec``, the mask is
+            crop/padded with the same spec and passed to
+            :func:`percentile_normalise` so the foreground definition uses
+            real intra-brain voxels rather than the ``x > 0`` heuristic.
+            Required for cohorts whose stored intensities are z-score
+            normalised (BraTS-Africa); harmless for raw-intensity cohorts.
         """
         if x.ndim != 5 or x.shape[1] != 1:
-            raise ShapeContractError(
-                f"encode expects (B,1,H,W,D); got {tuple(x.shape)}"
-            )
+            raise ShapeContractError(f"encode expects (B,1,H,W,D); got {tuple(x.shape)}")
+        if mask is not None and (mask.ndim != 5 or mask.shape[1] != 1):
+            raise ShapeContractError(f"encode mask expects (B,1,H,W,D); got {tuple(mask.shape)}")
         x = x.to(self.handle.device, dtype=torch.float32, non_blocking=True)
+        if mask is not None:
+            mask = mask.to(self.handle.device, dtype=torch.float32, non_blocking=True)
 
         if crop_spec is not None:
             # Crop-box path: map native volume onto the fixed brain box first,
             # then normalise over the (already brain-containing) box region.
             x = apply_crop_pad(x, crop_spec)
+            if mask is not None:
+                mask = apply_crop_pad(mask, crop_spec)
             if normalise:
                 x = percentile_normalise(
                     x,
                     lower=self.percentile_lower,
                     upper=self.percentile_upper,
                     foreground_only=self.percentile_foreground_only,
+                    mask=mask,
                 )
             if mode == "full":
                 return EncodeResult(self._full(x), None, "full", crop=crop_spec)
@@ -171,8 +183,11 @@ class MaisiEncoder:
                 lower=self.percentile_lower,
                 upper=self.percentile_upper,
                 foreground_only=self.percentile_foreground_only,
+                mask=mask,
             )
         x, pad = pad_depth_to_multiple_of(x, base=self.depth_pad_base)
+        if mask is not None:
+            mask, _ = pad_depth_to_multiple_of(mask, base=self.depth_pad_base)
 
         if mode == "full":
             return EncodeResult(self._full(x), pad, "full")

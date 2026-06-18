@@ -1,4 +1,4 @@
-# VENA Training Cohort Registry — 2026-06-03
+# VENA Training Cohort Registry — 2026-06-03 (last updated 2026-06-19)
 
 Single source of truth for the multi-cohort corpus VENA trains and evaluates
 on. Per-cohort markdown notes (e.g. `ivygap.md`, `lumiere.md`,
@@ -8,6 +8,43 @@ The numbers below match the deduplicated `corpus_local.json` /
 `corpus_server3.json` / `corpus_picasso.json` (schema 1.0.0). Patient counts
 are post-conversion (skipped patients dropped); `n_kept` is the number
 surviving the `cohort_dedup` preflight.
+
+## State as of 2026-06-19 (post-audit fix-up)
+
+Three audit-§0 critical findings (v4 brain-mask synth-ones, BraTS-Africa
+z-score skew, IvyGAP CC noise) **CLOSED on the Picasso production data**.
+See `2026-06-19_data_audit_v2.md` for the full report. Key changes that
+affect this registry:
+
+- **BraTS-PED is back in `corpus_picasso.json`** as `role: test_only`
+  (260 patients; image H5 re-transferred 2026-06-18, brain_latent encoded
+  on loginexa, `produced_by_brain_to_latent=True`).
+- **BraTS-GLI + IvyGAP brain masks unified** to union-of-4-modalities +
+  `clean_brain_mask` (was `t1pre > 0`). BraTS-GLI gained ~755k voxels per
+  scan at the boundary; IvyGAP lost ~118 voxels per scan of skull-strip
+  noise.
+- **BraTS-Africa-Glioma + Other re-encoded** with `percentile_use_brain_mask=True`;
+  latent distributions now match UCSF (mean ≈ −0.14/−0.20, std ≈ 0.95/0.97).
+- **v4 brain-mask "synth-ones" CLOSED** via TorchIO seed-replay
+  (`scripts/patch_v4_brain_latent.py`); 2 066 v4 rows across the 6 cv
+  cohorts now carry real warped brain masks (mean sums 24 735–26 947;
+  pre-fix every row was 129 024).
+- **Schema versions bumped**: aug-image + aug-latent 0.1.0 → 0.2.0
+  (added `masks/brain` to aug-image manifest; conditional `masks/brain_latent`
+  validator on aug-latent gated on root attr `produced_by_brain_to_latent`).
+  Base image + latent H5s stay at `2.0.0`.
+- **Splits normalized**: `splits/cv/fold_N/{train,val}` + `splits/test`
+  everywhere on cv cohorts; only `splits/test` on test-only cohorts. Legacy
+  flat `splits/{train,val}` aliases dropped on IvyGAP + REMBRANDT.
+- **REMBRANDT image H5 caveat**: shipped originally with ONLY flat
+  `splits/{train,val,test}` (small cohort, no nested CV). After Phase 6
+  drop, `splits/cv` was copied in-place from the latent H5 (identical
+  patient sets — same `make_cohort_splits` seed). Both image + latent
+  now expose `splits/cv/fold_0/train n=53`, `splits/cv/fold_0/val n=5`,
+  `splits/test n=5`.
+
+The "Open follow-ups" §3 (REMBRANDT converter) and the "intensity policy"
+note further down are now stale — see the marked sections.
 
 ---
 
@@ -268,15 +305,33 @@ surviving the `cohort_dedup` preflight.
 * **Modalities**: `{t1pre, t1c, t2, flair}` for every cohort. No cohort
   carries SWAN/SWI — the vessel-prior input the proposal needs is still
   pending the Málaga in-house cohort (`role: external`, expected 2026-Q3).
-* **Brain mask**: derived in the converter as the union of nonzero voxels
-  across the four modalities (background is exactly 0 post HD-BET / CBICA
-  skull-strip).
+* **Brain mask** (as of 2026-06-19): derived in the converter as the union
+  of nonzero voxels across the four modalities + `clean_brain_mask`
+  (1000-voxel CC floor; preserves cerebellum + brainstem, drops boundary
+  noise). UCSF-PDGM + LUMIERE inherit the shipped CBICA / Bern mask;
+  BraTS-GLI + IvyGAP were harmonized in-place from the legacy `t1pre > 0`
+  to the union-of-4 policy (2026-06-18). Every cohort's image H5 carries
+  `masks/brain.attrs["brain_cc_cleaned"] = True`; harmonized cohorts also
+  carry `brain_source_unified = True` + `brain_source_modalities =
+  "t1pre,t1c,t2,flair"`.
+* **Latent brain mask**: `masks/brain_latent` shape `(N, 1, 48, 56, 48)`
+  int8 (max-pool-4 of the image-domain brain mask). Aug-latent rows for
+  v4 are TorchIO-seed-replayed warps of the image-domain brain mask, not
+  synth-ones. Every latent H5 carries root attr
+  `produced_by_brain_to_latent = True` (post-2026-06-18); the conditional
+  aug-latent validator gates on this.
 * **Latent shape** (MAISI-V2 VAE): `(C=4, H=48, W=56, D=48)`; 4× spatial
   compression of the 192×224×192 brain box.
-* **Intensity policy**: H5 stores native scanner intensities; per-modality
-  percentile normalisation `[0, 99.95]` with `foreground_only=true` runs at
-  encode time. Cross-cohort latent comparability requires every cohort to
-  share these settings — change only in lockstep across `corpus_*.json`.
+* **Intensity policy**: H5 stores native scanner intensities (BraTS-Africa
+  still stores intra-brain z-score; the encoder accommodates via
+  `mask=masks/brain`); per-modality percentile normalisation `[0, 99.95]`
+  runs at encode time. Two equivalent encoder knobs:
+  `percentile_foreground_only=True` (legacy: `x > 0` heuristic) **plus**
+  `percentile_use_brain_mask=True` (default since 2026-06-18: passes
+  `masks/brain` to `percentile_normalise`, bypassing the heuristic).
+  `mask` overrides `foreground_only` when both are set; for raw cohorts the
+  two paths produce byte-identical output, for z-score cohorts (BraTS-Africa)
+  the mask path is required to preserve intra-brain negatives.
 
 ## Dedup invariants (as of 2026-06-03)
 
@@ -400,9 +455,14 @@ The patient-then-scan two-stage draw (instead of scan-uniform) is the correct ca
 
 ## Open follow-ups
 
-1. **REMBRANDT converter** does not write `splits/cv/fold_0/{train,val}`
-   natively — the trainer requires that path. Currently patched in-place on
-   the latent H5; needs a converter fix (see task #21 in current session).
+1. ~~**REMBRANDT converter** does not write `splits/cv/fold_0/{train,val}`
+   natively~~ — **CLOSED 2026-06-19**: post the Phase-6 schema unification
+   the latent H5 carries `splits/cv/fold_0/*` natively and the image H5 was
+   patched in-place via `h5py copy` from the latent (same patient sets;
+   verified `splits/cv/fold_0/train n=53`, `splits/cv/fold_0/val n=5`).
+   Converter still emits flat splits as the source-of-truth for REMBRANDT;
+   a longer-term fix would add `splits/cv/fold_0/*` natively at conversion
+   time so future re-runs do not need the copy step.
 2. **IvyGAP bridge file** — 21 unresolvable xlsx overlaps; supply an
    external bridge to actually dedup IvyGAP against BraTS-GLI.
 3. **Málaga in-house cohort** — multi-vendor + SWAN/SWI (the
@@ -410,7 +470,14 @@ The patient-then-scan two-stage draw (instead of scan-uniform) is the correct ca
    in 2026. Until then VENA conditions on an empty vessel map at training
    time and the proposal §6 external-validation pipeline cannot run on real
    SWAN data.
-4. **No SWAN anywhere yet** — all 8 current cohorts have
+4. **No SWAN anywhere yet** — all 9 current cohorts have
    `has_swan = false`. The vessel-aware conditioning branch trains on a
    constant zero-tensor placeholder; the discriminator design hinges on
    this being a fast no-op when the modality is absent.
+5. **BraTS-Africa "z-score" cohort flag is heuristic, not authoritative.**
+   The image H5 has no `intensity_policy` root attr and per-scan empirical
+   stats vary (most scans look raw with `mean ≈ 3000`; a minority have
+   `min < 0` with 0.0% intra-brain negatives). The
+   `percentile_use_brain_mask=True` default in the encoder is a safety net;
+   any future cohort that ships z-score / standardised intensities should
+   set the same flag explicitly.

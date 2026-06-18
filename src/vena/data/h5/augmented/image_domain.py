@@ -39,8 +39,13 @@ from vena.data.h5.shared.exceptions import H5ValidationError
 
 logger = logging.getLogger(__name__)
 
-AUG_IMAGE_SCHEMA_VERSION: str = "0.1.0"
-"""Schema version of the augmented image-domain H5."""
+AUG_IMAGE_SCHEMA_VERSION: str = "0.2.0"
+"""Schema version of the augmented image-domain H5.
+
+0.2.0 — 2026-06-19: added ``masks/brain`` (warped jointly with images for v4,
+copied for v1/v2/v3). Required from this version on; consumers of pre-0.2.0
+files must re-build the bank to gain the warped brain mask.
+"""
 
 AUG_IMAGE_CROP_BOX: tuple[int, int, int] = (192, 224, 192)
 """Common brain-centred crop box, identical to the encode pipeline's box.
@@ -154,6 +159,21 @@ def build_aug_image_manifest(
             description=(
                 "BraTS tumour label map, warped jointly with images for v4; "
                 "copy of the source row for v1/v2/v3."
+            ),
+            leading_dim="n_scans",
+        )
+    )
+    datasets.append(
+        DatasetSpec(
+            path="masks/brain",
+            dtype="int8",
+            kind="mask",
+            units="binary",
+            description=(
+                "Binary brain mask, warped jointly with images for v4 "
+                "(nearest-neighbour); copy of the source row for v1/v2/v3. "
+                "Consumed by vena-encode-brain-to-latent to produce the latent "
+                "brain mask."
             ),
             leading_dim="n_scans",
         )

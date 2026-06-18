@@ -1,0 +1,48 @@
+# decoder_lpl_profile — smoke config (<2 min on cuda:0, single shard).
+#
+# One patient × v0 only; phase 2 + 3 enabled at NFE=1 to exercise the
+# code path without the full t-sweep budget. Intended for the CI smoke
+# test (synthetic ModelArtefacts) and dev sanity-checks; never use this
+# config for production knob measurement.
+
+output_root: artifacts/preflights/decoder_lpl_profile
+
+vae_checkpoint: null   # smoke runs supply ModelArtefacts(stub=True)
+s1_checkpoint: null
+s1_trunk_ema_snapshot: null
+
+cohorts:
+  - name: UCSF-PDGM
+    latent_h5: /media/hddb/mario/data/GLIOMAS/UCSF_PDGM/h5/UCSFPDGM_latents.h5
+    latent_aug_h5: null
+
+seed: 0
+device: cuda:0
+shard_id: null
+n_shards: 1
+
+patient_selection:
+  n_per_cohort: 1
+  cv_cohorts: [UCSF-PDGM]
+  volume_strata: [median]
+  variants: [v0]
+
+probe:
+  blocks: [0, 2, 5]
+  max_block: 5
+  grad_checkpoint: false
+
+phase2:
+  sampler: euler
+  nfe: 1
+  t_sweep: [0.50, 0.70, 0.90]
+  enabled: true
+
+phase3:
+  drift_threshold: 0.20
+  drift_fail_fraction: 0.25
+  inter_cohort_spread_threshold: 1.5
+
+emit:
+  composite_figures: false
+  per_channel_distribution: true

@@ -40,6 +40,7 @@ from vena.model.fm.lightning.callbacks import (
     ExhaustiveValLauncher,
     SigtermHandler,
     TrainMetricsCSV,
+    TrunkEMASnapshotCallback,
     VENACheckpointCallback,
 )
 from vena.model.fm.lightning.data import MultiCohortLatentDataModule
@@ -189,6 +190,11 @@ class _DataCfg(BaseModel):
     # into ``MultiCohortLatentDataModule`` so train/val/test scan IDs are
     # filtered before sampling. Mandatory when supplied.
     dedup_decisions_path: Path | None = None
+    # S3 stage gate. Points at the ``decision.json`` v1.0 produced by
+    # ``routines.preflights.decoder_lpl_profile``. Mandatory when
+    # ``run.stage == 's3'``; the gate validates the schema and checks
+    # that every active variant is in ``allowed_variants``.
+    decoder_lpl_decision_path: Path | None = None
     # Offline image-domain augmentation bank (per
     # ``routines.offline_aug.maisi``). When True, every cv cohort in the
     # registry must carry ``latent_aug_h5``; the DataModule wraps the train
@@ -531,6 +537,86 @@ def _assert_preflight_gates(cfg: FMTrainRoutineConfig) -> None:
     if cfg.data.use_offline_augmented_data:
         _assert_offline_aug_gate(cfg)
 
+    if cfg.run.stage.lower() == "s3":
+        _assert_decoder_lpl_gate(cfg)
+
+
+def _build_lpl_config(cfg: FMTrainRoutineConfig) -> Any:
+    """Build :class:`vena.model.fm.lpl.LplConfig` from the decision.json (S3 only).
+
+    Returns ``None`` for non-S3 stages or when no decision path is set
+    (the LightningModule then skips its S3 branch entirely). The decision
+    contract owns ``A`` / ``w_l`` / ``t_min`` / ``outlier_k`` / region
+    recipe; ``lambda_img`` and ``grad_checkpoint_segments`` come from the
+    ``loss.lpl`` YAML block.
+    """
+    if cfg.run.stage.lower() != "s3":
+        return None
+    path = getattr(cfg.data, "decoder_lpl_decision_path", None)
+    if path is None:
+        return None
+    from vena.model.fm.lpl import LplConfig
+
+    lpl_block = (cfg.loss or {}).get("lpl") if isinstance(cfg.loss, dict) else None
+    lpl_block = lpl_block or {}
+    return LplConfig.from_decision(
+        Path(path),
+        lambda_img=float(lpl_block.get("lambda_img", 0.1)),
+        soft_region=lpl_block.get("soft_region"),
+        grad_checkpoint_segments=lpl_block.get("grad_checkpoint_segments"),
+    )
+
+
+def _assert_decoder_lpl_gate(cfg: FMTrainRoutineConfig) -> None:
+    """S3 requires ``data.decoder_lpl_decision_path`` → a v1.0 decision.json.
+
+    Reads the decision via the canonical validator, asserts the schema, and
+    re-checks that every variant referenced in ``data.variant_weights`` is
+    in the decision's ``allowed_variants`` list — otherwise S3 would train
+    against an augmentation the LPL preflight explicitly rejected.
+    """
+    from vena.preflight.decoder_lpl_profile.decision import (
+        assert_decoder_lpl_decision_valid,
+    )
+
+    path = getattr(cfg.data, "decoder_lpl_decision_path", None)
+    if path is None:
+        raise PreflightGateError(
+            "S3 stage requires data.decoder_lpl_decision_path → the v1.0"
+            " decision.json emitted by routines/preflights/decoder_lpl_profile."
+            " Point at artifacts/preflights/decoder_lpl_profile/LATEST/decision.json."
+        )
+    p = Path(path)
+    if not p.is_file():
+        raise PreflightGateError(
+            f"data.decoder_lpl_decision_path={p} does not exist or is not a file."
+        )
+    try:
+        decision = assert_decoder_lpl_decision_valid(p)
+    except Exception as exc:  # pydantic ValidationError + others
+        raise PreflightGateError(
+            f"decoder_lpl_profile decision at {p} failed validation: {exc}"
+        ) from exc
+
+    # Variant intersection check: every variant in variant_weights with
+    # nonzero weight must be in allowed_variants.
+    weights = cfg.data.variant_weights or {}
+    active = {v for v, w in weights.items() if float(w) > 0.0}
+    not_allowed = active - set(decision.allowed_variants)
+    if not_allowed:
+        raise PreflightGateError(
+            f"variant_weights uses {sorted(not_allowed)} but the decoder_lpl"
+            f" preflight only allows {decision.allowed_variants}."
+            f" Either zero the weight or rerun the preflight."
+        )
+    logger.info(
+        "decoder_lpl gate passed: A=%s w_l=%s t_min=%.3f allowed=%s",
+        decision.A_recommended,
+        decision.w_l,
+        decision.t_min,
+        decision.allowed_variants,
+    )
+
 
 def _assert_offline_aug_gate(cfg: FMTrainRoutineConfig) -> None:
     """Validate that every cv cohort carries ``latent_aug_h5`` when the flag is on.
@@ -656,12 +742,29 @@ class _WarmStartCallback(pl.Callback):
     runs once per ``trainer.fit`` invocation, but defending against re-fits is
     cheap and surfaces accidental misuse loudly (the duplicate-load attempt is
     a single no-op).
+
+    The :meth:`setup` hook fires *before* ``LightningModule.setup`` (PL 2.x
+    lifecycle), which is exactly when the R6 trunk-EMA path needs the
+    snapshot path published on the module so ``setup`` can reload the saved
+    shadow into the freshly-built ``trunk_ema`` (model-coding-standards.md
+    §4.5). The path is the sibling ``trunk_ema_snapshot.pt`` written by
+    :class:`TrunkEMASnapshotCallback` during the source run; a missing
+    snapshot is a non-fatal warning (covers pre-R6 S1 checkpoints).
     """
 
     def __init__(self, ckpt_path: str) -> None:
         super().__init__()
         self.ckpt_path = ckpt_path
         self._applied = False
+
+    def setup(self, trainer: pl.Trainer, pl_module: pl.LightningModule, stage: str) -> None:
+        snapshot = Path(self.ckpt_path).parent / TRUNK_EMA_SNAPSHOT_FILENAME
+        # The setter is no-op-safe: pl_module.setup() decides whether to
+        # actually load (skips silently when trunk_ema is None on a frozen
+        # trunk, warns when the file is missing on a trainable trunk).
+        pl_module.set_pending_trunk_ema_snapshot(  # type: ignore[attr-defined]
+            snapshot if snapshot.is_file() else None
+        )
 
     def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if self._applied:
@@ -790,9 +893,9 @@ class FMTrainRoutineEngine:
             trunk_peft_variant = cfg.model.trunk.peft.get("variant")
             trunk_peft_params = dict(cfg.model.trunk.peft.get("params", {}))
         return {
-            "schema_version": "0.8.0",
+            "schema_version": "0.9.0",
             "produced_at": now_iso_utc(),
-            "producer": "routines.fm.train:0.8.0",
+            "producer": "routines.fm.train:0.9.0",
             "run_id": run_id,
             "run_dir": str(run_dir),
             "stage": cfg.run.stage,
@@ -836,6 +939,13 @@ class FMTrainRoutineEngine:
             # Schema 0.7.0 — CFG training-time dropout (additive, defaults to 0).
             "conditioning_dropout_p": cfg.training.conditioning_dropout_p,
             "conditioning_dropout_keys": list(cfg.training.conditioning_dropout_keys),
+            # Schema 0.9.0 — decoder-LPL preflight gate (S3 stage).
+            "decoder_lpl_decision_path": (
+                str(cfg.data.decoder_lpl_decision_path)
+                if cfg.data.decoder_lpl_decision_path
+                else None
+            ),
+            "decoder_lpl_decision_sha256": _safe_sha256(cfg.data.decoder_lpl_decision_path),
         }
 
     def _build_exhaustive_job_base(self, cfg: FMTrainRoutineConfig) -> dict[str, Any]:
@@ -1138,6 +1248,12 @@ class FMTrainRoutineEngine:
             vae_decoder=None,
             conditioning_dropout_p=cfg.training.conditioning_dropout_p,
             conditioning_dropout_keys=cfg.training.conditioning_dropout_keys,
+            lpl_config=_build_lpl_config(cfg),
+            lpl_vae_checkpoint=(
+                cfg.model.vae_checkpoint
+                if cfg.run.stage.lower() == "s3" and cfg.model.vae_checkpoint is not None
+                else None
+            ),
         )
 
         # Checkpoint selection (ema_best) is on the epoch-aggregated training
@@ -1158,6 +1274,12 @@ class FMTrainRoutineEngine:
                 best_mode="min",
                 save_on_train_epoch_end=True,
             ),
+            # R6 (model-coding-standards.md §4.5): mirror the trunk-EMA shadow
+            # next to the Lightning checkpoint on every save so a future
+            # WARM_START (S1→S3) can restore the exact fine-tuned EMA shadow.
+            # No-op for frozen-trunk runs (callback returns when
+            # ``pl_module.trunk_ema is None``); safe to attach unconditionally.
+            TrunkEMASnapshotCallback(dirpath=run_dir / "checkpoints"),
             TrainMetricsCSV(out_dir=run_dir / "metrics"),
             SigtermHandler(ckpt_dir=run_dir / "checkpoints", filename="ema_final.ckpt"),
         ]

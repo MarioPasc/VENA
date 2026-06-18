@@ -22,10 +22,15 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
-from typing import Literal, TypedDict
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, TypedDict
 
+import h5py
 import numpy as np
 from sklearn.model_selection import KFold, StratifiedKFold, StratifiedShuffleSplit
+
+if TYPE_CHECKING:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -196,8 +201,7 @@ def make_cohort_splits(
         )
     if n - n_test < n_folds:
         raise ValueError(
-            f"cohort too small for {n_folds}-fold CV after holding out "
-            f"n_test={n_test} from n={n}"
+            f"cohort too small for {n_folds}-fold CV after holding out n_test={n_test} from n={n}"
         )
     return make_nested_cv_splits(
         ids,
@@ -206,3 +210,79 @@ def make_cohort_splits(
         seed=seed,
         stratify_by=stratify_by,
     )
+
+
+_FLAT_SPLITS: tuple[str, ...] = ("splits/train", "splits/val", "splits/test")
+
+
+def normalize_splits(
+    h5_path: Path | str,
+    role: Literal["cv", "test_only"],
+    *,
+    dry_run: bool = False,
+) -> dict[str, list[str]]:
+    """Rewrite splits in place so every cohort H5 carries the canonical layout.
+
+    Canonical layout per role:
+
+    * ``role="cv"`` → keep ``splits/test`` plus ``splits/cv/fold_N/{train,val}``.
+      Drop the legacy flat ``splits/{train,val}`` that some cohorts shipped.
+    * ``role="test_only"`` → keep only ``splits/test``. Drop the
+      ``splits/cv/fold_0/{train,val}`` aliases (val == test, train == empty).
+
+    The function never invents splits — it only removes redundant aliases.
+    ``splits/test`` is preserved verbatim in both roles.
+
+    Parameters
+    ----------
+    h5_path : Path | str
+        H5 file to rewrite in place.
+    role : Literal["cv", "test_only"]
+        Cohort role; controls which legacy nodes are removed.
+    dry_run : bool
+        When True, compute the diff but do not mutate the file. Useful for
+        the per-cohort delta CSV produced by
+        ``scripts/normalize_splits_inplace.py``.
+
+    Returns
+    -------
+    dict[str, list[str]]
+        ``{"removed": [...], "kept": [...]}`` listing the H5 paths that were
+        (or would be) dropped and the ones that remain.
+    """
+    path = Path(h5_path)
+    removed: list[str] = []
+    kept: list[str] = []
+    if not path.exists():
+        raise FileNotFoundError(f"normalize_splits: H5 not found: {path}")
+
+    mode = "r" if dry_run else "a"
+    with h5py.File(path, mode) as f:
+        if "splits" not in f:
+            return {"removed": removed, "kept": kept}
+        if role == "cv":
+            for legacy in ("splits/train", "splits/val"):
+                if legacy in f:
+                    removed.append(legacy)
+                    if not dry_run:
+                        del f[legacy]
+            # Keep splits/test + splits/cv/* untouched.
+            for key in f["splits"]:
+                full = f"splits/{key}"
+                if full in removed:
+                    continue
+                kept.append(full)
+        elif role == "test_only":
+            # Drop the cv/fold_0/{train,val} aliases (and any cv subtree).
+            if "splits/cv" in f:
+                removed.append("splits/cv")
+                if not dry_run:
+                    del f["splits/cv"]
+            for key in f["splits"]:
+                full = f"splits/{key}"
+                if full in removed:
+                    continue
+                kept.append(full)
+        else:  # pragma: no cover — covered by Literal
+            raise ValueError(f"unknown role {role!r}; expected 'cv' or 'test_only'")
+    return {"removed": removed, "kept": kept}
