@@ -61,6 +61,7 @@ def percentile_normalise(
     eps: float = 1e-8,
     foreground_only: bool = False,
     foreground_threshold: float = 0.0,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Map ``x`` into ``[b_min, b_max]`` using per-volume percentile clipping.
 
@@ -84,9 +85,19 @@ def percentile_normalise(
         background mask). The clip/scale is still applied to the entire
         volume so background voxels remain zero. Recommended for
         skull-stripped MR (Isensee *et al.* 2021, Reinhold *et al.* 2019).
+        Ignored when ``mask`` is provided.
     foreground_threshold : float
         Inclusive lower bound for the foreground mask. Defaults to ``0``
-        (anything strictly above 0 is foreground).
+        (anything strictly above 0 is foreground). Ignored when ``mask`` is
+        provided.
+    mask : torch.Tensor | None
+        Optional explicit brain-mask of shape ``(B, 1, H, W, D)`` or
+        broadcastable to ``x``. When provided, the foreground voxels are
+        taken from ``mask > 0`` and the ``foreground_only`` / ``foreground_threshold``
+        heuristic is bypassed. Required for cohorts that store
+        z-score-normalised intensities (e.g. BraTS-Africa) where the
+        ``x > 0`` heuristic silently excludes the negative half of the
+        intra-brain distribution.
 
     Returns
     -------
@@ -96,14 +107,42 @@ def percentile_normalise(
     Raises
     ------
     ShapeContractError
-        If ``x`` is not a 5-D tensor.
+        If ``x`` is not a 5-D tensor, or if ``mask`` is provided with an
+        incompatible shape.
     """
     if x.ndim != 5:
         raise ShapeContractError(
             f"percentile_normalise expects (B,C,H,W,D); got shape {tuple(x.shape)}"
         )
 
-    if foreground_only:
+    if mask is not None:
+        if mask.ndim != 5:
+            raise ShapeContractError(
+                f"percentile_normalise: mask expects (B,1,H,W,D); got shape {tuple(mask.shape)}"
+            )
+        if mask.shape[0] != x.shape[0] or tuple(mask.shape[2:]) != tuple(x.shape[2:]):
+            raise ShapeContractError(
+                f"percentile_normalise: mask spatial / batch shape {tuple(mask.shape)} "
+                f"incompatible with input {tuple(x.shape)}"
+            )
+        B, C = x.shape[0], x.shape[1]
+        lo = torch.empty((B, C, 1, 1, 1), dtype=x.dtype, device=x.device)
+        hi = torch.empty_like(lo)
+        # mask: (B, 1, H, W, D) broadcast across channel.
+        m_bool = mask > 0
+        for b in range(B):
+            mb = m_bool[b, 0]
+            for c in range(C):
+                fg = x[b, c][mb]
+                if fg.numel() == 0:
+                    lo[b, c, 0, 0, 0] = 0.0
+                    hi[b, c, 0, 0, 0] = 1.0
+                    continue
+                q = torch.tensor([lower / 100.0, upper / 100.0], dtype=fg.dtype, device=fg.device)
+                lh = torch.quantile(fg, q)
+                lo[b, c, 0, 0, 0] = lh[0]
+                hi[b, c, 0, 0, 0] = lh[1]
+    elif foreground_only:
         # Compute percentiles per (B, C) slice over the foreground voxels
         # only. We have to loop because torch.quantile does not support a
         # per-row masked variant; the loop is over at most B*C items.
@@ -118,9 +157,7 @@ def percentile_normalise(
                     lo[b, c, 0, 0, 0] = 0.0
                     hi[b, c, 0, 0, 0] = 1.0
                     continue
-                q = torch.tensor(
-                    [lower / 100.0, upper / 100.0], dtype=fg.dtype, device=fg.device
-                )
+                q = torch.tensor([lower / 100.0, upper / 100.0], dtype=fg.dtype, device=fg.device)
                 lh = torch.quantile(fg, q)
                 lo[b, c, 0, 0, 0] = lh[0]
                 hi[b, c, 0, 0, 0] = lh[1]
@@ -228,9 +265,7 @@ def apply_crop_pad(x: torch.Tensor, spec: CropPadSpec) -> torch.Tensor:
         ``spec.native_shape``.
     """
     if x.ndim != 5:
-        raise ShapeContractError(
-            f"apply_crop_pad expects (B,C,H,W,D); got shape {tuple(x.shape)}"
-        )
+        raise ShapeContractError(f"apply_crop_pad expects (B,C,H,W,D); got shape {tuple(x.shape)}")
     if tuple(x.shape[2:]) != tuple(spec.native_shape):
         raise ShapeContractError(
             f"apply_crop_pad: input spatial {tuple(x.shape[2:])} != "
@@ -286,9 +321,7 @@ def invert_crop_pad(x: torch.Tensor, spec: CropPadSpec) -> torch.Tensor:
         Volume of shape ``(B, C, *spec.native_shape)``.
     """
     if x.ndim != 5:
-        raise ShapeContractError(
-            f"invert_crop_pad expects (B,C,H,W,D); got shape {tuple(x.shape)}"
-        )
+        raise ShapeContractError(f"invert_crop_pad expects (B,C,H,W,D); got shape {tuple(x.shape)}")
     if tuple(x.shape[2:]) != tuple(spec.target_shape):
         raise ShapeContractError(
             f"invert_crop_pad: input spatial {tuple(x.shape[2:])} != "

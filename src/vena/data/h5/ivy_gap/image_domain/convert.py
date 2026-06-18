@@ -155,8 +155,12 @@ def _load_patient_payload(
         )
     out["masks/tumor"] = seg.astype(np.int8, copy=False)
 
+    # Brain mask: t1pre nonzero foreground, then drop sub-threshold CCs
+    # (cloud-like blurs at axial slice extremes). See
+    # `.claude/notes/data/2026-06-18_data_audit.md` — IvyGAP samples carry
+    # 35-148 spurious CCs before cleaning.
     assert t1pre_lps is not None  # t1pre is loaded above.
-    brain_bin = (t1pre_lps > 0).astype(np.int8)
+    brain_bin = clean_brain_mask((t1pre_lps > 0).astype(np.int8))
     out["masks/brain"] = brain_bin
 
     try:

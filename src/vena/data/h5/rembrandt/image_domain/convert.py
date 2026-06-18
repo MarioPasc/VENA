@@ -156,8 +156,10 @@ def _load_patient_payload(
         raise H5ConvertError(f"{patient_id}: seg shape {seg.shape} != expected {expected_shape}")
     out["masks/tumor"] = seg.astype(np.int8, copy=False)
 
+    # Brain mask: union of nonzero across modalities + CC-clean.
+    # See `.claude/notes/data/2026-06-18_data_audit.md`.
     assert nonzero_union is not None  # at least one modality loaded above.
-    brain_bin = nonzero_union.astype(np.int8)
+    brain_bin = clean_brain_mask(nonzero_union.astype(np.int8))
     out["masks/brain"] = brain_bin
 
     try:

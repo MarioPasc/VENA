@@ -46,6 +46,7 @@ from vena.data.h5.shared import (
     now_iso_utc,
     resolve_git_sha,
 )
+from vena.data.h5.shared.brain_mask import clean_brain_mask
 from vena.data.niigz.brats_gli import BraTSGLIDataset
 from vena.data.niigz.shared.geometry import reorient_to_axcodes
 from vena.data.niigz.shared.io import load_nii
@@ -174,14 +175,14 @@ def _load_session_payload(
         raise H5ConvertError(f"{session_id}: missing tumour segmentation {seg_path.name}")
     seg = _load_lps(seg_path)
     if seg.shape != expected_shape:
-        raise H5ConvertError(
-            f"{session_id}: seg shape {seg.shape} != expected {expected_shape}"
-        )
+        raise H5ConvertError(f"{session_id}: seg shape {seg.shape} != expected {expected_shape}")
     out["masks/tumor"] = seg.astype(np.int8, copy=False)
 
-    # Brain mask: nonzero foreground of t1n after LPS reorientation.
+    # Brain mask: nonzero foreground of t1n after LPS reorientation, then
+    # drop sub-threshold connected components (skull-strip jitter on the
+    # first/last z-slices). See `.claude/notes/data/2026-06-18_data_audit.md`.
     assert t1n_lps is not None  # t1pre is always loaded above.
-    brain_bin = (t1n_lps > 0).astype(np.int8)
+    brain_bin = clean_brain_mask((t1n_lps > 0).astype(np.int8))
     out["masks/brain"] = brain_bin
 
     try:
@@ -269,11 +270,7 @@ class BraTSGLIImageH5Converter:
         # Rebuild session list from the (possibly truncated) patient groups.
         all_sessions = dataset.sessions()
         # Collect sessions that belong to the kept patients in CSR order.
-        sessions = [
-            all_sessions[row_idx]
-            for _, indices in patient_groups
-            for row_idx in indices
-        ]
+        sessions = [all_sessions[row_idx] for _, indices in patient_groups for row_idx in indices]
         n = len(sessions)
         n_patients = len(patient_ids)
         logger.info(
@@ -402,8 +399,7 @@ class BraTSGLIImageH5Converter:
                 offsets,
                 dtype="int32",
                 description=(
-                    "CSR offsets; sessions of patient k are rows "
-                    "[offsets[k]:offsets[k+1]]."
+                    "CSR offsets; sessions of patient k are rows [offsets[k]:offsets[k+1]]."
                 ),
             )
             w.write_vlen_str_1d(

@@ -119,8 +119,10 @@ def _load_patient_payload(
     # BraTS-2021 labels {0, 1, 2, 4} — fits comfortably in int8.
     out["masks/tumor"] = seg.astype(np.int8, copy=False)
 
+    # Brain mask: union of nonzero across modalities, then CC-clean to
+    # drop boundary jitter. See `.claude/notes/data/2026-06-18_data_audit.md`.
     assert nonzero_union is not None
-    brain_bin = nonzero_union.astype(np.int8, copy=False)
+    brain_bin = clean_brain_mask(nonzero_union.astype(np.int8, copy=False))
     out["masks/brain"] = brain_bin
 
     try:
