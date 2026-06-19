@@ -1,4 +1,4 @@
-"""Curriculum-aware loss factory (v0.4 — 2026-06-09 overhaul).
+"""Curriculum-aware loss factory (v0.5 — 2026-06-19 S3 overhaul).
 
 Stage names follow the proposal:
 
@@ -7,7 +7,15 @@ Stage names follow the proposal:
   (:class:`ContrastiveTumourLoss` v0.4). Classifier-free guidance dropout is
   configured at the training-loop level via
   ``training.conditioning_dropout_p``, not through this builder.
-* ``S3``      — S2 + capped :math:`L^p` background reconstruction.
+* ``S3``      — S1 + the decoder-feature Latent Perceptual Loss (LPL,
+  :class:`vena.model.fm.lpl.LplLoss`). The contrastive term is **not** part
+  of S3; LPL replaces it as the image-aware learning signal (see
+  ``.claude/notes/changes/decoder_perceptual_loss_s3.md``). The LPL term is
+  added in :class:`FMLightningModule.training_step` as
+  ``lambda_img(epoch) * lpl_scalar``, never through :class:`CompositeLoss` —
+  so the builder for S3 returns a CFM-only composite. The legacy
+  ``CappedLpReconLoss`` stub is no longer instantiated by any stage; the
+  v0.4 proposal §5.4 "capped L^p" idea was superseded by LPL.
 * ``skipS1``  — S2 from scratch (the curriculum-necessity ablation,
   proposal §5.5).
 
@@ -38,7 +46,6 @@ from typing import Any
 from .base import AbstractFMLoss, CompositeLoss
 from .cfm import CFMLoss
 from .contrastive import ContrastiveTumourLoss, RegionTerm
-from .reconstruction import CappedLpReconLoss
 from .schedule import (
     WeightSchedule,
     build_schedule,
@@ -105,11 +112,15 @@ def build_loss(stage: str, cfg: dict[str, Any]) -> CompositeLoss:
         Loss config block from the YAML, typically::
 
             cfm: {weight: 1.0, reduction: "mean", norm: "l2"}
-            contrastive:
+            contrastive:                                # S2 / skipS1 only
               weight: 0.1
               terms:
                 - {name: healthy, region: healthy, p: 2.0, weight: 1.0}
-            reconstruction: {weight: 0.1, p: 4, delta: 2.0}
+
+        For ``stage="S3"``, the ``contrastive`` block is ignored — the LPL
+        coupling lives in a separate ``loss.lpl`` block consumed by
+        :func:`routines.fm.train.engine._build_lpl_config`, not by this
+        builder.
 
     Returns
     -------
@@ -121,7 +132,6 @@ def build_loss(stage: str, cfg: dict[str, Any]) -> CompositeLoss:
 
     cfm_cfg = cfg.get("cfm") or {}
     contrast_cfg = cfg.get("contrastive") or {}
-    recon_cfg = cfg.get("reconstruction") or {}
 
     terms: dict[str, AbstractFMLoss] = {
         "cfm": CFMLoss(
@@ -136,21 +146,15 @@ def build_loss(stage: str, cfg: dict[str, Any]) -> CompositeLoss:
     # active) is handled at the training-loop level, not through the loss.
     requires_perturb = False
 
-    if stage_norm in {"S2", "S3", "skipS1"}:
+    # S3 carries CFM only at the CompositeLoss level. The decoder-feature LPL
+    # term is added in FMLightningModule.training_step as
+    # lambda_img(epoch) * lpl_scalar, gated by t > t_min, and is not part of
+    # this composite — see vena.model.fm.lpl + .claude/notes/changes/decoder_perceptual_loss_s3.md.
+    if stage_norm in {"S2", "skipS1"}:
         terms["contrastive"] = ContrastiveTumourLoss(terms=_parse_region_terms(contrast_cfg))
         weights["contrastive"] = build_schedule(
             _get(contrast_cfg, "weight", 0.1),
             _get(contrast_cfg, "schedule", None),
-        )
-
-    if stage_norm == "S3":
-        terms["reconstruction"] = CappedLpReconLoss(
-            p=int(_get(recon_cfg, "p", 4)),
-            delta=float(_get(recon_cfg, "delta", 2.0)),
-        )
-        weights["reconstruction"] = build_schedule(
-            _get(recon_cfg, "weight", 0.1),
-            _get(recon_cfg, "schedule", None),
         )
 
     logger.info(

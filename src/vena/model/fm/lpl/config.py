@@ -23,6 +23,11 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .schedule import LambdaImgSchedule
+
+# Re-export so callers can `from vena.model.fm.lpl.config import LambdaImgSchedule`.
+__all__ = ["LambdaImgSchedule", "LplConfig"]
+
 
 class LplConfig(BaseModel):
     """Recipe for the latent perceptual loss.
@@ -44,8 +49,14 @@ class LplConfig(BaseModel):
         2025 §3.3). The preflight finds the knee in the
         ``x̂_1`` reliability curve and overrides this default.
     lambda_img : float
-        Outer coupling weight in the composite loss. Consumed by the
-        future S3 ``CompositeLoss`` wiring; not used inside ``LplLoss``.
+        Static outer coupling weight used when ``schedule`` is ``None``
+        (legacy back-compat). When ``schedule`` is set,
+        :func:`vena.model.fm.lpl.compute_lambda_img` provides the active
+        coupling and this field is ignored by the training step.
+    schedule : LambdaImgSchedule | None
+        Optional epoch-driven schedule for the outer coupling. When set,
+        takes precedence over the static ``lambda_img`` field. Production
+        S3 runs ramp from 0 → 1 linearly over the first 30 epochs.
     alpha : dict[str, float]
         Per-region weight in the §2.6 region-weighted variant. Keys
         ``"wt"`` and ``"notwt"``; production default ``(2, 3)`` per the
@@ -83,6 +94,7 @@ class LplConfig(BaseModel):
     w_l: dict[int, float] = Field(default_factory=lambda: {2: 1.0, 5: 2.0})
     t_min: float = 0.7
     lambda_img: float = 1.0
+    schedule: LambdaImgSchedule | None = None
     alpha: dict[str, float] = Field(default_factory=lambda: {"wt": 2.0, "notwt": 3.0})
     p: dict[str, int] = Field(default_factory=lambda: {"wt": 2, "notwt": 2})
     outlier_k: dict[int, float] = Field(default_factory=lambda: {2: 5.0, 5: 5.0})
@@ -160,20 +172,33 @@ class LplConfig(BaseModel):
         lambda_img: float = 1.0,
         soft_region: bool | None = None,
         grad_checkpoint_segments: int | None = None,
+        schedule: LambdaImgSchedule | None = None,
+        A_override: list[int] | None = None,
+        w_l_override: dict[int, float] | None = None,
+        outlier_k_override: dict[int, float] | None = None,
+        alpha_override: dict[str, float] | None = None,
     ) -> LplConfig:
         """Build the loss recipe from a ``decoder_lpl_profile`` decision.json.
 
         The decision contract pins ``A``, ``w_l``, ``t_min``, ``outlier_k``,
         and the global ``region_recipe``. The S3 train YAML supplies the
-        outer ``lambda_img`` coupling weight (the decision file does not
-        commit a value — that is an experiment-design knob) and may
-        override ``soft_region`` / ``grad_checkpoint_segments`` for
-        deployment-specific tuning.
+        outer ``lambda_img`` coupling (or a ``schedule`` that supersedes
+        it) and may override ``soft_region`` / ``grad_checkpoint_segments``.
+
+        For arms that target a readout depth different from the preflight's
+        ``A_recommended`` (e.g. the K=5 ablation, where ``A=[2, 5]`` is
+        canonical per design-note §5.3 but the preflight emitted
+        ``A=[2, 3]``), pass ``A_override`` together with matching
+        ``w_l_override`` and ``outlier_k_override`` dicts. The validator
+        enforces key alignment downstream.
+
+        ``alpha_override`` lets a Standard-LPL arm pin :math:`\\alpha = (1, 1)`
+        while a Region-aware arm inherits the preflight's
+        ``region_recipe.alpha_*``.
 
         Per-cohort α overrides in ``region_recipe.per_cohort_overrides``
         are NOT consumed here — the production training loop applies the
-        global recipe. Per-cohort plumbing is a follow-up; for now, the
-        global α=(2.0, 3.0) is the contract.
+        global recipe. Per-cohort plumbing is a follow-up.
         """
         from vena.preflight.decoder_lpl_profile.decision import (
             assert_decoder_lpl_decision_valid,
@@ -181,14 +206,40 @@ class LplConfig(BaseModel):
 
         decision = assert_decoder_lpl_decision_valid(Path(decision_path))
         recipe = decision.region_recipe
+
+        if A_override is not None:
+            if w_l_override is None or outlier_k_override is None:
+                raise ValueError(
+                    "When A_override is set, w_l_override and outlier_k_override "
+                    "must also be provided (their keys must equal A_override). "
+                    "See .claude/notes/changes/decoder_perceptual_loss_s3.md §5.3 "
+                    "for the K=5 canonical recipe."
+                )
+            a_value = list(A_override)
+            w_l_value = {int(k): float(v) for k, v in w_l_override.items()}
+            outlier_k_value = {int(k): float(v) for k, v in outlier_k_override.items()}
+        else:
+            a_value = list(decision.A_recommended)
+            w_l_value = {int(k): float(v) for k, v in decision.w_l.items()}
+            outlier_k_value = {int(k): float(v) for k, v in decision.outlier_k.items()}
+
+        if alpha_override is not None:
+            alpha_value = {str(k): float(v) for k, v in alpha_override.items()}
+        else:
+            alpha_value = {
+                "wt": float(recipe.alpha_wt),
+                "notwt": float(recipe.alpha_notwt),
+            }
+
         return cls(
-            A=list(decision.A_recommended),
-            w_l={int(k): float(v) for k, v in decision.w_l.items()},
+            A=a_value,
+            w_l=w_l_value,
             t_min=float(decision.t_min),
             lambda_img=float(lambda_img),
-            alpha={"wt": float(recipe.alpha_wt), "notwt": float(recipe.alpha_notwt)},
+            schedule=schedule,
+            alpha=alpha_value,
             p={"wt": 2, "notwt": 2},  # production default; sweep axis
-            outlier_k={int(k): float(v) for k, v in decision.outlier_k.items()},
+            outlier_k=outlier_k_value,
             soft_region=(
                 bool(soft_region) if soft_region is not None else bool(recipe.soft_region)
             ),

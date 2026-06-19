@@ -36,6 +36,7 @@ from vena.data.h5.shared import now_iso_utc, sha256_file
 from vena.data.registry import load_registry
 from vena.model.fm.lightning import FMLightningModule, MultiCohortLatentDataModule
 from vena.model.fm.lightning.callbacks import (
+    TRUNK_EMA_SNAPSHOT_FILENAME,
     BestCheckpointCallback,
     ExhaustiveValLauncher,
     SigtermHandler,
@@ -382,6 +383,11 @@ class _ExhaustiveValCfg(BaseModel):
     # epoch (``figure_best_{1..k}.png`` + ``figure_worst_{1..k}.png``). Clamped
     # at job runtime to ``len(scored_patients) // 2`` so the lists never overlap.
     figure_top_k: int = 3
+    # S3 — emit per-block real-vs-synth decoder-feature panels for the top-K
+    # best/worst patients. Active only on K=2 production runs (the deeper K=5
+    # readout makes the activation footprint risky on the val GPU). False by
+    # default; the K=2 YAMLs flip it on.
+    export_per_block_figures: bool = False
     # Prune ``ema_snapshot.pt`` / ``trunk_ema_snapshot.pt`` from epoch dirs older
     # than ``prune_snapshots_keep`` cadence epochs. ``latent_preds.h5`` and
     # ``metrics.csv`` are NEVER pruned — they are the long-run diagnostic record.
@@ -547,23 +553,39 @@ def _build_lpl_config(cfg: FMTrainRoutineConfig) -> Any:
     Returns ``None`` for non-S3 stages or when no decision path is set
     (the LightningModule then skips its S3 branch entirely). The decision
     contract owns ``A`` / ``w_l`` / ``t_min`` / ``outlier_k`` / region
-    recipe; ``lambda_img`` and ``grad_checkpoint_segments`` come from the
-    ``loss.lpl`` YAML block.
+    recipe; the ``loss.lpl`` YAML block supplies ``lambda_img`` /
+    ``schedule`` / ``grad_checkpoint_segments`` / ``soft_region`` plus
+    optional ``*_override`` knobs for non-preflight arms (K=5 canonical,
+    Standard-LPL α=(1,1)).
     """
     if cfg.run.stage.lower() != "s3":
         return None
     path = getattr(cfg.data, "decoder_lpl_decision_path", None)
     if path is None:
         return None
-    from vena.model.fm.lpl import LplConfig
+    from vena.model.fm.lpl import LambdaImgSchedule, LplConfig
 
     lpl_block = (cfg.loss or {}).get("lpl") if isinstance(cfg.loss, dict) else None
     lpl_block = lpl_block or {}
+
+    schedule_raw = lpl_block.get("schedule")
+    schedule = LambdaImgSchedule.model_validate(schedule_raw) if schedule_raw is not None else None
+
+    def _coerce_int_keys(d: Any) -> dict[int, float] | None:
+        if d is None:
+            return None
+        return {int(k): float(v) for k, v in d.items()}
+
     return LplConfig.from_decision(
         Path(path),
         lambda_img=float(lpl_block.get("lambda_img", 0.1)),
         soft_region=lpl_block.get("soft_region"),
         grad_checkpoint_segments=lpl_block.get("grad_checkpoint_segments"),
+        schedule=schedule,
+        A_override=lpl_block.get("A_override"),
+        w_l_override=_coerce_int_keys(lpl_block.get("w_l_override")),
+        outlier_k_override=_coerce_int_keys(lpl_block.get("outlier_k_override")),
+        alpha_override=lpl_block.get("alpha_override"),
     )
 
 
@@ -990,6 +1012,18 @@ class FMTrainRoutineEngine:
             "n_patients": ev.n_patients,
             "figure_top_k": ev.figure_top_k,
         }
+        # S3 — per-block real-vs-synth feature-map render. Active only when the
+        # YAML sets ``exhaustive_val.export_per_block_figures=true`` and the
+        # trainer has an LPL config (so ``lpl_A`` is populated from the live
+        # readout depth, not the YAML's overrideable knobs).
+        export_per_block = bool(getattr(ev, "export_per_block_figures", False))
+        job["export_per_block_figures"] = export_per_block
+        if export_per_block:
+            lpl_cfg = _build_lpl_config(cfg)
+            job["lpl_A"] = list(lpl_cfg.A) if lpl_cfg is not None else []
+            job["vae_checkpoint"] = str(cfg.model.vae_checkpoint)
+        else:
+            job["lpl_A"] = []
         job["corpus_registry"] = str(ev.corpus_registry)
         return job
 

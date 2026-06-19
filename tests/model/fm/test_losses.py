@@ -75,10 +75,17 @@ def test_build_loss_s2_includes_contrastive_no_perturbed_pass() -> None:
 
 
 @pytest.mark.unit
-def test_build_loss_s3_adds_reconstruction() -> None:
+def test_build_loss_s3_is_cfm_only() -> None:
+    """v0.5 (2026-06-19 S3 overhaul): S3 composite carries CFM only.
+
+    LPL is added in ``FMLightningModule.training_step`` as
+    ``lambda_img(epoch) * lpl_scalar``, not through the composite. The
+    contrastive term that used to be inherited from S2 is gone (LPL replaces
+    it as the image-aware signal), and the ``CappedLpReconLoss`` stub is no
+    longer wired by any stage.
+    """
     composite = build_loss("S3", {})
-    assert set(composite.terms.keys()) == {"cfm", "contrastive", "reconstruction"}
-    # v0.4: contrastive no longer needs a perturbed pass; S3 inherits.
+    assert set(composite.terms.keys()) == {"cfm"}
     assert composite.requires_perturbed_pass is False
 
 
@@ -89,31 +96,18 @@ def test_build_loss_rejects_unknown_stage() -> None:
 
 
 @pytest.mark.unit
-def test_s3_reconstruction_stub_raises_on_forward() -> None:
-    """S3 still depends on the CappedLpReconLoss stub; confirm it raises until
-    that loss lands. (S2's contrastive is now implemented — see
-    ``tests/model/fm/test_losses_contrastive.py``.)
+def test_s3_composite_forward_returns_cfm_only_total() -> None:
+    """v0.5: S3 composite forward succeeds (no NotImplementedError stub)
+    because the recon branch was removed. ``total`` should equal the CFM
+    term exactly.
     """
     composite = build_loss("S3", {})
-    # Provide m_wt + m_brain so the v0.4 contrastive term is satisfied; the
-    # failure should come from the recon stub that runs next.
-    base = _make_inputs()
-    B, C, h, w, d = base.v_orig.shape
-    m_wt = torch.zeros(B, 1, h, w, d)
-    m_brain = torch.ones(B, 1, h, w, d)
-    inputs = LossInputs(
-        x_clean=base.x_clean,
-        noise=base.noise,
-        x_t=base.x_t,
-        timesteps=base.timesteps,
-        u_target=base.u_target,
-        v_orig=base.v_orig,
-        v_perturb=None,
-        m_wt=m_wt,
-        m_brain=m_brain,
-    )
-    with pytest.raises(NotImplementedError, match="S3 commit"):
-        composite(inputs)
+    inputs = _make_inputs()
+    total, per_term = composite(inputs)
+    assert "cfm" in per_term and "total" in per_term
+    assert "contrastive" not in per_term
+    assert "reconstruction" not in per_term
+    assert torch.allclose(total.detach(), per_term["total"])
 
 
 @pytest.mark.unit

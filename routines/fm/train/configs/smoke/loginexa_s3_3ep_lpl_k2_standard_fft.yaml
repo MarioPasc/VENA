@@ -1,0 +1,173 @@
+# Loginexa 3-epoch smoke — S3 + FFT trunk + Standard LPL (α=(1,1), K=2).
+#
+# Loginexa: single V100-DGXS-32GB, 30-min hard wallclock. Single-GPU so both
+# training and exhaustive_val share cuda:0; `exhaustive_val.block_until_complete:
+# true` is mandatory.
+#
+# Acceptance criteria for this smoke:
+#  * `last.ckpt`, `train_step.csv`, `train_epoch.csv`, `decision.json` written.
+#  * `train_step.csv` columns include: lpl, hi_frac, lambda_img_active,
+#    lpl_b2, lpl_b3, lpl_wt, lpl_notwt.
+#  * `lambda_img_active` ramps 0 → 1 across epoch 1 (warmup_epochs=1).
+#  * `exhaustive_val/epoch_002/metrics.csv` exists (cadence epoch 2).
+#  * `exhaustive_val/epoch_002/figures/block{2,3}_{best,worst}_*.png` present.
+#  * `decision.json::decoder_lpl_decision_path` set; schema_version >= "0.9.0".
+
+run:
+  stage: s3
+  tag: lpl_k2_standard_fft_smoke
+  # Warm-start from the converged S1 + CFM checkpoint. Absolute path is used
+  # because the S1 source dir lives under `/mnt/.../execs/vena/experiments/`
+  # while this run's `output.experiments_root` is the loginexa-side
+  # `/mnt/.../execs/VENA` — different parents, so the by-run_id resolver
+  # would look in the wrong place.
+  resume_from: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/2026-06-12_01-27-55_s1_fft_cfm_c9b97556/checkpoints/ema_best.ckpt
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
+
+data:
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  batch_size: 2
+  num_workers: 4
+  pin_memory: true
+  tau: 0.5
+  max_train_patients_per_cohort: 10  # smoke speedup
+  # Re-run on the post-audit corpus (2026-06-19T14-59-38Z); SHA matches
+  # corpus_picasso.json. Smoke validates the gate wiring end-to-end before
+  # the production S3 jobs hit the SLURM queue.
+  dedup_decisions_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
+  use_offline_augmented_data: true
+  variant_weights:
+    v0: 0.2
+    v1: 0.2
+    v2: 0.2
+    v3: 0.2
+    v4: 0.2
+  # S3 gate input — schema v1.0 decision.json (2026-06-18T20-18-44Z post-fix).
+  decoder_lpl_decision_path: /mnt/home/users/tic_163_uma/mpascual/execs/vena/artifacts/preflights/decoder_lpl_profile/LATEST/decision.json
+
+model:
+  trunk:
+    checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides: {}
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+    trainable: true
+    regime: fft
+  controlnet:
+    conditioning_inputs:
+      - latent:t1pre
+      - latent:t2
+      - latent:flair
+      - mask:wt:identity
+    arch_overrides: {}
+    perturb_keys: []
+  vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+
+loss:
+  cfm:
+    weight: 1.0
+    reduction: mean
+    norm: l2
+  lpl:
+    # 1-epoch warm-up so the smoke (3 epochs) reaches λ_img = 1.0 by epoch 2.
+    schedule:
+      kind: linear
+      warmup_epochs: 1
+      lambda_min: 0.0
+      lambda_max: 1.0
+    # Standard LPL: α uniform across regions (no region weighting).
+    alpha_override:
+      wt: 1.0
+      notwt: 1.0
+    # SMOKE-ONLY: restrict to A=[2] (single readout at latent res) so the
+    # partial decode fits a V100 alongside the FFT trunk. Production K=2 on
+    # A100 honors the preflight (A=[2, 3]); the loginexa V100 cannot fit
+    # block 3 (256ch × 2× spatial = ~10 GB activation budget) + the trunk.
+    # The smoke proves the LPL code path; production proves the recipe.
+    A_override: [2]
+    w_l_override:
+      2: 1.0
+    outlier_k_override:
+      2: 5.0
+    soft_region: false
+    grad_checkpoint_segments: 0
+
+rflow:
+  num_train_timesteps: 1000
+  use_discrete_timesteps: true
+  sample_method: logit-normal
+
+optim:
+  lr: 5.0e-5            # warm-start: softer than S1's 1e-4 to not overwrite trajectory
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  warmup_steps: 40
+  scheduler: cosine
+
+ema:
+  # Short stage (§4.5): 0.9999 has a ~10⁴-step time constant which would
+  # not converge in a 3-epoch smoke; 0.999 (~10³ steps) reaches steady state.
+  decay: 0.999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 600
+  max_epochs: 3
+  batch_size: 2
+  grad_accum: 1
+  checkpoint_every_epochs: 1
+  log_train_every_steps: 10
+  best_metric_name: mse_latent
+  best_metric_region: bg
+  best_metric_nfe: 5
+  gradient_clip_val: 1.0
+  patience: 100
+
+validation:
+  every_epochs: 0
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 999999
+  sweep_nfes: [1, 2, 5, 10, 20]
+  qualitative_every_epochs: 999999
+  image_metrics: false
+
+exhaustive_val:
+  enabled: true
+  every_epochs: 2                 # fires after epoch 2
+  n_patients: 3
+  nfe_levels: [1, 5]
+  integrator: euler
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  device: cuda:0                  # single-GPU loginexa
+  block_until_complete: true      # mandatory on 1-GPU
+  figure_top_k: 2
+  export_per_block_figures: true  # S3 K=2 diagnostic
+
+output:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/VENA
+  retention_n_checkpoints: 3
+  tensorboard: false
+  wandb: false
+
+regions:
+  brain:
+    source: latents_h5
+  wt:
+    source: derived_from_tumor_latent
+    threshold: 0.5
+  wt_dilated:
+    source: derived_via_scipy_binary_dilation
+    structure: ones_3x3x3
+  bg:
+    source: derived
+  vessel:
+    source: skipped

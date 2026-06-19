@@ -112,6 +112,53 @@ source ~/.conda/envs/vena/bin/activate           # or: conda activate vena
 
 See `src/external/LINKS.md` for the Picasso mirror of MAISI weights and the UCSF-PDGM H5 cache.
 
+## Rectified-flow timestep convention (load-bearing)
+
+The MAISI trunk + MONAI `RFlowScheduler` use **integer timestep codes**
+in `[0, num_train_timesteps)`. In this codebase `num_train_timesteps = 1000`
+and `use_discrete_timesteps = true`. Two conventions coexist; mixing them
+silently is the 2026-06-19 S3 bug (3.5h of training discarded because
+`x̂_1 = x_t + (1 - 998)·v` was being fed to the LPL decoder).
+
+| Symbol | Domain | Meaning | Where it appears |
+|---|---|---|---|
+| `timesteps` | int, `[0, 1000)` | raw discrete code | `RFlowEngine.sample_timesteps` output; first arg to the trunk |
+| `α` | float, `[0, 1]` | noise fraction | `α = timesteps.float() / T` |
+| `t_dn` | float, `[0, 1]` | data fraction (design note "t") | `t_dn = 1 - α`; **1 = data, 0 = noise** |
+
+Forward and target velocity (`src/vena/model/fm/sampler/rflow.py`):
+
+```
+x_t = (1 - α) · x_clean + α · x_noise              # MONAI add_noise
+u   = x_clean - x_noise = x_1 - x_0                # RFlowEngine.target_velocity
+v   ≈ u                                            # network output
+```
+
+One-step clean estimate (used by S3 LPL):
+
+```
+x̂_1 = x_t + α · v                                  # MONAI / codebase form
+    = x_t + (1 - t_dn) · v                          # design-note form (.claude/notes/changes/decoder_perceptual_loss_s3.md)
+```
+
+LPL high-SNR gate (Berrada 2025): `t_dn > t_min` (e.g. `t_min = 0.4`
+from `decoder_lpl_profile/LATEST/decision.json`). Equivalent to
+`α < 1 - t_min`. **Never compare raw `timesteps` to `t_min`** — the
+gate would pass on every `timesteps ≥ 1`.
+
+The canonical implementation lives in `FMLightningModule.training_step`
+S3 branch — copy it verbatim when a new module needs `x̂_1`. The
+`decoder_lpl_profile` preflight (`phase2_separation.py`) uses
+design-note `t_b ∈ [0, 1]` directly (it samples `t_b` from a sweep
+list, not via the trunk's integer codes), so its `(1 - t_b)·v` form
+is the SAME formula `α · v` — internally consistent.
+
+Pitfall in adapters: if you pass a float `t ∈ [0, 1]` to the MAISI
+trunk's `forward(x_t, timesteps, ...)`, the sinusoidal embedding will
+treat `0.4` as 400× smaller frequency than the trunk was trained on.
+Always scale to integer code form (`(t * T).long()`) before the trunk
+call.
+
 ## Conventions in one line each
 
 - **Library code in `src/vena/`, routines in `routines/<bucket>/<name>/` are thin engines** — see `.claude/rules/preflight-pattern.md`.

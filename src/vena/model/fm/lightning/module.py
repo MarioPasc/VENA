@@ -235,10 +235,13 @@ class FMLightningModule(pl.LightningModule):
             from vena.model.fm.lpl import FeatureStatsEMA, LplLoss
 
             # Per-block channels — discovered statically from the design
-            # doc's §3.5 geometry table (block→channels): {0,1,2}=256,
-            # {3,4,5}=128. The VAE is frozen so the channel counts cannot
-            # drift between init and setup.
-            _CH = {0: 256, 1: 256, 2: 256, 3: 128, 4: 128, 5: 128}
+            # doc's §3.5 geometry table (block→channels):
+            #   blocks 0,1,2 = 256 (latent res)
+            #   block 3 = 256 (level-0→1 Upsample preserves channels)
+            #   blocks 4, 5 = 128 (level-1 ResBlocks, channel halving)
+            # The VAE is frozen so the channel counts cannot drift between
+            # init and setup.
+            _CH = {0: 256, 1: 256, 2: 256, 3: 256, 4: 128, 5: 128}
             stats_channels = {blk: _CH[blk] for blk in self.lpl_config.A}
             self.feature_stats = FeatureStatsEMA(channels=stats_channels)
             self.lpl_loss = LplLoss(self.lpl_config, self.feature_stats)
@@ -600,14 +603,50 @@ class FMLightningModule(pl.LightningModule):
             and m_wt is not None
             and m_brain is not None
         ):
-            from vena.model.fm.lpl import decoder_feature_extractor
+            from vena.model.fm.lpl import compute_lambda_img, decoder_feature_extractor
 
-            # One-step image-aware target: x̂_1 = x_t + (1 - t) * v_orig.
-            t_view = timesteps.view(-1, *([1] * (x_t.ndim - 1)))
-            x1_hat = x_t + (1.0 - t_view) * v_orig
+            # `timesteps` is the integer code in [0, num_train_timesteps) that
+            # MONAI's RFlowScheduler returns (use_discrete_timesteps=True). The
+            # MAISI/MONAI noise schedule is
+            #     x_t = (1 - α) x_clean + α x_noise     with α = timesteps / T
+            #     u   = x_clean - x_noise               (RFlowEngine.target_velocity)
+            #     → x_1 = x_t + α · u  ⇒  x̂_1 = x_t + α · v_orig
+            # The design-note convention (decoder_perceptual_loss_s3.md §0)
+            # uses t_dn = 1 - α (1 = data, 0 = noise) and the high-SNR gate
+            # is t_dn > t_min — so we hand t_dn to LplLoss for its own gate
+            # while building x̂_1 from α here.
+            T = float(self.rflow.num_train_timesteps)
+            alpha = timesteps.float() / T  # noise fraction ∈ [0, 1]
+            t_dn = 1.0 - alpha  # data fraction; design-note "t"
+            alpha_view = alpha.view(-1, *([1] * (x_t.ndim - 1)))
+            x1_hat = x_t + alpha_view * v_orig
             blocks = frozenset(int(b) for b in self.lpl_config.A)
             max_block = int(max(self.lpl_config.A))
             grad_ckpt = bool(self.lpl_config.grad_checkpoint_segments >= 2)
+            # Schedule-driven lambda_img — falls back to the static field when
+            # no schedule is set (legacy / unit-test path).
+            if self.lpl_config.schedule is not None:
+                lam_active = compute_lambda_img(self.lpl_config.schedule, int(self.current_epoch))
+            else:
+                lam_active = float(self.lpl_config.lambda_img)
+            # Pre-populate every LPL diagnostic key with a NaN placeholder so
+            # the train_step.csv header includes the LPL columns even when the
+            # very first batch OOMs (otherwise the header is auto-frozen from
+            # the surviving keys and the CSV becomes blind to LPL outcomes).
+            # ``lambda_img_active`` is logged unconditionally (not NaN) — it is
+            # a property of the schedule, independent of whether the step ran.
+            # ``lpl_skipped`` is the 0/1 visibility column so the CSV reader
+            # can count silent skips at a glance.
+            nan_dev = total.device
+            nan_t = torch.full((), float("nan"), device=nan_dev)
+            per_term["lpl"] = nan_t.clone()
+            per_term["lambda_img_active"] = torch.as_tensor(lam_active, device=nan_dev)
+            per_term["hi_frac"] = nan_t.clone()
+            per_term["lpl_skipped"] = torch.zeros((), device=nan_dev)
+            for blk in self.lpl_config.A:
+                per_term[f"lpl_b{int(blk)}"] = nan_t.clone()
+            for region in self.lpl_config.region_set:
+                per_term[f"lpl_{region}"] = nan_t.clone()
             try:
                 with decoder_feature_extractor(
                     self._lpl_vae_handle,
@@ -619,17 +658,27 @@ class FMLightningModule(pl.LightningModule):
                     with torch.no_grad():
                         phi_tgt = extract(x1.detach())
                 self.feature_stats.update(phi_pred)
-                lpl_scalar, lpl_break = self.lpl_loss(phi_pred, phi_tgt, m_wt, m_brain, timesteps)
-                total = total + float(self.lpl_config.lambda_img) * lpl_scalar
+                # LplLoss applies the `t_dn > t_min` high-SNR gate internally;
+                # pass the normalised data-fraction (design-note "t"), not the
+                # raw integer timesteps that MONAI returns.
+                lpl_scalar, lpl_break = self.lpl_loss(phi_pred, phi_tgt, m_wt, m_brain, t_dn)
+                total = total + lam_active * lpl_scalar
                 per_term["lpl"] = lpl_scalar.detach()
-                # Expose the breakdown to the train-CSV via per_term so the
-                # existing column-discovery picks them up at first step.
+                # Overwrite the per-term breakdown with real values now that we
+                # made it past the partial decode.
                 for k, v in lpl_break.items():
                     per_term[k] = (
-                        torch.as_tensor(v, device=total.device) if not torch.is_tensor(v) else v
+                        torch.as_tensor(v, device=nan_dev) if not torch.is_tensor(v) else v
                     )
-            except RuntimeError as exc:  # OOM or shape mismatch — log and skip
+            except RuntimeError as exc:
+                # OOM, shape mismatch, or other CUDA-side error. Log and keep
+                # the NaN placeholders so the per-step CSV records the skip.
                 logger.warning("S3 LPL step skipped: %s", exc)
+                per_term["lpl_skipped"] = torch.ones((), device=nan_dev)
+                # Release the cached blocks of memory that the OOM left
+                # half-allocated; otherwise consecutive batches keep failing
+                # at the same allocation boundary.
+                torch.cuda.empty_cache()
         # Per-cohort CFM breakdown (P1.2). The multi-cohort dataset attaches a
         # ``cohort`` string per sample; the DataLoader collates strings into a
         # list. When all samples are from one cohort the .mean() across that

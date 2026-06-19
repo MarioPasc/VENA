@@ -39,11 +39,15 @@ from .region import (
     resample_region_to_block,
     soft_wt_from_tumor_latent,
 )
+from .schedule import LambdaImgSchedule, LambdaImgScheduleKind, compute_lambda_img
 
 __all__ = [
     "FeatureStatsEMA",
+    "LambdaImgSchedule",
+    "LambdaImgScheduleKind",
     "LplConfig",
     "LplLoss",
+    "compute_lambda_img",
     "decoder_feature_extractor",
     "region_weight_map",
     "resample_region_to_block",

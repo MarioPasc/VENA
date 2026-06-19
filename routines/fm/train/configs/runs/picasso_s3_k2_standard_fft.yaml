@@ -1,0 +1,170 @@
+# Picasso — S3 LPL warm-started from S1, K=2 (preflight A=[2,3]), Standard LPL.
+#
+# Ablation row 1 of the 2026-06-19 four-job S3 study:
+#   {K=2, K=5} × {Standard α=(1,1), Region α=(2,3)}
+#
+# K=2 here = honor the 2026-06-18T20:18Z preflight's `A_recommended=[2, 3]`
+# (block 2 = latent res, block 3 = level-0→1 upsample boundary). The K=5 sibling
+# overrides to `A=[2, 5]` (design-note §5.3 canonical). All four jobs share
+# every other knob (resume_from, FFT trunk, linear λ schedule 0→1 over 30 ep,
+# exhaustive_val cadence 25/10/blocking).
+#
+# Standard LPL = α uniform across regions (no region weighting). The Region-aware
+# sibling inherits α=(2, 3) from the preflight's region_recipe.
+
+run:
+  stage: s3
+  tag: lpl_k2_standard_fft_s1warm
+  # Absolute path → ema_best.ckpt (user task brief). The by-run_id resolver
+  # would default to last.ckpt; explicit ema_best is the converged shadow.
+  resume_from: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/2026-06-12_01-27-55_s1_fft_cfm_c9b97556/checkpoints/ema_best.ckpt
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
+
+data:
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  batch_size: 2          # see training.batch_size note (2026-06-19 OOM fix)
+  num_workers: 8
+  pin_memory: true
+  tau: 0.5
+  # Re-run on the post-audit corpus (2026-06-19T14-59-38Z); SHA matches
+  # corpus_picasso.json (b98be6f3...). Drops 293 UCSF-PDGM + 447 UPENN-GBM
+  # patients that duplicate BraTS-GLI under brats21_id bridges.
+  dedup_decisions_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
+  use_offline_augmented_data: true
+  variant_weights:
+    v0: 0.2
+    v1: 0.2
+    v2: 0.2
+    v3: 0.2
+    v4: 0.2
+  decoder_lpl_decision_path: /mnt/home/users/tic_163_uma/mpascual/execs/vena/artifacts/preflights/decoder_lpl_profile/LATEST/decision.json
+
+model:
+  trunk:
+    checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides: {}
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+    trainable: true
+    regime: fft
+  controlnet:
+    conditioning_inputs:
+      - latent:t1pre
+      - latent:t2
+      - latent:flair
+      - mask:wt:identity
+    arch_overrides: {}
+    perturb_keys: []
+  vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+
+loss:
+  cfm:
+    weight: 1.0
+    reduction: mean
+    norm: l2
+  lpl:
+    # Linear warm-up 0 → 1.0 over the first 30 epochs (3% of total 1000).
+    # Aggressive (no halo λ_img < 1) but lands softly on the warm-start.
+    schedule:
+      kind: linear
+      warmup_epochs: 30
+      lambda_min: 0.0
+      lambda_max: 1.0
+    # Standard LPL — uniform region weights.
+    alpha_override:
+      wt: 1.0
+      notwt: 1.0
+    # K=2 honors preflight (A=[2,3], w_l from decision.json, no override).
+    soft_region: false
+    # 2026-06-19: with FFT trunk at bs=2 the partial decode at K=2 still
+    # peaks the A100 at ~38 GB; checkpointing the partial decoder drops the
+    # decoder activation graph to ~2 GB and frees the headroom needed for
+    # the gradient backward.
+    grad_checkpoint_segments: 2
+
+rflow:
+  num_train_timesteps: 1000
+  use_discrete_timesteps: true
+  sample_method: logit-normal
+
+optim:
+  # §4.5: warm-start refinement should land softly — drop S1's 1e-4 to 5e-5.
+  lr: 5.0e-5
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  warmup_steps: 500
+  scheduler: cosine
+
+ema:
+  # §4.5: short S3 stage needs ~10³-step time constant — 0.9999 (~10⁴ steps)
+  # would not converge in 200 epochs.
+  decay: 0.999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  # 2026-06-19: dropped bs from 4 to 2 — the FFT trunk at bs=4 used ~35 GB
+  # of the A100 40 GB budget on its own, leaving < 5 GB for the LPL partial
+  # decode + backward (every LPL step OOM'd on the first 4-job submission;
+  # 775 silent skips in 40 min). bs=2 + grad_accum=4 keeps the effective
+  # batch at 8.
+  total_steps: 41600          # 200 ep × ≈ 208 step/ep
+  max_epochs: 200
+  batch_size: 2
+  grad_accum: 4
+  checkpoint_every_epochs: 25
+  log_train_every_steps: 100
+  best_metric_name: mse_latent
+  best_metric_region: bg
+  best_metric_nfe: 5
+  gradient_clip_val: 1.0
+  patience: 30
+
+validation:
+  every_epochs: 0
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 999999
+  sweep_nfes: [1, 2, 5, 10, 20]
+  qualitative_every_epochs: 999999
+  image_metrics: false
+
+exhaustive_val:
+  enabled: true
+  every_epochs: 25
+  n_patients: 10                  # task brief
+  nfe_levels: [1, 5, 20]
+  integrator: euler
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  device: cuda:1
+  python_executable: /mnt/home/users/tic_163_uma/mpascual/fscratch/conda_envs/vena/bin/python
+  block_until_complete: true      # task brief
+  figure_top_k: 5
+  export_per_block_figures: true  # K=2 only
+
+output:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments
+  retention_n_checkpoints: 3
+  tensorboard: false
+  wandb: false
+
+regions:
+  brain:
+    source: latents_h5
+  wt:
+    source: derived_from_tumor_latent
+    threshold: 0.5
+  wt_dilated:
+    source: derived_via_scipy_binary_dilation
+    structure: ones_3x3x3
+  bg:
+    source: derived
+  vessel:
+    source: skipped

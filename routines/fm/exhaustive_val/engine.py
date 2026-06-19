@@ -122,6 +122,19 @@ class ExhaustiveValJobConfig(BaseModel):
     # Capped at half the patient count so a tiny cohort cannot have its top-K
     # and bottom-K overlap.
     figure_top_k: int = 3
+    # S3 — per-block real-vs-synth decoder-feature figure for the top-K best
+    # and worst patients. Off by default. Activated by K=2 picasso YAMLs;
+    # K=5 keeps it off to avoid OOM on the val GPU.
+    export_per_block_figures: bool = False
+    # Block indices to read features from (subset of the trainer's LPL `A`).
+    # Required (and only consumed) when ``export_per_block_figures`` is True.
+    # The launcher populates this from the training config so the val job
+    # matches the trainer's readout depth.
+    lpl_A: list[int] = Field(default_factory=list)
+    # Path to the frozen MAISI VAE checkpoint. Required when
+    # ``export_per_block_figures`` is True (the decoder is loaded on
+    # ``device`` to extract per-block features).
+    vae_checkpoint: Path | None = None
 
     @classmethod
     def from_yaml(cls, path: Path | str) -> ExhaustiveValJobConfig:
@@ -135,6 +148,11 @@ class ExhaustiveValEngine:
     def __init__(self, cfg: ExhaustiveValJobConfig) -> None:
         self.cfg = cfg
         self.device = self._resolve_device(cfg.device)
+        # Per-patient ground-truth T1c latent — populated by
+        # ``_process_patient`` so ``_render_per_block_features`` can extract
+        # decoder features on both the real and the predicted latent. Empty
+        # when ``export_per_block_figures`` is False.
+        self._real_latents_by_pid: dict[str, torch.Tensor] = {}
 
     @staticmethod
     def _resolve_device(device: str) -> torch.device:
@@ -362,6 +380,18 @@ class ExhaustiveValEngine:
         self._render_best_worst(
             module, vae, ssim_by_pid, latents_by_pid_nfe, gen_decode_time, pid_to_image_h5, out_dir
         )
+        if cfg.export_per_block_figures and cfg.lpl_A:
+            try:
+                self._render_per_block_features(
+                    vae=vae,
+                    ssim_by_pid=ssim_by_pid,
+                    latents_by_pid_nfe=latents_by_pid_nfe,
+                    out_dir=out_dir,
+                )
+            except (RuntimeError, ValueError) as exc:
+                logger.warning("per-block feature render skipped: %s", exc)
+            finally:
+                self._real_latents_by_pid.clear()
         logger.info("exhaustive-val epoch=%d complete -> %s", cfg.epoch, out_dir)
         return out_dir
 
@@ -571,6 +601,12 @@ class ExhaustiveValEngine:
         m_brain_img = self._brain_mask_in_image_space(batch, real_box.shape)
         brain_mask_source = "masks/brain_latent" if m_brain_img is not None else "real_box>0"
 
+        # Stash the real T1c latent for the per-block feature render. Cheap
+        # (one (B=1,C,h,w,d) CPU tensor per scored patient); only retained
+        # when ``export_per_block_figures`` is set.
+        if cfg.export_per_block_figures:
+            self._real_latents_by_pid[pid] = z_target.detach().to("cpu")
+
         for nfe in cfg.nfe_levels:
             z_pred, gen_t = self._sample(module, sampler, z_target, int(nfe))
             latents_by_pid_nfe[(pid, int(nfe))] = z_pred.detach().to("cpu")
@@ -711,6 +747,153 @@ class ExhaustiveValEngine:
                 out_path=out_dir / f"figure_{tag}.png",
             )
             logger.info("wrote figure_%s.png (%s, mean SSIM=%.4f)", tag, pid, mean_ssim[pid])
+
+    # ------------------------------------------------------------------
+
+    def _render_per_block_features(
+        self,
+        *,
+        vae: MaisiDecoder,
+        ssim_by_pid: dict[str, list[float]],
+        latents_by_pid_nfe: dict[tuple[str, int], torch.Tensor],
+        out_dir: Path,
+    ) -> None:
+        """Render per-block real-vs-synth decoder-feature maps (S3 diagnostic).
+
+        For each of the top-K best and bottom-K worst patients (by mean SSIM),
+        for every block index in ``cfg.lpl_A``, extract decoder features from
+        both the predicted latent (highest available NFE) and the real T1c
+        latent via :func:`vena.model.fm.lpl.decoder_feature_extractor` (the
+        same context manager ``training_step`` uses). Renders a 1×3
+        matplotlib panel ``(real channel-mean, synth channel-mean, |diff|)``
+        on the central axial slice. Also emits ``feature_maps.csv`` with the
+        per-patient per-block feature-MSE (channel-mean) so the plot can be
+        compared quantitatively across epochs.
+
+        K=2 only on production runs — for K=5 the activation cost on the val
+        GPU is prohibitive (cfg sets ``export_per_block_figures=false`` in
+        that case).
+        """
+        import csv as _csv
+
+        import matplotlib.pyplot as plt
+
+        from vena.model.fm.lpl import decoder_feature_extractor
+
+        if not self._real_latents_by_pid:
+            logger.info("per-block feature render: no real latents cached; skipping.")
+            return
+
+        mean_ssim = {pid: (sum(v) / len(v)) for pid, v in ssim_by_pid.items() if v}
+        if not mean_ssim:
+            return
+        k = max(1, min(int(self.cfg.figure_top_k), len(mean_ssim) // 2))
+        sorted_desc = sorted(mean_ssim.items(), key=lambda kv: kv[1], reverse=True)
+        best_picks = sorted_desc[:k]
+        worst_picks = list(reversed(sorted_desc[-k:]))
+        targets: list[tuple[str, str]] = [
+            (f"best_{rank + 1}", pid) for rank, (pid, _) in enumerate(best_picks)
+        ] + [(f"worst_{rank + 1}", pid) for rank, (pid, _) in enumerate(worst_picks)]
+
+        blocks_sorted = sorted(int(b) for b in self.cfg.lpl_A)
+        max_block = int(blocks_sorted[-1])
+        blocks_fset = frozenset(blocks_sorted)
+        # Highest NFE = best-quality prediction → diagnostic content is
+        # maximised at top NFE rather than the noisy 1-step prediction.
+        nfe_for_render = int(max(self.cfg.nfe_levels))
+        fig_dir = out_dir / "figures"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+
+        csv_path = out_dir / "feature_maps.csv"
+        rows: list[dict[str, Any]] = []
+
+        for tag, pid in targets:
+            real_lat = self._real_latents_by_pid.get(pid)
+            pred_lat = latents_by_pid_nfe.get((pid, nfe_for_render))
+            if real_lat is None or pred_lat is None:
+                logger.warning(
+                    "per-block render: missing latents for pid=%s (real=%s pred=%s)",
+                    pid,
+                    real_lat is None,
+                    pred_lat is None,
+                )
+                continue
+            real_lat = real_lat.to(self.device)
+            pred_lat = pred_lat.to(self.device)
+
+            # Use the canonical context manager (same one ``training_step``
+            # uses) so ``post_quant_conv`` + the partial-decode hooks stay
+            # in lock-step with the training path. The wrapper consumes
+            # ``vae.handle`` (the AutoencoderHandle), not the bare
+            # MaisiDecoder — ``post_quant_conv`` lives on the parent
+            # autoencoder, not on the decoder submodule.
+            with torch.no_grad():
+                with decoder_feature_extractor(
+                    vae.handle,
+                    blocks=blocks_fset,
+                    max_block=max_block,
+                    grad_checkpoint=False,
+                ) as extract:
+                    phi_real = extract(real_lat)
+                    phi_pred = extract(pred_lat)
+
+            for blk in blocks_sorted:
+                fr = phi_real[blk][0]  # (C, h, w, d)
+                fp = phi_pred[blk][0]
+                # Channel-mean projection (one scalar per voxel) — matches the
+                # design-note §2.6 channel-mean panel.
+                mean_real = fr.mean(dim=0)
+                mean_pred = fp.mean(dim=0)
+                diff = (mean_pred - mean_real).abs()
+                # Quantitative: per-block feature MSE (channel-mean).
+                mse = float((mean_pred - mean_real).pow(2).mean().item())
+                rows.append(
+                    {
+                        "patient_id": pid,
+                        "tag": tag,
+                        "block": int(blk),
+                        "nfe": nfe_for_render,
+                        "feat_mse_channel_mean": mse,
+                        "mean_ssim": mean_ssim.get(pid, float("nan")),
+                    }
+                )
+
+                # Mid-axial slice (depth axis).
+                d_idx = mean_real.shape[-1] // 2
+                a = mean_real[..., d_idx].detach().cpu().numpy()
+                b = mean_pred[..., d_idx].detach().cpu().numpy()
+                c = diff[..., d_idx].detach().cpu().numpy()
+                fig, axes = plt.subplots(1, 3, figsize=(10, 4))
+                vmin = float(min(a.min(), b.min()))
+                vmax = float(max(a.max(), b.max()))
+                axes[0].imshow(a, cmap="gray", vmin=vmin, vmax=vmax)
+                axes[0].set_title(f"real block {blk}")
+                axes[0].axis("off")
+                axes[1].imshow(b, cmap="gray", vmin=vmin, vmax=vmax)
+                axes[1].set_title(f"synth block {blk} (NFE={nfe_for_render})")
+                axes[1].axis("off")
+                axes[2].imshow(c, cmap="magma")
+                axes[2].set_title(f"|diff|  MSE={mse:.4f}")
+                axes[2].axis("off")
+                fig.suptitle(f"{tag}  {pid}", fontsize=10)
+                fig.tight_layout()
+                fig.savefig(fig_dir / f"block{blk}_{tag}.png", dpi=120)
+                plt.close(fig)
+            logger.info(
+                "per-block render: pid=%s tag=%s blocks=%s (NFE=%d)",
+                pid,
+                tag,
+                blocks_sorted,
+                nfe_for_render,
+            )
+
+        if rows:
+            with csv_path.open("w", newline="") as f:
+                w = _csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                w.writeheader()
+                for row in rows:
+                    w.writerow(row)
+            logger.info("wrote feature_maps.csv (%d rows)", len(rows))
 
     # ------------------------------------------------------------------
 

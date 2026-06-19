@@ -50,6 +50,20 @@ _EPOCH_AGG_KEYS: tuple[str, ...] = (
     "grad_norm_trunk_postclip",
     "t_mean",
     "gpu_mem_peak_mb",
+    # S3 LPL diagnostics. Over-include the per-block keys so the CSV schema
+    # is stable across K=2 ({2, 3}) and K=5 ({2, 5}) runs — unused columns
+    # stay empty rather than the schema shifting per-config. Per-region
+    # split (lpl_wt, lpl_notwt) lets the user audit the α weighting at a
+    # glance from train_epoch.csv.
+    "lpl",
+    "lambda_img_active",
+    "hi_frac",
+    "lpl_skipped",
+    "lpl_b2",
+    "lpl_b3",
+    "lpl_b5",
+    "lpl_wt",
+    "lpl_notwt",
 )
 
 # Per-cohort log key prefixes discovered at runtime — accumulated into the
@@ -186,12 +200,16 @@ class TrainMetricsCSV(pl.Callback):
         )
         logger.info(
             "epoch %d done | step=%d total=%.4f cfm=%.4f contrastive=%.4f "
+            "lpl=%.4f lam=%.3f hi_frac=%.2f "
             "gpu_peak_mb=%.0f samples_per_sec=%.2f elapsed=%.1fs",
             epoch,
             int(trainer.global_step),
             _m("total"),
             _m("cfm"),
             _m("contrastive"),
+            _m("lpl"),
+            _m("lambda_img_active"),
+            _m("hi_frac"),
             _m("gpu_mem_peak_mb"),
             _m("samples_per_sec"),
             elapsed,

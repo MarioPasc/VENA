@@ -7,10 +7,12 @@ Public surface:
 * :func:`build_loss` — factory that maps a stage name + config to a
   :class:`CompositeLoss`.
 
-S1 implements :class:`CFMLoss` only. S2 and S3 ship as stubs that raise
-``NotImplementedError`` when the builder is asked for them; this keeps the
-curriculum's wiring visible in the code while constraining the present change
-to the proposal's acceptance criterion (S1 smoke).
+S1 implements :class:`CFMLoss` only. S2 / skipS1 add the region-weighted
+:class:`ContrastiveTumourLoss`. S3 returns a CFM-only composite and the
+decoder-feature :class:`vena.model.fm.lpl.LplLoss` is added by
+:class:`FMLightningModule.training_step` as
+``lambda_img(epoch) * lpl_scalar`` — never through :class:`CompositeLoss`.
+The legacy ``CappedLpReconLoss`` stub is no longer wired by any stage.
 """
 
 from .base import AbstractFMLoss, CompositeLoss, LossInputs
