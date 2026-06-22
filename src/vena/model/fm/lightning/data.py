@@ -12,11 +12,18 @@ Each item is a dict::
         "z_t2": Tensor(4, 60, 60, 40),
         "z_flair": Tensor(4, 60, 60, 40),
         "z_t1c": Tensor(4, 60, 60, 40),  # target
-        "m_wt": Tensor(1, 60, 60, 40),  # binary WT mask
+        "m_wt": Tensor(1, 60, 60, 40),  # binary WT mask (legacy, kept for back-compat)
+        "m_tumor": Tensor(3, 60, 60, 40),  # soft per-class masks (NETC, ED, ET)
+        "m_netc": Tensor(1, 60, 60, 40),  # m_tumor[0:1] view
+        "m_ed": Tensor(1, 60, 60, 40),  # m_tumor[1:2] view
+        "m_et": Tensor(1, 60, 60, 40),  # m_tumor[2:3] view
     }
 
 The WT mask is derived from ``masks/tumor_latent[i]`` (3 soft NETC/ED/ET maps)
-by ``m_wt = (clip(c0+c1+c2, 0, 1) >= 0.5).float()`` per proposal §2.2.
+by ``m_wt = (clip(c0+c1+c2, 0, 1) >= 0.5).float()`` per proposal §2.2. The
+sum-then-threshold semantics are preserved for back-compat with the v0.4
+contrastive loss; ``m_tumor`` and the per-class slices are new (2026-06-22,
+S1 v3) and consumed by the region-weighted L1 loss and per-region metrics.
 
 Additional modalities (ADC, SWI) or priors (vessel, perfusion) are loaded on
 demand: pass their names through ``extra_latents`` / ``extra_priors`` and the
@@ -198,6 +205,18 @@ class LatentH5Dataset(Dataset):
         soft_union = np.clip(tumor_lat.sum(axis=0, keepdims=True), 0.0, 1.0)
         m_wt = (soft_union >= self.wt_threshold).astype(np.float32)
         out["m_wt"] = torch.from_numpy(np.ascontiguousarray(m_wt))
+
+        # S1 v3 (2026-06-22): emit the full 3-channel soft mask + per-class
+        # slices so the region-weighted L1 loss and per-region metrics can
+        # consume them. ``m_wt`` above is the back-compat union for the
+        # contrastive v0.4 path. ``m_tumor`` carries the raw soft NETC/ED/ET
+        # channels at the same latent resolution; per-class slices are
+        # contiguous views into the same tensor (cheap, no copy).
+        m_tumor_t = torch.from_numpy(np.ascontiguousarray(tumor_lat)).float()
+        out["m_tumor"] = m_tumor_t
+        out["m_netc"] = m_tumor_t[0:1]
+        out["m_ed"] = m_tumor_t[1:2]
+        out["m_et"] = m_tumor_t[2:3]
 
         # Brain mask in latent space — produced by `vena-encode-brain-to-latent`
         # (`masks/brain_latent`, shape (1, h, w, d), int8). Required by the v0.4
@@ -392,6 +411,15 @@ class OfflineAugmentedLatentH5Dataset(Dataset):
         soft_union = np.clip(tumor_lat.sum(axis=0, keepdims=True), 0.0, 1.0)
         m_wt = (soft_union >= self._wt_threshold).astype(np.float32)
         out["m_wt"] = torch.from_numpy(np.ascontiguousarray(m_wt))
+        # S1 v3 (2026-06-22): parity with LatentH5Dataset._read_one — emit
+        # the 3-channel soft mask + per-class slices. Required on EVERY sample
+        # so default_collate stacks without KeyError when a mixed v0/v1+ batch
+        # arrives (one cohort emitting m_tumor, another not, would collapse).
+        m_tumor_t = torch.from_numpy(np.ascontiguousarray(tumor_lat)).float()
+        out["m_tumor"] = m_tumor_t
+        out["m_netc"] = m_tumor_t[0:1]
+        out["m_ed"] = m_tumor_t[1:2]
+        out["m_et"] = m_tumor_t[2:3]
         # Parity with LatentH5Dataset.__getitem__: load `masks/brain_latent` when
         # the aug H5 carries it. Without this, a mixed batch (v0 emits m_brain,
         # v1+ does not) collapses in default_collate with KeyError 'm_brain'.

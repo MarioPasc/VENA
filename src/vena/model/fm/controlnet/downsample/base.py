@@ -22,3 +22,15 @@ class AbstractDownsampler(nn.Module, ABC):
     @abstractmethod
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the spatial downsampling."""
+
+    @property
+    def out_channels(self) -> int | None:
+        """Output channel count, or ``None`` when unchanged from the input.
+
+        The ``ConditioningAssembler`` consults this when computing
+        ``channels_per_spec``: a ``None`` return preserves the kind-based
+        default (``latent_channels``, ``mask_channels``, ``prior_channels``);
+        a concrete int overrides it (used by learned channel-lifting
+        downsamplers such as :class:`LiftTo4ChDownsampler`).
+        """
+        return None

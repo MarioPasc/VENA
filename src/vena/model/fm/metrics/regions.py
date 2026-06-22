@@ -68,19 +68,36 @@ class RegionSpec(BaseModel):
 
 REQUIRED_REGIONS: tuple[str, ...] = ("brain", "wt", "wt_dilated", "bg", "vessel")
 
+# S1 v3 (2026-06-22): additional regions derived automatically from m_tumor and
+# m_brain when both are present in the batch. They do NOT need a YAML entry —
+# the resolver builds them on the fly. Consumers (exhaustive_val per-region
+# metrics, region-weighted loss diagnostics) read them via ``RegionMasks.get``.
+OPTIONAL_DERIVED_REGIONS: tuple[str, ...] = ("netc", "ed", "et", "brain_not_wt")
+
 
 @dataclass
 class RegionMasks:
-    """Per-batch boolean masks at latent resolution. ``None`` if skipped."""
+    """Per-batch boolean masks at latent resolution. ``None`` if skipped.
+
+    The first five fields are the legacy regions declared in the YAML
+    ``regions:`` block (REQUIRED_REGIONS). The remaining four are S1 v3
+    additions derived automatically from ``batch["m_tumor"]`` + ``batch["m_brain"]``
+    when both are present; they require no YAML configuration.
+    """
 
     brain: torch.Tensor | None
     wt: torch.Tensor | None
     wt_dilated: torch.Tensor | None
     bg: torch.Tensor | None
     vessel: torch.Tensor | None
+    # S1 v3 derived regions (None when m_tumor or m_brain is absent).
+    netc: torch.Tensor | None = None
+    ed: torch.Tensor | None = None
+    et: torch.Tensor | None = None
+    brain_not_wt: torch.Tensor | None = None
 
     def get(self, name: str) -> torch.Tensor | None:
-        return getattr(self, name)
+        return getattr(self, name, None)
 
 
 def _structure_kernel_size(name: str) -> int:
@@ -131,13 +148,68 @@ class RegionResolver:
         * ``m_wt``         — binary WT mask, shape ``(B, 1, h, w, d)``.
         * optionally ``m_brain``, ``m_vessel``, ``m_wt_dilated`` if the
           corresponding source is ``latents_h5``.
+        * optionally ``m_tumor`` (3-channel soft) — when present alongside
+          ``m_brain``, the resolver auto-populates the S1 v3 derived regions
+          ``netc``, ``ed``, ``et``, ``brain_not_wt``. Absent ⇒ those fields
+          stay ``None`` and metric callers report NaN.
         """
         wt = self._resolve_wt(batch)
         wt_dilated = self._resolve_wt_dilated(batch, wt)
         brain = self._resolve_brain(batch, reference=wt)
         bg = self._resolve_bg(batch, brain=brain, wt_dilated=wt_dilated)
         vessel = self._resolve_vessel(batch)
-        return RegionMasks(brain=brain, wt=wt, wt_dilated=wt_dilated, bg=bg, vessel=vessel)
+        netc, ed, et, bnwt = self._resolve_v3_derived(batch, brain=brain)
+        return RegionMasks(
+            brain=brain,
+            wt=wt,
+            wt_dilated=wt_dilated,
+            bg=bg,
+            vessel=vessel,
+            netc=netc,
+            ed=ed,
+            et=et,
+            brain_not_wt=bnwt,
+        )
+
+    def _resolve_v3_derived(
+        self, batch: dict[str, Any], brain: torch.Tensor | None
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Derive netc/ed/et/brain_not_wt from ``batch["m_tumor"]`` + brain.
+
+        Returns ``(netc, ed, et, bnwt)``. Any field is ``None`` when its
+        prerequisite is missing — the metric layer skips those regions and
+        reports NaN to keep the CSV columns aligned across batches with /
+        without the masks.
+
+        Threshold τ = 0.5 — same as ``derived_from_tumor_latent`` for ``wt``.
+        Region partition (disjoint):
+          * netc = (m_tumor[:,0] ≥ τ) & brain
+          * ed   = (m_tumor[:,1] ≥ τ) & brain
+          * et   = (m_tumor[:,2] ≥ τ) & brain
+          * bnwt = brain & ~(any(m_tumor ≥ τ))
+        """
+        m_tumor = batch.get("m_tumor")
+        if m_tumor is None:
+            return None, None, None, None
+        τ = float(self.specs["wt"].threshold)
+        m_t_hard = m_tumor >= τ
+        netc = m_t_hard[:, 0:1]
+        ed = m_t_hard[:, 1:2]
+        et = m_t_hard[:, 2:3]
+        if brain is not None:
+            netc = netc & brain
+            ed = ed & brain
+            et = et & brain
+            wt_hard = m_t_hard.any(dim=1, keepdim=True)
+            bnwt = brain & ~wt_hard
+        else:
+            bnwt = None
+        return netc, ed, et, bnwt
 
     # ------------------------------------------------------------------
 

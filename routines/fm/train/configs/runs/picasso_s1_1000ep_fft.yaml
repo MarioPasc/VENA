@@ -1,14 +1,38 @@
-# Picasso — 1000-epoch S1 baseline (FFT trunk + ControlNet, CFM-only loss).
+# Picasso — 1000-epoch S1 v2 baseline (FFT trunk + ControlNet, CFM-only loss).
 #
-# 2026-06-09 overhaul:
+# 2026-06-20 overhaul (this version):
+#   * loss.cfm.norm -> l1 (was l2). L1 is median-seeking and preserves the
+#     sharp enhancing-rim boundaries that L2's mean-seeking objective smears
+#     into a halo. T1C-RFlow uses L1; the new VENA baseline matches that
+#     choice. See ``.claude/notes/changes/decoder_perceptual_loss_s3_analysis_2026-06-20.md``
+#     §4 / E1.
+#   * model.controlnet.conditioning_inputs: mask:wt:identity -> mask:wt:zero_out.
+#     S1 does not condition on the WT mask (no region-contrastive loss). The
+#     ``zero_out`` downsampler preserves the 13-channel input layout so
+#     warm-start S1 -> S2/S3 (which switch back to ``identity`` or
+#     ``lift_to_4ch``) needs no channel-dim surgery in the ControlNet's
+#     conditioning-embedding first conv.
+#   * model.controlnet.output_scale_ramp (new): sigmoid ramp on the
+#     ControlNet output projections from ~0 to ~1 over 5 000 steps. Removes
+#     the cold-start dead time the literal-zero-init ControlNet otherwise
+#     pays (Berrada/T1C-RFlow comparison; same analysis §4a).
+#   * rflow.use_timestep_transform: true. SD3-style timestep weighting
+#     (Esser et al. 2024) biases sampled timesteps toward intermediate α
+#     where structure forms. Complementary to the LPL t_min=0.4 gate, not
+#     antagonistic (analysis §4b).
+#   * training.patience -> 250 (was 100). The retired S1 plateaued at epoch
+#     ~475 then continued for 1000 more epochs adding +0.1 dB PSNR; the new
+#     baseline must run truly to convergence so S2/S3 warm-start from a
+#     fully-converged checkpoint, hence the much longer patience window.
+#
+# 2026-06-09 overhaul (kept from prior version):
 #   * LR scheduler -> cosine (was "polynomial" with total_steps=1e9 → no-op).
 #   * Peak lr 1e-4 (was 5e-5; matches MAISI-V2 §4.1 + TumorFlow).
 #   * total_steps pinned to the measured value: 208 steps/epoch × 1000 ep ≈ 208 000.
 #     (Empirical: prior run logged 117 728 steps over 566 epochs = 208 steps/epoch.)
 #
 # Hardware: 2× A100 40 GB (cuda:0 training, cuda:1 async exhaustive val).
-# Walltime: 7 days. EarlyStopping patience=100 epochs on train/total_epoch
-# releases the allocation if the run plateaus before exhausting the budget.
+# Walltime: 7 days. EarlyStopping patience=250 epochs on train/total_epoch.
 # Effective batch 8 (physical 4, grad_accum 2) matches the Diffusers SDXL
 # ControlNet sweet spot.
 #
@@ -40,8 +64,18 @@ data:
   num_workers: 8
   pin_memory: true
   tau: 0.5
-  augmentation_config_path: routines/fm/train/configs/augmentations/equivariant_v1.yaml
-  preflight_decision_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/latent_aug_equivariance/LATEST/decision.json
+  # Online augmentation disabled for the 2026-06-20 baseline: the
+  # ``latent_aug_equivariance`` preflight artifact was wiped from Picasso
+  # alongside the retired S1 / S3 experiments and is not currently
+  # reproducible without re-running the preflight pipeline. Offline aug
+  # (variant_weights below, K=4 per-cohort H5s) is still active and
+  # provides 5x data diversity — sufficient for a baseline whose primary
+  # purpose is to anchor S2 / S3 fine-tunes. Re-enable both fields and
+  # point ``preflight_decision_path`` at a fresh
+  # ``latent_aug_equivariance/LATEST/decision.json`` when that preflight
+  # is re-run.
+  augmentation_config_path: null
+  preflight_decision_path: null
   dedup_decisions_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
   use_offline_augmented_data: true
   variant_weights:
@@ -65,24 +99,46 @@ model:
       - latent:t1pre
       - latent:t2
       - latent:flair
-      - mask:wt:identity
+      # S1 keeps the WT-mask channel slot for warm-start compatibility with
+      # S2/S3, but the slot carries zeros — the model receives no tumour
+      # localisation signal during S1, exactly matching the proposal's
+      # "no region-contrastive loss in S1" design.
+      - mask:wt:zero_out
     arch_overrides: {}
     # S1 has no contrastive term; perturb_keys is irrelevant but kept for
     # backward compat. CFG dropout (training.conditioning_dropout_p) drives
     # any conditioning ablation in the s2_cfg variant.
     perturb_keys: []
+    # Scale-ramped zero-init on the ControlNet output projections. Modulates
+    # ``MaisiControlNet.output_scale`` from ~0 to ~1 over 5000 steps via a
+    # sigmoid. See OutputScaleRampCallback.
+    output_scale_ramp:
+      enabled: true
+      ramp_steps: 5000
+      steepness: 10.0
   vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
 
 loss:
   cfm:
     weight: 1.0
     reduction: mean
-    norm: l2
+    norm: l1
 
 rflow:
   num_train_timesteps: 1000
   use_discrete_timesteps: true
   sample_method: logit-normal
+  # SD3 timestep weighting; concentrates training mass at intermediate α
+  # (~0.3-0.7) where structure forms. base_img_size_numel left null so
+  # MONAI's default applies; a future profiling pass can tune it.
+  use_timestep_transform: true
+  # Calibration target for the timestep transform — VENA brain-box latent
+  # (48x56x48). Required at inference: the EulerSampler propagates this to
+  # ``RFlowScheduler.set_timesteps`` so MONAI's :func:`timestep_transform`
+  # does not divide ``None`` (the silent per-patient-fail trap caught on the
+  # 2026-06-20 smoke). Per-patient brain-box variation produces sub-10 %
+  # deltas in the cubic-root ratio used by the transform.
+  base_img_size_numel: 129024
 
 optim:
   lr: 1.0e-4
@@ -110,7 +166,7 @@ training:
   best_metric_region: bg
   best_metric_nfe: 5
   gradient_clip_val: 1.0
-  patience: 100
+  patience: 250
 
 validation:
   every_epochs: 0

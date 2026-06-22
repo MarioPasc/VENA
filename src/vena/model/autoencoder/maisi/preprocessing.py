@@ -62,6 +62,7 @@ def percentile_normalise(
     foreground_only: bool = False,
     foreground_threshold: float = 0.0,
     mask: torch.Tensor | None = None,
+    clip: bool = True,
 ) -> torch.Tensor:
     """Map ``x`` into ``[b_min, b_max]`` using per-volume percentile clipping.
 
@@ -98,11 +99,23 @@ def percentile_normalise(
         z-score-normalised intensities (e.g. BraTS-Africa) where the
         ``x > 0`` heuristic silently excludes the negative half of the
         intra-brain distribution.
+    clip : bool
+        When ``True`` (default — backwards-compatible) the rescaled volume is
+        clamped to ``[0, 1]`` before mapping to ``[b_min, b_max]``. When
+        ``False`` the clamp is skipped and super-percentile values keep their
+        magnitude (>1 after the affine), preserving the bright tail. Used by
+        the v3 normalisation audit (see
+        ``.claude/notes/changes/2026-06-22_s1_v3_normalization_exploration.md``)
+        to test whether the hard clip is what crushes the T1c gadolinium-
+        enhancement signal.
 
     Returns
     -------
     torch.Tensor
-        Same shape and dtype as ``x``, clipped into ``[b_min, b_max]``.
+        Same shape and dtype as ``x``. When ``clip=True`` (default), values
+        lie in ``[b_min, b_max]``; when ``clip=False``, the rescale is
+        applied without clipping (output may exceed ``b_max`` for voxels
+        above the ``upper`` percentile).
 
     Raises
     ------
@@ -170,7 +183,8 @@ def percentile_normalise(
 
     denom = (hi - lo).clamp_min(eps)
     y = (x - lo) / denom
-    y = y.clamp(0.0, 1.0)
+    if clip:
+        y = y.clamp(0.0, 1.0)
     return y * (b_max - b_min) + b_min
 
 

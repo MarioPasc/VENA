@@ -225,11 +225,82 @@ class _DataCfg(BaseModel):
         return data
 
 
+class _OutputScaleRampCfg(BaseModel):
+    """Scale-ramped zero-init on the ControlNet output projections.
+
+    Modulates :attr:`MaisiControlNet.output_scale` from ~0 to ~1 over
+    ``ramp_steps`` optimisation steps via a sigmoid (see
+    :class:`OutputScaleRampCallback`). Disabled by default for byte-identical
+    backward compatibility with the retired S1 recipe.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    ramp_steps: int = 5000
+    steepness: float = 10.0
+
+
+class _InputConcatCfg(BaseModel):
+    """S1 v3 (2026-06-22) trunk channel-concat conditioning.
+
+    When ``enabled``, the listed ``cond_latents`` (e.g. ``[t1pre, t2, flair]``)
+    are channel-concatenated to the noisy T1c latent at the trunk's first
+    convolution. The trunk's ``conv_in`` ``in_channels`` is widened from 4
+    to ``4 + 4 * len(cond_latents) + len(cond_masks)`` via
+    :func:`vena.model.fm.maisi.conv_in_expand.expand_conv_in`, with the
+    additional channels zero-initialised so the trunk's step-0 behaviour is
+    bit-identical to the pretrained MAISI baseline.
+
+    Disabled (default ``enabled=false``) is byte-identical to the S1 v2 path.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    cond_latents: list[str] = Field(default_factory=list)
+    cond_masks: list[str] = Field(default_factory=list)  # reserved for ablations
+    zero_init_new_channels: bool = True
+    # Optional sigmoid ramp on the new channels' weights. ``ramp_steps=0``
+    # disables the ramp (zero-init alone is enough for step-0 correctness).
+    ramp_steps: int = 0
+    ramp_steepness: float = 10.0
+
+
 class _ControlNetCfg(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    conditioning_inputs: list[str]
+    # S1 v3 (2026-06-22): primary on/off switch. ``False`` = Variant A (no
+    # ControlNet at all); module sets ``self.controlnet = None`` and the
+    # trunk is the sole prediction path. ``True`` = legacy / Variant B
+    # (3-channel mask conditioning) — the canonical S1 v2 path defaults here.
+    enabled: bool = True
+    # S1 v3: gate :meth:`MaisiControlNet.init_from_trunk`. Variant B sets
+    # ``False`` because the 3-channel-mask cond_embedding has no useful
+    # warm-start from the trunk's 4-channel-input encoder. Default ``True``
+    # preserves S1 v2 behaviour.
+    init_from_trunk: bool = True
+    # ``conditioning_inputs`` is OPTIONAL in v3 (Variant A leaves it empty).
+    conditioning_inputs: list[str] = Field(default_factory=list)
     arch_overrides: dict[str, Any] = Field(default_factory=dict)
     perturb_keys: list[str] = Field(default_factory=lambda: ["wt"])
+    # Scale-ramped zero-init (2026-06-20 analysis §4a). When ``enabled``, an
+    # :class:`OutputScaleRampCallback` is attached to the trainer and the
+    # ramp value is written into ``MaisiControlNet.output_scale`` every step.
+    # ``None`` is functionally identical to ``enabled=false``.
+    output_scale_ramp: _OutputScaleRampCfg | None = None
+
+    @model_validator(mode="after")
+    def _validate_enabled_requires_inputs(self) -> _ControlNetCfg:
+        if self.enabled and not self.conditioning_inputs:
+            raise ValueError(
+                "controlnet.enabled=true requires a non-empty conditioning_inputs list. "
+                "(For S1 v3 Variant A, set controlnet.enabled=false.)"
+            )
+        if not self.enabled and self.conditioning_inputs:
+            raise ValueError(
+                "controlnet.enabled=false rejects conditioning_inputs — Variant A has no "
+                "ControlNet to consume them. Move modality latents to "
+                "model.trunk.input_concat.cond_latents instead."
+            )
+        return self
 
 
 class _TrunkCfg(BaseModel):
@@ -248,6 +319,9 @@ class _TrunkCfg(BaseModel):
     # backbone. The ``peft`` block then selects variant + params.
     regime: Literal["fft", "peft"] = "fft"
     peft: dict[str, Any] | None = None
+    # S1 v3: channel-concat conditioning at the trunk's first convolution
+    # (both Variant A and Variant B). Disabled by default ⇒ S1 v2 behaviour.
+    input_concat: _InputConcatCfg = Field(default_factory=_InputConcatCfg)
 
     @model_validator(mode="after")
     def _validate_regime_peft(self) -> _TrunkCfg:
@@ -279,6 +353,13 @@ class _RFlowCfg(BaseModel):
     num_train_timesteps: int = 1000
     use_discrete_timesteps: bool = True
     sample_method: str = "uniform"
+    # SD3-style resolution-aware timestep weighting (Esser et al. 2024,
+    # arXiv:2403.03206) — biases sampling toward intermediate α where
+    # semantic structure forms. Complementary to the LPL high-SNR gate
+    # (2026-06-20 analysis §4b). Off by default to keep the retired S1
+    # recipe reproducible.
+    use_timestep_transform: bool = False
+    base_img_size_numel: int | None = None
 
 
 class _OptimCfg(BaseModel):
@@ -459,6 +540,40 @@ class FMTrainRoutineConfig(BaseModel):
         with path.open("r") as f:
             raw = yaml.safe_load(f)
         return cls.model_validate(raw)
+
+    @model_validator(mode="after")
+    def _validate_v3_consistency(self) -> FMTrainRoutineConfig:
+        """S1 v3 cross-block consistency checks.
+
+        * ``loss.cfm.region_weights.enabled=true`` requires
+          ``loss.cfm.reduction='none'``.
+        * ``model.trunk.input_concat.enabled=true`` requires
+          ``model.trunk.arch_overrides.in_channels`` to match the implied
+          width (4 base + 4 * len(cond_latents)). If unset, this is auto-
+          filled — Pydantic configs are frozen so we raise instead with a
+          clear remediation message.
+        """
+        cfm = (self.loss or {}).get("cfm") or {}
+        rw = cfm.get("region_weights") or {}
+        if rw.get("enabled", False) and cfm.get("reduction", "mean") != "none":
+            raise ValueError(
+                "loss.cfm.region_weights.enabled=true requires loss.cfm.reduction='none' "
+                f"(got reduction={cfm.get('reduction', 'mean')!r}). Set "
+                "loss.cfm.reduction: none in the YAML."
+            )
+        ic = self.model.trunk.input_concat
+        if ic.enabled:
+            expected_in = 4 + 4 * len(ic.cond_latents) + len(ic.cond_masks)
+            declared = int(self.model.trunk.arch_overrides.get("in_channels", 4))
+            if declared != expected_in:
+                raise ValueError(
+                    "model.trunk.input_concat.enabled=true with "
+                    f"cond_latents={ic.cond_latents}, cond_masks={ic.cond_masks} "
+                    f"implies trunk in_channels={expected_in}, but "
+                    f"model.trunk.arch_overrides.in_channels={declared}. Set "
+                    f"model.trunk.arch_overrides: {{in_channels: {expected_in}}}."
+                )
+        return self
 
 
 # =============================================================================
@@ -914,10 +1029,12 @@ class FMTrainRoutineEngine:
         if cfg.model.trunk.regime == "peft" and cfg.model.trunk.peft is not None:
             trunk_peft_variant = cfg.model.trunk.peft.get("variant")
             trunk_peft_params = dict(cfg.model.trunk.peft.get("params", {}))
+        cfm_block = (cfg.loss or {}).get("cfm") or {}
+        rw_block = cfm_block.get("region_weights")
         return {
-            "schema_version": "0.9.0",
+            "schema_version": "0.10.0",
             "produced_at": now_iso_utc(),
-            "producer": "routines.fm.train:0.9.0",
+            "producer": "routines.fm.train:0.10.0",
             "run_id": run_id,
             "run_dir": str(run_dir),
             "stage": cfg.run.stage,
@@ -968,6 +1085,31 @@ class FMTrainRoutineEngine:
                 else None
             ),
             "decoder_lpl_decision_sha256": _safe_sha256(cfg.data.decoder_lpl_decision_path),
+            # Schema 0.10.0 — S1 v3 architecture deltas (channel-concat at
+            # trunk + optional ControlNet for masks + region-weighted L1).
+            "controlnet_enabled": cfg.model.controlnet.enabled,
+            "controlnet_init_from_trunk_enabled": (
+                cfg.model.controlnet.init_from_trunk if cfg.model.controlnet.enabled else None
+            ),
+            "controlnet_conditioning_inputs": list(cfg.model.controlnet.conditioning_inputs),
+            "input_concat": {
+                "enabled": cfg.model.trunk.input_concat.enabled,
+                "cond_latents": list(cfg.model.trunk.input_concat.cond_latents),
+                "cond_masks": list(cfg.model.trunk.input_concat.cond_masks),
+                "trunk_in_channels_old": 4,
+                "trunk_in_channels_new": int(cfg.model.trunk.arch_overrides.get("in_channels", 4)),
+                "zero_init_new_channels": cfg.model.trunk.input_concat.zero_init_new_channels,
+                "ramp_steps": cfg.model.trunk.input_concat.ramp_steps,
+                "ramp_steepness": cfg.model.trunk.input_concat.ramp_steepness,
+            },
+            "loss_cfm_reduction": cfm_block.get("reduction", "mean"),
+            "loss_cfm_norm": cfm_block.get("norm", "l2"),
+            "region_weights": (dict(rw_block) if rw_block is not None else None),
+            # Reserved for the (deferred) normalisation-audit sibling spec;
+            # null until that preflight lands and v3 latents carry a
+            # ``normalization_variant_id`` attr cross-checked at engine init.
+            "normalization_audit_decision_path": None,
+            "normalization_variant_id": "V0",
         }
 
     def _build_exhaustive_job_base(self, cfg: FMTrainRoutineConfig) -> dict[str, Any]:
@@ -998,8 +1140,15 @@ class FMTrainRoutineEngine:
                 "trainable": cfg.model.trunk.trainable,
                 "regime": cfg.model.trunk.regime,
                 "peft": (dict(cfg.model.trunk.peft) if cfg.model.trunk.peft is not None else None),
+                # S1 v3 — propagate input-concat so the sub-process rebuilds
+                # the trunk with the same widened conv_in shape.
+                "input_concat": cfg.model.trunk.input_concat.model_dump(),
             },
             "controlnet": {
+                # S1 v3 — propagate the enable + init flags so Variant A
+                # sub-jobs skip the ControlNet entirely.
+                "enabled": cfg.model.controlnet.enabled,
+                "init_from_trunk": cfg.model.controlnet.init_from_trunk,
                 "conditioning_inputs": list(cfg.model.controlnet.conditioning_inputs),
                 "arch_overrides": dict(cfg.model.controlnet.arch_overrides),
             },
@@ -1288,6 +1437,10 @@ class FMTrainRoutineEngine:
                 if cfg.run.stage.lower() == "s3" and cfg.model.vae_checkpoint is not None
                 else None
             ),
+            # S1 v3 wiring (defaults preserve S1 v2 behaviour byte-for-byte).
+            controlnet_enabled=cfg.model.controlnet.enabled,
+            controlnet_init_from_trunk_enabled=cfg.model.controlnet.init_from_trunk,
+            input_concat_cfg=cfg.model.trunk.input_concat.model_dump(),
         )
 
         # Checkpoint selection (ema_best) is on the epoch-aggregated training
@@ -1321,6 +1474,21 @@ class FMTrainRoutineEngine:
             callbacks.append(AugmentationTracker(out_dir=run_dir / "metrics"))
         if cfg.data.use_offline_augmented_data:
             callbacks.append(VariantTracker(out_dir=run_dir / "metrics"))
+        ramp_cfg = cfg.model.controlnet.output_scale_ramp
+        if ramp_cfg is not None and ramp_cfg.enabled:
+            from vena.model.fm.lightning.callbacks import OutputScaleRampCallback
+
+            callbacks.append(
+                OutputScaleRampCallback(
+                    ramp_steps=int(ramp_cfg.ramp_steps),
+                    steepness=float(ramp_cfg.steepness),
+                )
+            )
+            logger.info(
+                "OutputScaleRampCallback ENABLED: ramp_steps=%d steepness=%.1f",
+                int(ramp_cfg.ramp_steps),
+                float(ramp_cfg.steepness),
+            )
         if cfg.exhaustive_val.enabled:
             callbacks.append(
                 ExhaustiveValLauncher(

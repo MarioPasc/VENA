@@ -11,16 +11,37 @@ manually with the same fixed ``max_val``. For SSIM we set out-of-region voxels
 to a *neutral* fill (the per-volume mean of the in-region voxels) so the
 sliding 3D window contains representative content; this is an approximation
 acceptable for training-time tracking — final metrics use a dedicated harness.
+
+S1 v3 (2026-06-22) adds masked **MAE** and **MSE** (linear and squared
+error means inside the region) plus a one-shot ``metrics_per_region`` driver
+that returns ``{region: {psnr_db, ssim, mae, mse}}`` for every region in
+``RegionMasks`` that is not ``None``. This is the load-bearing API for the
+exhaustive_val CSV: per-(cohort, epoch, patient, nfe) row carries all four
+metrics × seven regions in one call.
 """
 
 from __future__ import annotations
 
 import logging
-import math
+from typing import TYPE_CHECKING
 
 import torch
 
+if TYPE_CHECKING:
+    pass
+
 logger = logging.getLogger(__name__)
+
+
+_PER_REGION_DRIVER_REGIONS: tuple[str, ...] = (
+    "brain",  # "whole" alias — the full brain foreground
+    "wt",
+    "bg",
+    "brain_not_wt",
+    "netc",
+    "ed",
+    "et",
+)
 
 
 class ImageMetrics:
@@ -67,15 +88,11 @@ class ImageMetrics:
         )
         return psnr
 
-    def psnr(
-        self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
-    ) -> torch.Tensor:
+    def psnr(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Masked PSNR-3D per batch element."""
         return self._masked_psnr_3d(pred, target, mask, self.data_range)
 
-    def ssim(
-        self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
-    ) -> torch.Tensor:
+    def ssim(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Approximate masked SSIM-3D — fills out-of-region with mean intensity.
 
         Returns ``(B,)``; entries are NaN if the region is empty.
@@ -99,3 +116,92 @@ class ImageMetrics:
         empty = m.flatten(1).sum(dim=1) == 0
         scores = torch.where(empty, torch.full_like(scores, float("nan")), scores)
         return scores
+
+    @staticmethod
+    def _masked_mae_3d(
+        pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Mean absolute error inside ``mask``. NaN for empty regions.
+
+        Returns ``(B,)``. Matches the masked-PSNR conventions: voxels
+        outside the mask are excluded from both the numerator and the
+        denominator.
+        """
+        m = mask.expand_as(pred).to(pred.dtype)
+        num = ((pred - target).abs() * m).flatten(1).sum(dim=1)
+        den = m.flatten(1).sum(dim=1)
+        return torch.where(
+            den > 0,
+            num / den.clamp_min(1.0),
+            torch.full_like(num, float("nan")),
+        )
+
+    @staticmethod
+    def _masked_mse_3d(
+        pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Mean squared error inside ``mask``. NaN for empty regions."""
+        m = mask.expand_as(pred).to(pred.dtype)
+        num = (((pred - target) ** 2) * m).flatten(1).sum(dim=1)
+        den = m.flatten(1).sum(dim=1)
+        return torch.where(
+            den > 0,
+            num / den.clamp_min(1.0),
+            torch.full_like(num, float("nan")),
+        )
+
+    def mae(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Masked MAE-3D per batch element. Returns ``(B,)`` (NaN if region empty)."""
+        return self._masked_mae_3d(pred, target, mask)
+
+    def mse(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Masked MSE-3D per batch element. Returns ``(B,)`` (NaN if region empty)."""
+        return self._masked_mse_3d(pred, target, mask)
+
+    def metrics_per_region(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        region_masks: RegionMasks,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        """Compute PSNR + SSIM + MAE + MSE for every populated region.
+
+        Iterates over ``("brain", "wt", "bg", "brain_not_wt", "netc", "ed",
+        "et")`` (skipping any field that is ``None``) and returns a dict
+        ``{region: {psnr_db, ssim, mae, mse}}`` of per-batch tensors.
+
+        The ``"brain"`` field is aliased to ``"whole"`` in the returned dict
+        — it represents the full-brain foreground (matches the "whole-volume"
+        metric naming convention used by the exhaustive_val output). This
+        avoids double work for the most common metric and keeps the
+        downstream CSV column scheme stable.
+
+        Parameters
+        ----------
+        pred, target : Tensor
+            ``(B, 1, H, W, D)`` decoded volumes in the same intensity space
+            (typically VAE-decoded ``[0, 1]`` brain volumes).
+        region_masks : RegionMasks
+            Output of :class:`RegionResolver.resolve`. ``None`` fields are
+            silently skipped — the caller is responsible for emitting NaN
+            columns when a region is unavailable for a given batch.
+
+        Returns
+        -------
+        dict[region_name → dict[metric_name → Tensor of shape (B,)]]
+            Region names: ``{whole, wt, bg, brain_not_wt, netc, ed, et}``.
+            Metric names: ``{psnr_db, ssim, mae, mse}``.
+        """
+        out: dict[str, dict[str, torch.Tensor]] = {}
+        for region_name in _PER_REGION_DRIVER_REGIONS:
+            mask = region_masks.get(region_name)
+            if mask is None:
+                continue
+            key = "whole" if region_name == "brain" else region_name
+            out[key] = {
+                "psnr_db": self.psnr(pred, target, mask),
+                "ssim": self.ssim(pred, target, mask),
+                "mae": self.mae(pred, target, mask),
+                "mse": self.mse(pred, target, mask),
+            }
+        return out

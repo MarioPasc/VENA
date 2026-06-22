@@ -1,0 +1,175 @@
+# Picasso — S1 v3 Variant B (channel-concat at trunk + ControlNet on 3-ch mask).
+#
+# Diagnosis at .claude/notes/review/2026-06-22_s1_v2_tumor_synthesis_failure_diagnosis.md
+# Spec at        .claude/notes/changes/2026-06-22_s1_v3_model_implementation.md
+#
+# Variant B — layers ControlNet's designed-for use case (spatial-mask control)
+# on top of Variant A's channel-concat. The ControlNet's cond_embedding sees
+# the 3-channel [NETC, ED, ET] soft mask (NOT the modality latents — those
+# go straight to the trunk's conv_in). Tests "does per-sub-region ControlNet
+# add ET-quality on top of channel-concat?". If B − A PSNR_ET >= 2 dB, the
+# ControlNet recipe is load-bearing for the proposal's S2 vessel-prior plan.
+#
+# Recipe deltas vs the S1 v2 baseline (picasso_s1_1000ep_fft.yaml):
+#   * Same trunk channel-concat as Variant A (in_channels 4 → 16).
+#   * model.controlnet.enabled: true
+#   * model.controlnet.init_from_trunk: false
+#     ⇒ cond_embedding stays at Kaiming init (no useful warm-start from the
+#     trunk's 4-channel-input encoder, since the cond is now 3-channel masks)
+#   * model.controlnet.conditioning_inputs:
+#       [mask:netc:identity, mask:ed:identity, mask:et:identity]
+#     ⇒ cond_embedding first conv built with in_channels=3
+#   * output_scale_ramp retained from S1 v2 (same 5000-step ramp; performed
+#     correctly and saturated by epoch 24).
+#   * Same region-weighted L1 loss as Variant A.
+#
+# Hardware + wallclock: identical to Variant A.
+# Submit via:
+#   sbatch routines/fm/train/slurm/runs/launcher_picasso_s1_v3b_fft.sh
+
+run:
+  stage: s1
+  tag: v3b_concat_plus_cn3ch_fft
+  resume_from: baseline
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
+
+data:
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  batch_size: 4
+  num_workers: 8
+  pin_memory: true
+  tau: 0.5
+  augmentation_config_path: null
+  preflight_decision_path: null
+  dedup_decisions_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
+  use_offline_augmented_data: true
+  variant_weights:
+    v0: 0.2
+    v1: 0.2
+    v2: 0.2
+    v3: 0.2
+    v4: 0.2
+
+model:
+  trunk:
+    checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides:
+      in_channels: 16
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+    trainable: true
+    regime: fft
+    input_concat:
+      enabled: true
+      cond_latents: [t1pre, t2, flair]
+      cond_masks: []
+      zero_init_new_channels: true
+      ramp_steps: 0
+      ramp_steepness: 10.0
+  controlnet:
+    enabled: true             # Variant B — ControlNet active
+    init_from_trunk: false    # 3-channel mask cond has no useful trunk warm-start
+    # 3 single-channel mask specs ⇒ cond_embedding first conv in_channels=3.
+    # Reads batch["m_netc"], batch["m_ed"], batch["m_et"] (derived in the
+    # dataset from masks/tumor_latent channels 0/1/2).
+    conditioning_inputs:
+      - mask:netc:identity
+      - mask:ed:identity
+      - mask:et:identity
+    arch_overrides: {}
+    perturb_keys: []
+    output_scale_ramp:
+      enabled: true
+      ramp_steps: 5000
+      steepness: 10.0
+  vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+
+loss:
+  cfm:
+    weight: 1.0
+    # 2026-06-22 (3-arm ablation): this arm adds the CN-on-masks branch on
+    # top of v3a but keeps the **same standard L1 mean loss** so the only
+    # delta vs v3a is the architecture. Pair-wise with v3a isolates CN-on-
+    # masks; pair-wise with `picasso_s1_v3b_rw_concat_plus_cn3ch_fft.yaml`
+    # isolates the region-weighted loss.
+    reduction: mean
+    norm: l1
+
+rflow:
+  num_train_timesteps: 1000
+  use_discrete_timesteps: true
+  sample_method: logit-normal
+  use_timestep_transform: true
+  base_img_size_numel: 129024
+
+optim:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  warmup_steps: 1000
+  scheduler: cosine
+
+ema:
+  decay: 0.9999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 400000
+  max_epochs: 10000
+  batch_size: 4
+  grad_accum: 2
+  checkpoint_every_epochs: 25
+  log_train_every_steps: 100
+  best_metric_name: mse_latent
+  best_metric_region: bg
+  best_metric_nfe: 5
+  gradient_clip_val: 1.0
+  patience: 250
+
+validation:
+  every_epochs: 0
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 999999
+  sweep_nfes: [1, 2, 5, 10, 20]
+  qualitative_every_epochs: 999999
+  image_metrics: false
+
+exhaustive_val:
+  enabled: true
+  every_epochs: 25
+  n_patients: 60
+  nfe_levels: [1, 2, 5, 10, 20]
+  integrator: euler
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  device: cuda:1
+  block_until_complete: false
+  figure_top_k: 5
+
+output:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments
+  retention_n_checkpoints: 3
+  tensorboard: false
+  wandb: false
+
+regions:
+  brain:
+    source: latents_h5
+  wt:
+    source: derived_from_tumor_latent
+    threshold: 0.5
+  wt_dilated:
+    source: derived_via_scipy_binary_dilation
+    structure: ones_3x3x3
+  bg:
+    source: derived
+  vessel:
+    source: skipped

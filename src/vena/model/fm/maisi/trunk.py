@@ -153,7 +153,25 @@ def load_trunk(
         )
 
     state_dict = blob["unet_state_dict"]
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    # S1 v3 (2026-06-22): when ``arch_overrides`` widens ``in_channels`` past 4,
+    # ``model.conv_in.conv.weight`` has shape ``(C_out, requested_in_ch, k, k, k)``
+    # but the checkpoint key carries the 4-channel slice ``(C_out, 4, k, k, k)``.
+    # PyTorch ≥2.0 raises ``RuntimeError`` on shape mismatch even under
+    # ``strict=False``, so we must FILTER the wide-shape conv_in keys out of
+    # the loaded state_dict here. The conv_in expansion block below then
+    # re-installs the pretrained 4-channel slice into the wider Conv3d's
+    # first 4 input channels via a fresh ``nn.Conv3d`` swap.
+    requested_in_ch = (arch_overrides or {}).get("in_channels")
+    expand_conv_in_now = requested_in_ch is not None and int(requested_in_ch) > 4
+    if expand_conv_in_now:
+        filtered_sd = {
+            k: v
+            for k, v in state_dict.items()
+            if k not in ("conv_in.conv.weight", "conv_in.conv.bias")
+        }
+        missing, unexpected = model.load_state_dict(filtered_sd, strict=False)
+    else:
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
         logger.warning("trunk state_dict missing %d keys (first: %s)", len(missing), missing[:3])
     if unexpected:
@@ -173,6 +191,56 @@ def load_trunk(
             logger.warning("trunk scale_factor present but non-scalar: %r", type(sf_raw).__name__)
 
     num_train_timesteps = int(blob.get("num_train_timesteps", 1000))
+
+    # S1 v3 (2026-06-22) — channel-expand the trunk's first conv when the
+    # config requests more input channels than the MAISI JSON default of 4.
+    # ``_instantiate_trunk`` built ``model.conv_in`` with the requested
+    # width but Kaiming-init everywhere; the load_state_dict above could
+    # not copy the 4-channel checkpoint slice into the wider tensor. Here
+    # we rebuild the inner Conv3d so that the first 4 input channels carry
+    # the pretrained weights and the remaining channels are zero-filled
+    # ⇒ bit-identical step-0 behaviour for inputs of the form
+    # ``cat([x_old, ...], dim=1)``. Done BEFORE ``make_trunk_grad_safe`` so
+    # the patched ``_forward_oop`` (attribute-lookup ``self.conv_in``)
+    # picks up the new layer at call time.
+    requested_in_ch = (arch_overrides or {}).get("in_channels")
+    if requested_in_ch is not None and int(requested_in_ch) > 4:
+        from torch import nn
+
+        pretrained_w = state_dict.get("conv_in.conv.weight")
+        pretrained_b = state_dict.get("conv_in.conv.bias")
+        if pretrained_w is None or pretrained_w.shape[1] != 4:
+            raise TrunkLoadError(
+                "trunk checkpoint does not carry conv_in.conv.weight at expected "
+                f"shape (*, 4, *, *, *); got "
+                f"{None if pretrained_w is None else tuple(pretrained_w.shape)}. "
+                "Cannot perform v3 conv_in expansion."
+            )
+        # MAISI wraps Conv3d in a MONAI ``Convolution`` block: the actual
+        # Conv3d lives at ``model.conv_in.conv``.
+        old_inner = model.conv_in.conv
+        new_inner = nn.Conv3d(
+            in_channels=int(requested_in_ch),
+            out_channels=old_inner.out_channels,
+            kernel_size=old_inner.kernel_size,
+            stride=old_inner.stride,
+            padding=old_inner.padding,
+            dilation=old_inner.dilation,
+            groups=old_inner.groups,
+            bias=old_inner.bias is not None,
+            padding_mode=old_inner.padding_mode,
+        )
+        with torch.no_grad():
+            new_inner.weight.zero_()  # zero-init for all channels
+            new_inner.weight[:, :4].copy_(pretrained_w)  # overlay pretrained slice
+            if pretrained_b is not None and new_inner.bias is not None:
+                new_inner.bias.copy_(pretrained_b)
+        model.conv_in.conv = new_inner
+        logger.info(
+            "trunk conv_in expanded 4 → %d channels (zero-init for new slices; "
+            "first 4 channels carry the pretrained MAISI weights).",
+            int(requested_in_ch),
+        )
 
     dev = torch.device(device)
     # ``train(trainable)`` sets eval() when frozen and train() when fine-tuning.

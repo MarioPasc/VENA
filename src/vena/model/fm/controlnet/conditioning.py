@@ -37,7 +37,7 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch import nn
 
-from .downsample import AbstractDownsampler, get_downsampler
+from .downsample import get_downsampler
 
 logger = logging.getLogger(__name__)
 
@@ -145,8 +145,7 @@ class ConditioningAssembler(nn.Module):
     ) -> None:
         super().__init__()
         parsed: list[ConditioningSpec] = [
-            s if isinstance(s, ConditioningSpec) else ConditioningSpec.from_string(s)
-            for s in specs
+            s if isinstance(s, ConditioningSpec) else ConditioningSpec.from_string(s) for s in specs
         ]
         if not parsed:
             raise ValueError("ConditioningAssembler requires at least one spec")
@@ -160,14 +159,24 @@ class ConditioningAssembler(nn.Module):
 
     @property
     def channels_per_spec(self) -> list[int]:
+        """Per-spec output channel count, downsampler-aware.
+
+        When a downsampler exposes an integer ``out_channels`` property
+        (i.e. it lifts the channel dim, e.g. :class:`LiftTo4ChDownsampler`),
+        the assembler uses that value instead of the kind-based default.
+        Stateless operators return ``None`` for ``out_channels`` and the
+        kind default applies.
+        """
         out: list[int] = []
-        for spec in self.specs:
+        for spec, ds in zip(self.specs, self.downsamplers, strict=True):
             if spec.kind == "latent":
-                out.append(self.latent_channels)
+                default_n = self.latent_channels
             elif spec.kind == "mask":
-                out.append(self.mask_channels)
+                default_n = self.mask_channels
             else:
-                out.append(self.prior_channels)
+                default_n = self.prior_channels
+            override = getattr(ds, "out_channels", None)
+            out.append(int(override) if override is not None else default_n)
         return out
 
     @property

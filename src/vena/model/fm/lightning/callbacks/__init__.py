@@ -8,6 +8,7 @@ from .checkpointing import (
 )
 from .exhaustive_launcher import ExhaustiveValLauncher
 from .nfe_timing import NFETimingCSV
+from .output_scale_ramp import OutputScaleRampCallback
 from .qualitative import QualitativeH5Writer
 from .sigterm import SigtermHandler
 from .train_csv import TrainMetricsCSV
@@ -18,6 +19,7 @@ __all__ = [
     "BestCheckpointCallback",
     "ExhaustiveValLauncher",
     "NFETimingCSV",
+    "OutputScaleRampCallback",
     "QualitativeH5Writer",
     "SigtermHandler",
     "TrainMetricsCSV",

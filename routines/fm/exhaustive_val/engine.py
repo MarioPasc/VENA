@@ -64,11 +64,19 @@ class _TrunkJobCfg(BaseModel):
     # reconstruct the wrapped trunk before loading the EMA snapshot.
     regime: Literal["fft", "peft"] = "fft"
     peft: dict[str, Any] | None = None
+    # S1 v3 (2026-06-22) — input-concat conditioning at trunk's first conv.
+    # Mirrors train-time _InputConcatCfg fields verbatim. Disabled (default)
+    # is byte-identical to S1 v2 behaviour.
+    input_concat: dict[str, Any] = Field(default_factory=dict)
 
 
 class _CNJobCfg(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    conditioning_inputs: list[str]
+    # S1 v3 Variant A: ``enabled=False`` skips ControlNet entirely. Defaults
+    # to ``True`` for back-compat with S1 v2 job YAMLs.
+    enabled: bool = True
+    init_from_trunk: bool = True
+    conditioning_inputs: list[str] = Field(default_factory=list)
     arch_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -105,7 +113,9 @@ class ExhaustiveValJobConfig(BaseModel):
 
     fold: int = 0
 
-    ema_snapshot: Path
+    # S1 v3 Variant A (no ControlNet) has no CN EMA shadow to load; the
+    # launcher writes a ``None`` here and the sub-process skips the load.
+    ema_snapshot: Path | None = None
     # Unfrozen-trunk ablation: EMA trunk shadow saved by the launcher. When set
     # (and ``trunk.trainable``), sampling uses the fine-tuned trunk; otherwise
     # the original frozen trunk checkpoint is used.
@@ -193,10 +203,27 @@ class ExhaustiveValEngine:
             ema_cfg=dict(cfg.ema),
             region_resolver=None,
             vae_decoder=None,
+            # S1 v3 — propagate the architecture flags so Variant A sub-jobs
+            # rebuild the module with controlnet_enabled=False (and skip the
+            # ConditioningAssembler) and the trunk-side input-concat.
+            controlnet_enabled=cfg.controlnet.enabled,
+            controlnet_init_from_trunk_enabled=cfg.controlnet.init_from_trunk,
+            input_concat_cfg=cfg.trunk.input_concat,
         )
         module = module.to(self.device)
         module.setup()
-        self._load_ema_snapshot(module, cfg.ema_snapshot)
+        if cfg.ema_snapshot is not None and module.ema is not None:
+            self._load_ema_snapshot(module, cfg.ema_snapshot)
+        elif cfg.ema_snapshot is None and module.ema is None:
+            logger.info(
+                "S1 v3 Variant A: skipping CN EMA snapshot load (controlnet.enabled=false)."
+            )
+        else:
+            logger.warning(
+                "ema_snapshot=%s but module.ema is %s — mismatched. Skipping load.",
+                cfg.ema_snapshot,
+                module.ema,
+            )
         if cfg.trunk.trainable and cfg.trunk_finetuned_snapshot is not None:
             self._load_trunk_ema_snapshot(module, cfg.trunk_finetuned_snapshot)
         module.eval()
@@ -329,7 +356,21 @@ class ExhaustiveValEngine:
         vae = MaisiDecoder(handle=load_autoencoder(cfg.vae_checkpoint, device=str(self.device)))
         latent_metrics = LatentMetrics()
         image_metrics = ImageMetrics(data_range=1.0)
-        sampler = get_sampler(cfg.integrator)(scheduler=module.rflow.scheduler)
+        # When the trained scheduler uses MONAI's SD3-style timestep transform
+        # (``rflow.use_timestep_transform=True``), the sampler's
+        # ``set_timesteps`` call needs ``input_img_size_numel`` or the
+        # internal :func:`timestep_transform` divides ``None`` by ``int`` and
+        # every per-patient sample fails with a silent WARNING. Plumb the
+        # YAML's ``rflow.base_img_size_numel`` through as the inference-side
+        # value; per-patient brain-box shape variations are sub-10 % deltas
+        # in the cubic-root ratio used by ``timestep_transform``.
+        sampler_kwargs: dict[str, Any] = {"scheduler": module.rflow.scheduler}
+        if cfg.rflow.get("use_timestep_transform"):
+            ts_numel = cfg.rflow.get("base_img_size_numel")
+            if ts_numel is None:
+                ts_numel = 48 * 56 * 48  # VENA brain-box latent (48x56x48)
+            sampler_kwargs["input_img_size_numel"] = int(ts_numel)
+        sampler = get_sampler(cfg.integrator)(**sampler_kwargs)
 
         metric_rows: list[dict[str, Any]] = []
         latent_entries: list[tuple[str, int, Any]] = []
@@ -370,6 +411,12 @@ class ExhaustiveValEngine:
 
         self._write_metrics_csv(out_dir / "metrics.csv", metric_rows)
         self._write_timing_csv(out_dir / "timing.csv", metric_rows)
+        # S1 v3 (2026-06-22): per-(cohort, nfe, region) aggregate.csv summarises
+        # the row-level metrics.csv for downstream convergence plots. NaN cells
+        # are skipped from the mean/std so patients with empty regions (e.g.
+        # 17 % of UCSF-PDGM val has no latent WT voxels) do not pull the
+        # average to NaN.
+        self._write_aggregate_csv(out_dir / "aggregate.csv", metric_rows)
         write_latent_preds_h5(
             out_dir / "latent_preds.h5",
             latent_entries,
@@ -377,8 +424,26 @@ class ExhaustiveValEngine:
             run_id=cfg.run_id,
             extra_attrs={"nfe_levels_json": json.dumps(list(cfg.nfe_levels))},
         )
+        # Per-(patient, NFE) PSNR/SSIM index for the comparison figure's
+        # per-row annotation (2026-06-20 global figure overhaul). Built once
+        # from ``metric_rows`` and passed down to ``_render_best_worst``.
+        psnr_ssim_by_pid_nfe: dict[tuple[str, int], tuple[float, float]] = {
+            (str(row["patient_id"]), int(row["nfe"])): (
+                float(row.get("psnr_db", float("nan"))),
+                float(row.get("ssim", float("nan"))),
+            )
+            for row in metric_rows
+            if "patient_id" in row and "nfe" in row
+        }
         self._render_best_worst(
-            module, vae, ssim_by_pid, latents_by_pid_nfe, gen_decode_time, pid_to_image_h5, out_dir
+            module,
+            vae,
+            ssim_by_pid,
+            latents_by_pid_nfe,
+            gen_decode_time,
+            pid_to_image_h5,
+            out_dir,
+            psnr_ssim_by_pid_nfe=psnr_ssim_by_pid_nfe,
         )
         if cfg.export_per_block_figures and cfg.lpl_A:
             try:
@@ -599,6 +664,9 @@ class ExhaustiveValEngine:
         # `real_box > 0` inference in that case.
         m_wt_img = self._wt_mask_in_image_space(batch, real_box.shape)
         m_brain_img = self._brain_mask_in_image_space(batch, real_box.shape)
+        m_netc_img, m_ed_img, m_et_img = self._per_class_tumor_masks_in_image_space(
+            batch, real_box.shape
+        )
         brain_mask_source = "masks/brain_latent" if m_brain_img is not None else "real_box>0"
 
         # Stash the real T1c latent for the per-block feature render. Cheap
@@ -617,6 +685,19 @@ class ExhaustiveValEngine:
             psnr_wt, ssim_wt, psnr_bg, ssim_bg, psnr_nwt, ssim_nwt = self._region_psnr_ssim(
                 img_pred, real_box, m_wt_img, image_metrics, m_brain_img=m_brain_img
             )
+            # S1 v3 (2026-06-22) extra per-region metrics (ET / NETC / ED / BNWT
+            # + MAE/MSE for every region + voxel counts). Missing m_tumor /
+            # m_brain ⇒ those entries are NaN / 0.
+            v3_extras = self._v3_per_region_metrics(
+                img_pred,
+                real_box,
+                m_netc_img=m_netc_img,
+                m_ed_img=m_ed_img,
+                m_et_img=m_et_img,
+                m_wt_img=m_wt_img,
+                m_brain_img=m_brain_img,
+                image_metrics=image_metrics,
+            )
 
             mask = torch.ones_like(z_target, dtype=torch.bool)
             lat_mse = float(latent_metrics.mse(z_pred, z_target, mask)[0].item())
@@ -625,28 +706,28 @@ class ExhaustiveValEngine:
 
             ssim_by_pid[pid].append(ssim)
             gen_decode_time[(pid, int(nfe))] = gen_t + dec_t
-            metric_rows.append(
-                {
-                    "epoch": int(cfg.epoch),
-                    "cohort": cohort,
-                    "patient_id": pid,
-                    "nfe": int(nfe),
-                    "psnr_db": psnr,
-                    "ssim": ssim,
-                    "psnr_db_wt": psnr_wt,
-                    "ssim_wt": ssim_wt,
-                    "psnr_db_bg": psnr_bg,
-                    "ssim_bg": ssim_bg,
-                    "psnr_db_nwt": psnr_nwt,
-                    "ssim_nwt": ssim_nwt,
-                    "latent_mse": lat_mse,
-                    "latent_l1": lat_l1,
-                    "latent_cosine": lat_cos,
-                    "gen_sec": gen_t,
-                    "decode_sec": dec_t,
-                    "brain_mask_source": brain_mask_source,
-                }
-            )
+            row: dict[str, Any] = {
+                "epoch": int(cfg.epoch),
+                "cohort": cohort,
+                "patient_id": pid,
+                "nfe": int(nfe),
+                "psnr_db": psnr,
+                "ssim": ssim,
+                "psnr_db_wt": psnr_wt,
+                "ssim_wt": ssim_wt,
+                "psnr_db_bg": psnr_bg,
+                "ssim_bg": ssim_bg,
+                "psnr_db_nwt": psnr_nwt,
+                "ssim_nwt": ssim_nwt,
+                "latent_mse": lat_mse,
+                "latent_l1": lat_l1,
+                "latent_cosine": lat_cos,
+                "gen_sec": gen_t,
+                "decode_sec": dec_t,
+                "brain_mask_source": brain_mask_source,
+            }
+            row.update(v3_extras)
+            metric_rows.append(row)
             del img_pred
 
     # ------------------------------------------------------------------
@@ -691,6 +772,8 @@ class ExhaustiveValEngine:
         gen_decode_time: dict[tuple[str, int], float],
         pid_to_image_h5: dict[str, Path],
         out_dir: Path,
+        *,
+        psnr_ssim_by_pid_nfe: dict[tuple[str, int], tuple[float, float]] | None = None,
     ) -> None:
         """Render ``figure_top_k`` best and worst patients by mean SSIM.
 
@@ -736,15 +819,22 @@ class ExhaustiveValEngine:
             slices = select_content_slices(
                 real.cpu(), n_slices=self.cfg.figure_n_slices, offset=self.cfg.figure_slice_offset
             )
+            psnr_ssim_for_pid: dict[int, tuple[float, float]] = {}
+            if psnr_ssim_by_pid_nfe is not None:
+                for nfe in self.cfg.nfe_levels:
+                    psnr_ssim_for_pid[int(nfe)] = psnr_ssim_by_pid_nfe.get(
+                        (pid, int(nfe)),
+                        (float("nan"), float("nan")),
+                    )
             render_comparison_figure(
                 real.cpu(),
                 synth_by_nfe,
                 time_by_nfe,
                 slices,
                 patient_id=pid,
-                mean_ssim=mean_ssim[pid],
                 title_tag=tag,
                 out_path=out_dir / f"figure_{tag}.png",
+                psnr_ssim_by_nfe=psnr_ssim_for_pid,
             )
             logger.info("wrote figure_%s.png (%s, mean SSIM=%.4f)", tag, pid, mean_ssim[pid])
 
@@ -937,6 +1027,33 @@ class ExhaustiveValEngine:
         m_up = F.interpolate(mask.float(), size=target_spatial, mode="nearest")
         return m_up.bool()
 
+    def _per_class_tumor_masks_in_image_space(
+        self,
+        batch: dict[str, Any],
+        image_shape: tuple[int, ...],
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """NN-upsample the 3-channel ``m_tumor`` to image space, per class.
+
+        Returns ``(netc, ed, et)`` each shaped ``(B, 1, *image_shape[-3:])``,
+        or ``(None, None, None)`` when ``batch["m_tumor"]`` is missing.
+        Soft masks are binarised at threshold 0.5 (matches the loss / region
+        resolver convention).
+        """
+        m_tumor = batch.get("m_tumor")
+        if m_tumor is None or not isinstance(m_tumor, torch.Tensor):
+            return None, None, None
+        if m_tumor.dim() == 4:
+            # (3,h,w,d) → (1,3,h,w,d) for the DataLoader-of-1 path.
+            m_tumor = m_tumor.unsqueeze(0)
+        target_spatial = tuple(int(s) for s in image_shape[-3:])
+        m_up = F.interpolate(m_tumor.float(), size=target_spatial, mode="nearest")
+        m_hard = m_up >= 0.5
+        return (
+            m_hard[:, 0:1],  # NETC
+            m_hard[:, 1:2],  # ED
+            m_hard[:, 2:3],  # ET
+        )
+
     @staticmethod
     def _region_psnr_ssim(
         img_pred: torch.Tensor,
@@ -1009,7 +1126,138 @@ class ExhaustiveValEngine:
         )
 
     @staticmethod
-    def _write_metrics_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    def _v3_per_region_metrics(
+        img_pred: torch.Tensor,
+        real_box: torch.Tensor,
+        m_netc_img: torch.Tensor | None,
+        m_ed_img: torch.Tensor | None,
+        m_et_img: torch.Tensor | None,
+        m_wt_img: torch.Tensor | None,
+        m_brain_img: torch.Tensor | None,
+        image_metrics: ImageMetrics,
+    ) -> dict[str, float]:
+        """Per-region PSNR/SSIM/MAE/MSE for the S1 v3 sub-regions.
+
+        Returns a flat dict suitable for ``DictWriter.writerow``. Keys:
+
+        * ``psnr_db_{et,netc,ed,bnwt}``
+        * ``ssim_{et,netc,ed,bnwt}``
+        * ``mae_{whole,wt,bg,bnwt,et,netc,ed}``
+        * ``mse_{whole,wt,bg,bnwt,et,netc,ed}``
+        * ``n_voxels_{brain,wt,bnwt,netc,ed,et}``
+
+        Empty regions return NaN for PSNR/SSIM/MAE/MSE and 0 for the voxel
+        count. ``brain`` (the "whole" region) is the precise brain mask
+        when available, else the ``real_box > 0`` skull-strip-foreground
+        inference, matching the convention in :meth:`_region_psnr_ssim`.
+        """
+        p = img_pred[None, None] if img_pred.ndim == 3 else img_pred
+        r = real_box[None, None] if real_box.ndim == 3 else real_box
+
+        # Whole-brain mask (alias "whole") and the disjoint brain_not_wt region.
+        if m_brain_img is not None and m_brain_img.numel() > 0:
+            brain = m_brain_img if m_brain_img.ndim == 5 else m_brain_img[None, None]
+        else:
+            brain = r > 0
+        wt = (
+            m_wt_img
+            if m_wt_img is not None and m_wt_img.ndim == 5
+            else (m_wt_img[None, None] if m_wt_img is not None else None)
+        )
+        bg = (~wt) if wt is not None else None
+        bnwt = (brain & ~wt) if (wt is not None) else None
+
+        def _scalar(t: torch.Tensor | None) -> float:
+            if t is None or t.numel() == 0:
+                return float("nan")
+            v = float(t[0].item())
+            return v if v == v else float("nan")
+
+        out: dict[str, float] = {}
+
+        def _emit(name: str, mask: torch.Tensor | None) -> None:
+            if mask is None:
+                out[f"psnr_db_{name}"] = float("nan")
+                out[f"ssim_{name}"] = float("nan")
+                out[f"mae_{name}"] = float("nan")
+                out[f"mse_{name}"] = float("nan")
+                out[f"n_voxels_{name}"] = 0
+                return
+            out[f"psnr_db_{name}"] = _scalar(image_metrics.psnr(p, r, mask))
+            out[f"ssim_{name}"] = _scalar(image_metrics.ssim(p, r, mask))
+            out[f"mae_{name}"] = _scalar(image_metrics.mae(p, r, mask))
+            out[f"mse_{name}"] = _scalar(image_metrics.mse(p, r, mask))
+            out[f"n_voxels_{name}"] = int(mask.sum().item())
+
+        # ET / NETC / ED come from m_tumor; bnwt from brain & ~wt.
+        _emit("et", m_et_img)
+        _emit("netc", m_netc_img)
+        _emit("ed", m_ed_img)
+        _emit("bnwt", bnwt)
+        # Whole-volume MAE/MSE (PSNR/SSIM already in the row from the
+        # legacy code path) — emit only the MAE/MSE columns here.
+        whole_mask = brain
+        if whole_mask is not None:
+            out["mae_whole"] = _scalar(image_metrics.mae(p, r, whole_mask))
+            out["mse_whole"] = _scalar(image_metrics.mse(p, r, whole_mask))
+            out["n_voxels_brain"] = int(whole_mask.sum().item())
+        else:
+            out["mae_whole"] = float("nan")
+            out["mse_whole"] = float("nan")
+            out["n_voxels_brain"] = 0
+        # WT and BG MAE/MSE (paired with the legacy PSNR/SSIM).
+        if wt is not None:
+            out["mae_wt"] = _scalar(image_metrics.mae(p, r, wt))
+            out["mse_wt"] = _scalar(image_metrics.mse(p, r, wt))
+            out["n_voxels_wt"] = int(wt.sum().item())
+        else:
+            out["mae_wt"] = float("nan")
+            out["mse_wt"] = float("nan")
+            out["n_voxels_wt"] = 0
+        if bg is not None:
+            out["mae_bg"] = _scalar(image_metrics.mae(p, r, bg))
+            out["mse_bg"] = _scalar(image_metrics.mse(p, r, bg))
+        else:
+            out["mae_bg"] = float("nan")
+            out["mse_bg"] = float("nan")
+        return out
+
+    # S1 v3 CSV column manifest. Order is the same on every row so a partially-
+    # populated row (e.g. patient with no m_tumor) still writes blank cells in
+    # the right places.
+    _V3_EXTRA_COLS: tuple[str, ...] = (
+        "psnr_db_et",
+        "ssim_et",
+        "psnr_db_netc",
+        "ssim_netc",
+        "psnr_db_ed",
+        "ssim_ed",
+        "psnr_db_bnwt",
+        "ssim_bnwt",
+        "mae_whole",
+        "mae_wt",
+        "mae_bg",
+        "mae_bnwt",
+        "mae_et",
+        "mae_netc",
+        "mae_ed",
+        "mse_whole",
+        "mse_wt",
+        "mse_bg",
+        "mse_bnwt",
+        "mse_et",
+        "mse_netc",
+        "mse_ed",
+        "n_voxels_brain",
+        "n_voxels_wt",
+        "n_voxels_bnwt",
+        "n_voxels_netc",
+        "n_voxels_ed",
+        "n_voxels_et",
+    )
+
+    @classmethod
+    def _write_metrics_csv(cls, path: Path, rows: list[dict[str, Any]]) -> None:
         cols = [
             "cohort",
             "epoch",
@@ -1033,6 +1281,7 @@ class ExhaustiveValEngine:
             # loaded from the latent H5) or `real_box>0` (skull-strip-foreground
             # inference, fallback for H5s pre-dating `vena-encode-brain-to-latent`).
             "brain_mask_source",
+            *cls._V3_EXTRA_COLS,
         ]
         with path.open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=cols)
@@ -1075,3 +1324,101 @@ class ExhaustiveValEngine:
                         "total_sec_mean": f"{statistics.fmean(tot):.6g}",
                     }
                 )
+
+    @staticmethod
+    def _write_aggregate_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+        """One row per (cohort, nfe, region) summarising the metrics.csv.
+
+        For each region in
+        ``("whole", "wt", "bg", "bnwt", "netc", "ed", "et")`` and each
+        ``(cohort, nfe)`` group, emit mean/std (NaN-skipping) for
+        ``psnr_db, ssim, mae, mse`` and the patient count.
+
+        Per-region columns are read from the row by suffix. ``whole`` reads
+        from ``psnr_db`` / ``ssim`` / ``mae_whole`` / ``mse_whole``; the
+        other regions use ``psnr_db_<region>`` / ``ssim_<region>`` /
+        ``mae_<region>`` / ``mse_<region>``. Missing or NaN cells are
+        excluded from the mean (n_patients counts only the populated rows).
+        """
+        import math
+        import statistics
+
+        regions = ("whole", "wt", "bg", "bnwt", "netc", "ed", "et")
+
+        def _metric_key(region: str, metric: str) -> str:
+            if region == "whole" and metric in ("psnr_db", "ssim"):
+                return metric  # legacy whole-volume cols carry no suffix
+            return f"{metric}_{region}"
+
+        def _finite_values(rs: list[dict[str, Any]], key: str) -> list[float]:
+            values: list[float] = []
+            for r in rs:
+                v = r.get(key, "")
+                if v in ("", None):
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if math.isnan(fv):
+                    continue
+                values.append(fv)
+            return values
+
+        # Group rows by (cohort, nfe).
+        by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for r in rows:
+            by_key.setdefault((str(r.get("cohort", "")), int(r["nfe"])), []).append(r)
+
+        cols = [
+            "cohort",
+            "nfe",
+            "region",
+            "n_patients",
+            "psnr_db_mean",
+            "psnr_db_std",
+            "ssim_mean",
+            "ssim_std",
+            "mae_mean",
+            "mae_std",
+            "mse_mean",
+            "mse_std",
+        ]
+        with path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            for cohort, nfe in sorted(by_key):
+                rs = by_key[(cohort, nfe)]
+                for region in regions:
+                    psnr_vals = _finite_values(rs, _metric_key(region, "psnr_db"))
+                    ssim_vals = _finite_values(rs, _metric_key(region, "ssim"))
+                    mae_vals = _finite_values(rs, _metric_key(region, "mae"))
+                    mse_vals = _finite_values(rs, _metric_key(region, "mse"))
+
+                    def _mean(v: list[float]) -> str:
+                        return f"{statistics.fmean(v):.6g}" if v else ""
+
+                    def _std(v: list[float]) -> str:
+                        return f"{(statistics.stdev(v) if len(v) > 1 else 0.0):.6g}" if v else ""
+
+                    w.writerow(
+                        {
+                            "cohort": cohort,
+                            "nfe": nfe,
+                            "region": region,
+                            # n_patients = max populated count across the four
+                            # metrics. Region with empty PSNR also tends to
+                            # have empty MAE/MSE, so this is rarely > psnr_vals length.
+                            "n_patients": max(
+                                len(psnr_vals), len(ssim_vals), len(mae_vals), len(mse_vals)
+                            ),
+                            "psnr_db_mean": _mean(psnr_vals),
+                            "psnr_db_std": _std(psnr_vals),
+                            "ssim_mean": _mean(ssim_vals),
+                            "ssim_std": _std(ssim_vals),
+                            "mae_mean": _mean(mae_vals),
+                            "mae_std": _std(mae_vals),
+                            "mse_mean": _mean(mse_vals),
+                            "mse_std": _std(mse_vals),
+                        }
+                    )

@@ -46,6 +46,7 @@ from typing import Any
 from .base import AbstractFMLoss, CompositeLoss
 from .cfm import CFMLoss
 from .contrastive import ContrastiveTumourLoss, RegionTerm
+from .region_weights import RegionWeights
 from .schedule import (
     WeightSchedule,
     build_schedule,
@@ -133,10 +134,18 @@ def build_loss(stage: str, cfg: dict[str, Any]) -> CompositeLoss:
     cfm_cfg = cfg.get("cfm") or {}
     contrast_cfg = cfg.get("contrastive") or {}
 
+    # S1 v3 (2026-06-22): optional region-weighted reduction.
+    # ``region_weights`` block absent ⇒ None ⇒ legacy mean-reduction.
+    rw_block = cfm_cfg.get("region_weights")
+    region_weights: RegionWeights | None = None
+    if rw_block is not None:
+        region_weights = RegionWeights(**rw_block)
+
     terms: dict[str, AbstractFMLoss] = {
         "cfm": CFMLoss(
             reduction=_get(cfm_cfg, "reduction", "mean"),
             norm=_get(cfm_cfg, "norm", "l2"),
+            region_weights=region_weights,
         )
     }
     weights: dict[str, WeightSchedule] = {

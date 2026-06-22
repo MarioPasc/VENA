@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -56,14 +56,42 @@ class RFlowEngine:
     num_train_timesteps: int = 1000
     use_discrete_timesteps: bool = True
     sample_method: str = "uniform"
+    # SD3-style resolution-aware timestep weighting (Esser et al. 2024,
+    # arXiv:2403.03206). When enabled, MONAI's RFlowScheduler re-weights the
+    # sample distribution toward intermediate α where structure forms — the
+    # same regime the LPL high-SNR gate operates in (complementary, not
+    # antagonistic; see 2026-06-20 analysis §4b). Off by default to preserve
+    # backward compatibility with the retired S1 recipe.
+    use_timestep_transform: bool = False
+    # Calibration target for the timestep transform — the spatial token count
+    # the transform expects. For VENA's brain-box latent (≈48×56×48) this is
+    # ~129 024; set ``None`` to use MONAI's internal default.
+    base_img_size_numel: int | None = None
 
     def __post_init__(self) -> None:
         from monai.networks.schedulers.rectified_flow import RFlowScheduler
 
-        self._scheduler = RFlowScheduler(
-            num_train_timesteps=self.num_train_timesteps,
-            use_discrete_timesteps=self.use_discrete_timesteps,
-            sample_method=self.sample_method,
+        scheduler_kwargs: dict[str, Any] = {
+            "num_train_timesteps": self.num_train_timesteps,
+            "use_discrete_timesteps": self.use_discrete_timesteps,
+            "sample_method": self.sample_method,
+        }
+        # Pass-through the transform kwargs only when set — older MONAI minor
+        # versions may reject unknown kwargs; the conditional keeps the
+        # default code path byte-identical to the pre-2026-06-20 wrapper.
+        if self.use_timestep_transform:
+            scheduler_kwargs["use_timestep_transform"] = True
+        if self.base_img_size_numel is not None:
+            scheduler_kwargs["base_img_size_numel"] = int(self.base_img_size_numel)
+        self._scheduler = RFlowScheduler(**scheduler_kwargs)
+        logger.info(
+            "RFlowEngine: num_train_timesteps=%d use_discrete_timesteps=%s "
+            "sample_method=%s use_timestep_transform=%s base_img_size_numel=%s",
+            self.num_train_timesteps,
+            self.use_discrete_timesteps,
+            self.sample_method,
+            self.use_timestep_transform,
+            self.base_img_size_numel,
         )
 
     @property

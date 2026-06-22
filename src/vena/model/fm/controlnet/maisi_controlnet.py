@@ -45,18 +45,33 @@ class MaisiControlNet(AbstractControlNet):
         bundled ``configs/controlnet_rflow.json``.
     """
 
-    DEFAULT_ARCH_CONFIG = (
-        Path(__file__).parent / "configs" / "controlnet_rflow.json"
-    )
+    DEFAULT_ARCH_CONFIG = Path(__file__).parent / "configs" / "controlnet_rflow.json"
 
     def __init__(
         self,
         conditioning_in_channels: int,
         arch_overrides: dict[str, Any] | None = None,
         arch_config: Path | str | None = None,
+        init_from_trunk_enabled: bool = True,
     ) -> None:
+        """Construct a MAISI ControlNet branch.
+
+        ``init_from_trunk_enabled=True`` (default) preserves the canonical
+        ControlNet recipe: the LightningModule subsequently calls
+        :meth:`init_from_trunk` to shape-filter-copy the trunk's encoder
+        weights. S1 v3 Variant B sets this flag to ``False`` because the
+        ControlNet now consumes a 3-channel mask, not the modality latents —
+        the trunk's pretrained encoder weights are no longer the right
+        warm-start for the cond_embedding's downstream blocks (they still
+        get copied for the block params themselves; only the high-level
+        "should we re-init from trunk?" gate is exposed). Even with the
+        flag flipped, :meth:`zero_init_output_projections` is still run by
+        the caller — without it the residual injection would not be
+        additive-from-zero.
+        """
         super().__init__()
         self.conditioning_in_channels = int(conditioning_in_channels)
+        self.init_from_trunk_enabled = bool(init_from_trunk_enabled)
 
         arch_path = Path(arch_config) if arch_config is not None else self.DEFAULT_ARCH_CONFIG
         with arch_path.open("r") as f:
@@ -71,8 +86,23 @@ class MaisiControlNet(AbstractControlNet):
 
         self.net = ControlNetMaisi(**arch_kwargs)
         self.zero_init_output_projections()
+        # Scale-ramped zero-init (2026-06-20 analysis §4a, recipe E1):
+        # multiplied into every down-block residual and the mid-block residual
+        # in :meth:`forward`. Driven by
+        # :class:`vena.model.fm.lightning.callbacks.OutputScaleRampCallback`,
+        # which fills it with a sigmoid ramp from ~0 → 1 over ``ramp_steps``.
+        # Default 1.0 preserves byte-identical behaviour when the callback is
+        # not registered (S1 retired runs, any tooling that builds the
+        # ControlNet outside Lightning). Non-persistent: the ramp formula is
+        # deterministic in ``global_step`` so we recompute on resume rather
+        # than checkpointing a value that may diverge from the formula.
+        self.register_buffer(
+            "output_scale",
+            torch.tensor(1.0),
+            persistent=False,
+        )
         logger.info(
-            "MaisiControlNet built: cond_in=%d arch_keys=%s",
+            "MaisiControlNet built: cond_in=%d arch_keys=%s output_scale=1.0",
             self.conditioning_in_channels,
             list(arch_kwargs.keys()),
         )
@@ -88,12 +118,22 @@ class MaisiControlNet(AbstractControlNet):
         controlnet_cond: torch.Tensor,
         class_labels: torch.Tensor | None = None,
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
-        return self.net(
+        down_block_res_samples, mid_block_res_sample = self.net(
             x=x,
             timesteps=timesteps,
             controlnet_cond=controlnet_cond,
             class_labels=class_labels,
         )
+        # Apply the scale-ramped zero-init (default 1.0 = byte-identical).
+        # The scalar is a non-grad buffer so autograd treats it as a constant
+        # at each step; the ControlNet parameters' gradients are unaffected.
+        # Sits upstream of ``vena.model.fm.maisi.grad_safe`` 's out-of-place
+        # residual-add patch in the trunk's forward — no interaction with
+        # gradient checkpointing.
+        scale = self.output_scale
+        down_block_res_samples = [t * scale for t in down_block_res_samples]
+        mid_block_res_sample = mid_block_res_sample * scale
+        return down_block_res_samples, mid_block_res_sample
 
     def init_from_trunk(self, trunk_state_dict: dict) -> None:
         """Deep-copy the matching encoder + mid-block weights from the trunk.
@@ -117,7 +157,26 @@ class MaisiControlNet(AbstractControlNet):
           half-width. Skipping those keys is acceptable: the ControlNet
           paper's warm-start prescription is the *encoder convolutions*; the
           time projections are a small, fast-to-learn linear map.
+        * **trunk.conv_in shape mismatch** (S1 v3): when the trunk's
+          ``conv_in`` was expanded from 4 → 16 channels via
+          :func:`vena.model.fm.maisi.conv_in_expand.expand_conv_in`, its
+          shape no longer matches the ControlNet's own 4-channel
+          ``conv_in``. The mismatch is silently skipped by this method's
+          shape filter — the ControlNet's ``conv_in`` keeps the *original*
+          4-channel form (its forward input ``x`` is always the noisy T1c
+          latent, never the concat). This is the intended behaviour.
+
+        S1 v3 Variant B disables this call entirely (via
+        ``init_from_trunk_enabled=False`` on the constructor) because the
+        new 3-channel mask cond_embedding has no useful warm-start from the
+        trunk's 4-channel-input encoder.
         """
+        if not self.init_from_trunk_enabled:
+            logger.info(
+                "ControlNet init_from_trunk: SKIPPED (init_from_trunk_enabled=False); "
+                "encoder remains at MONAI's constructor init."
+            )
+            return
         own_sd = self.net.state_dict()
         copyable: dict[str, Any] = {}
         shape_mismatch: list[str] = []
@@ -127,9 +186,7 @@ class MaisiControlNet(AbstractControlNet):
             if own_sd[k].shape == v.shape:
                 copyable[k] = v
             else:
-                shape_mismatch.append(
-                    f"{k}: trunk={tuple(v.shape)} cn={tuple(own_sd[k].shape)}"
-                )
+                shape_mismatch.append(f"{k}: trunk={tuple(v.shape)} cn={tuple(own_sd[k].shape)}")
         missing, unexpected = self.net.load_state_dict(copyable, strict=False)
         logger.info(
             "ControlNet init_from_trunk: copied=%d shape_mismatch=%d "

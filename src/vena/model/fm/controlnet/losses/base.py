@@ -59,6 +59,13 @@ class LossInputs:
         from ``masks/brain_latent`` (max-pool-4 of image-domain ``masks/brain``,
         encoded by ``vena-encode-brain-to-latent``). Required by the v0.4
         contrastive when any term uses ``region ∈ {brain, healthy, background}``.
+    m_tumor : Tensor | None
+        Soft per-class tumour mask, shape ``(B, 3, h, w, d)``. Channels are
+        ``[NETC (label 1), ED (label 2), ET (label 4)]`` per the BraTS21
+        convention; produced by ``masks/tumor_latent`` in the latent H5
+        (avg-pooled from image-domain one-hot). Consumed by the S1 v3
+        region-weighted L1 loss to apply per-sub-region weights. ``None``
+        on legacy callers that pre-date v3.
     """
 
     x_clean: torch.Tensor
@@ -71,6 +78,7 @@ class LossInputs:
     m_wt: torch.Tensor | None = None
     m_bg: torch.Tensor | None = None
     m_brain: torch.Tensor | None = None
+    m_tumor: torch.Tensor | None = None
 
 
 class AbstractFMLoss(nn.Module, ABC):

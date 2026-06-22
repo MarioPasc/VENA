@@ -41,8 +41,8 @@ Read these before non-trivial work:
 | Native shape (UCSF-PDGM, isotropic 1 mm) | ~`(240, 240, 155)` after skull-strip / co-registration |
 | Latent (MAISI-V2 VAE) | 4× spatial compression, 4 channels |
 | Generator | Latent FM (rectified-flow / linear interpolant), DiT or U-Net trunk |
-| Conditioning route | ControlNet branch on masks; encoder for $T_{1\text{pre}}$ |
-| Loss (default) | $\mathcal{L}_{\text{CFM}}$ (latent); ablate $+ \lambda_v \mathcal{L}_{\text{vessel}} + \lambda_t \mathcal{L}_{\text{tum}}$ on decoded output |
+| Conditioning route | ControlNet branch with **scale-ramped zero-init** (`MaisiControlNet.output_scale` non-persistent buffer multiplied into the down-block + mid-block residuals; sigmoid 0 → 1 over `output_scale_ramp.ramp_steps` via `OutputScaleRampCallback`). Removes the cold-start dead-time the literal-zero-init ControlNet otherwise pays. |
+| Loss (default) | **L1 velocity loss** ($\mathcal{L}_{\text{CFM}}$ with `loss.cfm.norm: l1`) — median-seeking, preserves sharp enhancing-rim boundaries the L2 (retired) objective smeared into a halo. Decoder-feature LPL ($\mathcal{L}_{\text{dec}}$) added in stage S3 (see `.claude/notes/changes/decoder_perceptual_loss_s3*.md`). |
 | Inference | Rectified-flow sampling, 1–10 Heun/Euler steps; <10 s/volume on A100 |
 | Train cohort | UCSF-PDGM, 400 train / 50 val / 50 test (patient-level split) |
 | External cohort | Hospital U. Regional de Málaga (glioma + meningioma, multi-vendor) |
@@ -159,6 +159,17 @@ treat `0.4` as 400× smaller frequency than the trunk was trained on.
 Always scale to integer code form (`(t * T).long()`) before the trunk
 call.
 
+## S1 v2 baseline recipe (2026-06-20 — load-bearing)
+
+Production S1 (`routines/fm/train/configs/runs/picasso_s1_1000ep_fft.yaml`) carries four recipe deltas over the retired 2026-06-12 S1 (L2 + hard zero-init, 1500 ep, plateaued at 26.5 dB whole-vol PSNR / 18.3 dB WT-PSNR with the curve flat past epoch 475). All four are pinned in YAML and exercised by the smoke at `routines/fm/train/configs/smoke/loginexa_s1_4ep_fft.yaml`:
+
+1. **`loss.cfm.norm: l1`** — median-seeking; sharp enhancing-rim boundaries. T1C-RFlow (Eidex 2025) and most 3D medical latent-FM baselines use L1; the retired L2 produced a blurry tumour-region manifold (analysis §4 / E1 in `decoder_perceptual_loss_s3_analysis_2026-06-20.md`).
+2. **`model.controlnet.output_scale_ramp: {enabled: true, ramp_steps: 5000, steepness: 10.0}`** — `MaisiControlNet.output_scale` is a non-persistent buffer multiplied into every down-block + mid-block residual *before return* in `forward`. `OutputScaleRampCallback` (`vena.model.fm.lightning.callbacks.output_scale_ramp`) fills it with `sigmoid(steepness * (step/ramp_steps - 0.5))` on `on_train_batch_start`, capped at 1.0 after `ramp_steps`. Removes the cold-start dead-time vs T1C-RFlow's warm channel-concat. Sits upstream of the `vena.model.fm.maisi.grad_safe` out-of-place residual-add patch — no interaction with grad-checkpointing. The buffer is `persistent=False`: on resume the formula is recomputed from `global_step`.
+3. **`rflow.use_timestep_transform: true` + `rflow.base_img_size_numel: 129024`** — SD3-style resolution-aware timestep weighting (Esser et al. 2024, arXiv:2403.03206); concentrates sampled timesteps at α ∈ [0.3, 0.7] where structure forms. **Complementary to the LPL `t_min=0.4` gate, not antagonistic** (analysis §4b). `base_img_size_numel` matches VENA's brain-box latent (48×56×48). **Load-bearing pitfall**: when `use_timestep_transform=True`, the inference `EulerSampler` must receive `input_img_size_numel` or MONAI's `timestep_transform` divides `None / int` and every per-patient exhaustive-val pass fails with a silent WARNING. The patch at `routines/fm/exhaustive_val/engine.py:332` plumbs `cfg.rflow.base_img_size_numel` through; fallback `48*56*48`.
+4. **`model.controlnet.conditioning_inputs[3]: mask:wt:zero_out`** — S1 does not condition on the WT mask (no region-contrastive loss in S1), but the channel slot is preserved via the new `ZeroOutDownsampler` (returns `torch.zeros_like(x)`, `out_channels` inherits the kind-based default). Warm-start S1 → S2 / S3 is byte-identical in channel layout; S2/S3 YAMLs swap to `mask:wt:identity` (current) or `mask:wt:lift_to_4ch` (reserved infrastructure: learned `Conv3d(1, 4, kernel_size=1)`; `LiftTo4ChDownsampler.out_channels == 4`; lands now but used only when S2/S3 retrain with mask conditioning).
+
+**EarlyStopping monitor for S3 only**: `train/total_epoch` was patched on 2026-06-20 to project the LPL contribution onto `lambda_max` (steady-state) instead of the live `lam_active` (warmup ramp), so the monitor no longer grows monotonically across S3 warmup and EarlyStopping no longer fires at exactly `warmup_epochs + patience`. See `feedback_s3_monitor_pitfall.md` and `decoder_perceptual_loss_s3_analysis_2026-06-20.md`.
+
 ## Conventions in one line each
 
 - **Library code in `src/vena/`, routines in `routines/<bucket>/<name>/` are thin engines** — see `.claude/rules/preflight-pattern.md`.
@@ -167,7 +178,9 @@ call.
 - **Adding a new pathology cohort** = write `vena/data/niigz/<name>.py` with `@register_cohort` + a `routines/h5_datasets/<name>/` converter + a registry-JSON entry. See `src/vena/data/cohort/HOWTO.md`.
 - **Frozen pretrained models are immutable** — never edit `src/external/*` (other than `LINKS.md`), never write to checkpoint paths.
 - **Pre-flights are gating** — `_assert_preflight_gates(cfg)` runs at the top of `Engine.run()` and raises `PreflightGateError` before any side effect.
-- **`decision.json` v0.3.0** in every training run carries trunk + VAE SHA-256, cohorts used, augmentation gate path — see `.claude/rules/preflight-pattern.md`.
+- **`decision.json` v0.9.0** in every training run carries trunk + VAE SHA-256, cohorts used, augmentation gate path, LPL coupling fields — see `.claude/rules/preflight-pattern.md`. Bumped from 0.8.0 by the 2026-06-09 CFG-dropout + the 2026-06-20 LPL coupling changes.
+- **Conditioning assembler is downsampler-aware** — `ConditioningAssembler.channels_per_spec` consults `downsampler.out_channels` and only falls back to the kind-based default when the operator returns `None`. Channel-lifting downsamplers (`lift_to_4ch`) override the default; stateless operators (`identity`, `nearest`, `zero_out`, `avg_pool`, `trilinear`) preserve it.
+- **Exhaustive-val comparison figure** (2026-06-20 global overhaul, `vena.model.fm.eval.exhaustive.render_comparison_figure`) — black background, NFE rows sorted by SSIM descending, per-NFE PSNR/SSIM annotation in the row ylabel, per-slice intensity-matched display window (synth anchored to the real slice's per-slice `(min, max)`). Suptitle is bare `"<TAG> — <patient>"`; aggregate SSIM removed. The caller `_render_best_worst` builds a `psnr_ssim_by_pid_nfe` map from `metric_rows` and passes the per-patient slice.
 - **3D throughout** — no 2D ops in the core pipeline; 2.5D only in clearly-labelled evaluation utilities.
 - **YAML-driven** — every hyperparameter through OmegaConf/Pydantic; round-trip into the produced artifact.
 - **No bare `except Exception`** in library code; either narrow the type or re-raise after logging — see `coding-standards.md` rule 15.

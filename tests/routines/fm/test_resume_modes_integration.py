@@ -262,7 +262,9 @@ def test_baseline_creates_new_dir(stub_engine, tmp_path: Path) -> None:
 
     # Decision.json fields.
     d = _read_decision(run_dir)
-    assert d["schema_version"] == "0.9.0"
+    # S1 v3 (2026-06-22) bumped the schema for the input_concat / controlnet_enabled
+    # / region_weights / normalisation-audit fields.
+    assert d["schema_version"] == "0.10.0"
     assert d["tag"] == "smoke_resume"
     assert d["resume_mode"] == "baseline"
     assert d["resume_source"] == "baseline"

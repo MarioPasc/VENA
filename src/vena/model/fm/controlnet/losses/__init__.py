@@ -19,6 +19,7 @@ from .base import AbstractFMLoss, CompositeLoss, LossInputs
 from .builder import build_loss
 from .cfm import CFMLoss
 from .contrastive import ContrastiveTumourLoss, RegionTerm
+from .region_weights import RegionWeights, build_region_weight_tensor
 
 __all__ = [
     "AbstractFMLoss",
@@ -27,5 +28,7 @@ __all__ = [
     "ContrastiveTumourLoss",
     "LossInputs",
     "RegionTerm",
+    "RegionWeights",
     "build_loss",
+    "build_region_weight_tensor",
 ]

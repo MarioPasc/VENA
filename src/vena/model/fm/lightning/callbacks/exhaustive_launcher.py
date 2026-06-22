@@ -130,16 +130,23 @@ class ExhaustiveValLauncher(pl.Callback):
         epoch_dir = self.out_root / f"epoch_{epoch:03d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
 
-        # Snapshot the EMA shadow weights (small; no optimiser state).
-        snapshot = epoch_dir / "ema_snapshot.pt"
-        torch.save(pl_module.ema.ema_model.state_dict(), snapshot)
-
+        # Snapshot the ControlNet EMA shadow weights (small; no optimiser state).
+        # S1 v3 Variant A has no ControlNet ⇒ no CN EMA shadow to snapshot;
+        # write a sentinel marker so the exhaustive-val sub-process picks up
+        # a controlnet_enabled=False signal via the absence of the file.
         job = dict(self.job_base)
+        if pl_module.ema is not None:
+            snapshot = epoch_dir / "ema_snapshot.pt"
+            torch.save(pl_module.ema.ema_model.state_dict(), snapshot)
+            job["ema_snapshot"] = str(snapshot)
+        else:
+            # No ControlNet EMA — flag the sub-process to skip the CN snapshot
+            # load and pass controlnet=None into ``_trunk_forward``.
+            job["ema_snapshot"] = None
         job.update(
             {
                 "run_id": self.run_id,
                 "epoch": int(epoch),
-                "ema_snapshot": str(snapshot),
                 "output_dir": str(epoch_dir),
                 "device": self.device,
             }

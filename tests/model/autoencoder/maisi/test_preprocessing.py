@@ -104,3 +104,52 @@ def test_percentile_normalise_default_unchanged_when_no_mask() -> None:
     y_a = percentile_normalise(x, foreground_only=True)
     y_b = percentile_normalise(x, foreground_only=True, mask=None)
     assert torch.equal(y_a, y_b)
+
+
+@pytest.mark.unit
+def test_percentile_normalise_clip_default_is_backwards_compatible() -> None:
+    """``clip=True`` must reproduce the pre-2026-06-22 byte-identical behaviour."""
+    rng = torch.Generator().manual_seed(13)
+    x = torch.randn((2, 1, 8, 8, 8), generator=rng)
+    y_implicit = percentile_normalise(x, foreground_only=True)
+    y_explicit = percentile_normalise(x, foreground_only=True, clip=True)
+    assert torch.equal(y_implicit, y_explicit)
+    assert y_implicit.max().item() <= 1.0 + 1e-6
+    assert y_implicit.min().item() >= 0.0 - 1e-6
+
+
+@pytest.mark.unit
+def test_percentile_normalise_no_clip_preserves_bright_tail() -> None:
+    """With ``clip=False`` the super-percentile bright tail must exceed 1.0.
+
+    Background: the v3 normalisation audit needs to test whether the hard
+    clip at the 99.5%ile destroys the T1c gadolinium-enhancement signal. The
+    audit's V1 variant pins ``clip=False`` and expects the brightest voxels
+    to retain magnitude above 1.0 — this is the load-bearing behavioural
+    change vs. ``clip=True``.
+    """
+    rng = torch.Generator().manual_seed(17)
+    # Build a volume with a small bright tail at known voxels.
+    x = torch.randn((1, 1, 16, 16, 16), generator=rng).abs()
+    x[0, 0, 0, 0, 0] = 1000.0  # extreme outlier (well above 99.5%ile)
+    y_clip = percentile_normalise(x, lower=0.0, upper=99.5, clip=True)
+    y_noclip = percentile_normalise(x, lower=0.0, upper=99.5, clip=False)
+    assert y_clip[0, 0, 0, 0, 0].item() <= 1.0 + 1e-6
+    assert y_noclip[0, 0, 0, 0, 0].item() > 1.0
+    # On in-range voxels (well below the 99.5%ile) the two outputs match.
+    in_range = (y_noclip >= 0.0) & (y_noclip <= 1.0)
+    assert torch.allclose(y_clip[in_range], y_noclip[in_range], rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.unit
+def test_percentile_normalise_no_clip_with_mask() -> None:
+    """Mask-driven percentile path also honours ``clip=False``."""
+    rng = torch.Generator().manual_seed(19)
+    x = torch.randn((1, 1, 8, 8, 8), generator=rng).abs()
+    x[0, 0, 0, 0, 0] = 500.0  # outlier inside the masked region
+    mask = torch.zeros_like(x)
+    mask[..., :8, :8, :4] = 1.0
+    y_clip = percentile_normalise(x, mask=mask, lower=0.0, upper=99.5, clip=True)
+    y_noclip = percentile_normalise(x, mask=mask, lower=0.0, upper=99.5, clip=False)
+    assert y_clip[0, 0, 0, 0, 0].item() <= 1.0 + 1e-6
+    assert y_noclip[0, 0, 0, 0, 0].item() > 1.0

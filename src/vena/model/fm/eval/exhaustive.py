@@ -26,6 +26,7 @@ and testable without checkpoints.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -298,16 +299,28 @@ def render_comparison_figure(
     slice_indices: list[int],
     *,
     patient_id: str,
-    mean_ssim: float,
     title_tag: str,
     out_path: Path | str,
+    psnr_ssim_by_nfe: dict[int, tuple[float, float]] | None = None,
 ) -> Path:
     """Render the (1 + ``len(synth_by_nfe)``)-row comparison panel and save it.
 
-    Row 0 is the real T1c; subsequent rows are the synthesised T1c at each NFE
-    level in *descending* order (highest NFE first), each annotated with its
-    generation+decode wall-clock time. Columns are the chosen axial slices. The
-    row count adapts to however many NFE levels are provided.
+    Row 0 is the real T1c; subsequent rows are the synthesised T1c at each
+    NFE level sorted by SSIM descending (best-quality synthesis immediately
+    below the real). Columns are the chosen axial slices. Each synth row's
+    ylabel carries the per-NFE SSIM and PSNR (in addition to the gen+decode
+    wall-clock time); the suptitle is the bare ``"<TAG> — <patient>"`` —
+    aggregate SSIM is removed from there (the per-row labels supersede it).
+
+    Visual conventions (2026-06-20 global figure overhaul):
+
+    * Black figure / axes background, white text — improves contrast on the
+      MR intensity range that lives entirely in the lower half of ``[0, 1]``.
+    * Per-slice intensity match: each column anchors the synth display window
+      to the real slice's per-slice ``(min, max)``, so synth pixels are
+      visually comparable against the same brightness reference as the real
+      slice in that column. Degenerate (constant) real slices fall back to
+      ``[0, 1]``.
 
     Parameters
     ----------
@@ -319,10 +332,16 @@ def render_comparison_figure(
         NFE level -> generation+decode seconds (for that patient).
     slice_indices : list[int]
         Axial indices (columns).
-    patient_id, mean_ssim, title_tag : str, float, str
-        Figure title metadata (``title_tag`` e.g. "best" / "worst").
+    patient_id, title_tag : str, str
+        Figure title metadata (``title_tag`` e.g. ``"best_1"`` / ``"worst_2"``).
     out_path : Path | str
         PNG destination.
+    psnr_ssim_by_nfe : dict[int, tuple[float, float]] | None
+        ``nfe -> (psnr_db, ssim)`` for this patient. ``None`` (or missing
+        keys) falls back to ``(nan, nan)``; rows then sort by NFE descending
+        and the ylabel shows ``SSIM=nan / PSNR=nan dB``. Always supply this
+        from the live exhaustive-val loop — the ``nan`` fallback is only for
+        the very early degenerate-cohort case.
 
     Returns
     -------
@@ -334,36 +353,68 @@ def render_comparison_figure(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    nfes = sorted(synth_by_nfe.keys(), reverse=True)
-    rows = ["real", *nfes]
+    metrics = psnr_ssim_by_nfe or {}
+
+    def _ssim_key(nfe: int) -> float:
+        # SSIM descending; NaN sinks to the bottom (treated as -inf).
+        _, ssim_v = metrics.get(nfe, (float("nan"), float("nan")))
+        return float("-inf") if math.isnan(ssim_v) else float(ssim_v)
+
+    nfes = sorted(synth_by_nfe.keys(), key=_ssim_key, reverse=True)
+    rows: list[str | int] = ["real", *nfes]
     n_rows, n_cols = len(rows), len(slice_indices)
     real_np = real.detach().cpu().float().numpy()
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(1.4 * n_cols, 1.5 * n_rows), squeeze=False)
+    text_color = "white"
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(1.4 * n_cols, 1.5 * n_rows),
+        squeeze=False,
+        facecolor="black",
+    )
+    fig.patch.set_facecolor("black")
+
     for r, row in enumerate(rows):
         if row == "real":
             vol = real_np
             row_label = "Real T1c"
         else:
-            vol = synth_by_nfe[row].detach().cpu().float().numpy()
-            row_label = f"Synth NFE={row}\n(t={time_by_nfe.get(row, float('nan')):.2f}s)"
+            vol = synth_by_nfe[int(row)].detach().cpu().float().numpy()
+            psnr_v, ssim_v = metrics.get(int(row), (float("nan"), float("nan")))
+            t_sec = time_by_nfe.get(int(row), float("nan"))
+            row_label = f"NFE={row}  (t={t_sec:.2f}s)\nSSIM={ssim_v:.4f}  PSNR={psnr_v:.2f} dB"
         for c, k in enumerate(slice_indices):
+            real_slice = real_np[..., k]
+            sl_vmin = float(real_slice.min())
+            sl_vmax = float(real_slice.max())
+            if sl_vmax <= sl_vmin:
+                sl_vmin, sl_vmax = 0.0, 1.0
             ax = axes[r][c]
-            ax.imshow(np.rot90(vol[..., k]), cmap="gray", vmin=0.0, vmax=1.0)
+            ax.set_facecolor("black")
+            ax.imshow(np.rot90(vol[..., k]), cmap="gray", vmin=sl_vmin, vmax=sl_vmax)
             ax.set_xticks([])
             ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_color(text_color)
             if r == 0:
-                ax.set_title(f"z={k}", fontsize=7)
+                ax.set_title(f"z={k}", fontsize=7, color=text_color)
             if c == 0:
-                ax.set_ylabel(row_label, fontsize=8)
+                ax.set_ylabel(row_label, fontsize=8, color=text_color)
     fig.suptitle(
-        f"{title_tag.upper()} — {patient_id}  (mean SSIM={mean_ssim:.4f})",
+        f"{title_tag.upper()} — {patient_id}",
         fontsize=11,
+        color=text_color,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    fig.savefig(
+        out_path,
+        dpi=120,
+        bbox_inches="tight",
+        facecolor=fig.get_facecolor(),
+    )
     plt.close(fig)
     return out_path
 

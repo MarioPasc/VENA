@@ -141,6 +141,10 @@ class FMLightningModule(pl.LightningModule):
         conditioning_dropout_keys: Iterable[str] | None = None,
         lpl_config: Any = None,  # vena.model.fm.lpl.LplConfig (lazy import)
         lpl_vae_checkpoint: Path | None = None,
+        # ---- S1 v3 (2026-06-22) ----
+        controlnet_enabled: bool = True,
+        controlnet_init_from_trunk_enabled: bool = True,
+        input_concat_cfg: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         # Lightning saves these into checkpoint hparams. We exclude unpicklables.
@@ -187,14 +191,39 @@ class FMLightningModule(pl.LightningModule):
         # restores model weights *after* setup()). Frozen trunk stays unregistered
         # so frozen checkpoints are not bloated with 72 M immutable params.
         self._trunk_module: torch.nn.Module | None = None
-        self.conditioning = ConditioningAssembler(conditioning_specs)
-        cond_in = self.conditioning.total_channels
-        logger.info("FMLightningModule: conditioning_total_channels=%d", cond_in)
 
-        self.controlnet: AbstractControlNet = MaisiControlNet(
-            conditioning_in_channels=cond_in,
-            arch_overrides=controlnet_arch_overrides or {},
+        # ---- S1 v3 (2026-06-22) — controlnet/input_concat gating ----
+        # Variant A: ``controlnet_enabled=False`` ⇒ NO ConditioningAssembler,
+        # NO ControlNet, NO ControlNet EMA. Modality latents reach the trunk
+        # exclusively via the channel-concat at ``conv_in`` (see
+        # ``input_concat_cfg`` below). Variant B: ``controlnet_enabled=True``
+        # with a 3-channel mask cond_embedding (``init_from_trunk_enabled=False``)
+        # and modality latents still channel-concat into the trunk.
+        self.controlnet_enabled: bool = bool(controlnet_enabled)
+        self.input_concat_cfg: dict[str, Any] = dict(input_concat_cfg or {})
+        self._input_concat_enabled: bool = bool(self.input_concat_cfg.get("enabled", False))
+        self._input_concat_cond_latents: list[str] = list(
+            self.input_concat_cfg.get("cond_latents") or []
         )
+
+        if self.controlnet_enabled:
+            self.conditioning = ConditioningAssembler(conditioning_specs)
+            cond_in = self.conditioning.total_channels
+            logger.info("FMLightningModule: conditioning_total_channels=%d", cond_in)
+            self.controlnet: AbstractControlNet | None = MaisiControlNet(
+                conditioning_in_channels=cond_in,
+                arch_overrides=controlnet_arch_overrides or {},
+                init_from_trunk_enabled=bool(controlnet_init_from_trunk_enabled),
+            )
+        else:
+            self.conditioning = None  # type: ignore[assignment]
+            self.controlnet = None  # type: ignore[assignment]
+            logger.info(
+                "FMLightningModule: ControlNet DISABLED (Variant A); "
+                "input_concat_enabled=%s cond_latents=%s",
+                self._input_concat_enabled,
+                self._input_concat_cond_latents,
+            )
 
         self.composite: CompositeLoss = build_loss(stage, loss_cfg or {})
         self.rflow = RFlowEngine(**(rflow_cfg or {}))
@@ -203,8 +232,12 @@ class FMLightningModule(pl.LightningModule):
 
         # EMA must be built in __init__ so its parameters exist by the time
         # Lightning's checkpoint load_state_dict runs (it loads *before*
-        # setup()).
-        self.ema: WarmupEMA = WarmupEMA(self.controlnet, **self.ema_cfg)
+        # setup()). Variant A (controlnet_enabled=False) has no ControlNet
+        # to shadow, so ``self.ema`` stays ``None``; sampling reads the
+        # trunk EMA shadow only.
+        self.ema: WarmupEMA | None = (
+            WarmupEMA(self.controlnet, **self.ema_cfg) if self.controlnet is not None else None
+        )
         # Trunk EMA only exists in the unfrozen-trunk ablation; it is built in
         # setup() once the trunk is loaded (the trunk does not exist in
         # __init__). Resume-safety is delivered by the R6 path: the engine
@@ -290,7 +323,8 @@ class FMLightningModule(pl.LightningModule):
         if self._trunk_handle is None:
             self._setup_trunk_and_controlnet()
         # Move EMA shadow to the same device as the live model.
-        self.ema = self.ema.to(self.device)
+        if self.ema is not None:
+            self.ema = self.ema.to(self.device)
         # Unfrozen-trunk ablation: a second EMA over the trunk so that sampling
         # (validation + exhaustive job) uses EMA-smoothed trunk weights exactly
         # as it uses the EMA ControlNet. Built here because the trunk does not
@@ -385,8 +419,9 @@ class FMLightningModule(pl.LightningModule):
         # keys would be ``to_q.base_layer.weight`` + ``to_q.lora_A.default.weight``
         # — so we MUST apply PEFT AFTER ``init_from_trunk``.
         trunk_sd = self._trunk_handle.model.state_dict()
-        self.controlnet.init_from_trunk(trunk_sd)
-        self.controlnet.zero_init_output_projections()
+        if self.controlnet is not None:
+            self.controlnet.init_from_trunk(trunk_sd)
+            self.controlnet.zero_init_output_projections()
         if self.peft_handler is not None:
             self.peft_handler.apply(self._trunk_handle.model)
             adapter_params = self.peft_handler.trainable_parameters(self._trunk_handle.model)
@@ -405,12 +440,13 @@ class FMLightningModule(pl.LightningModule):
             # tensors (and trunk_ema + optimiser state) with the fine-tuned
             # values.
             self._trunk_module = self._trunk_handle.model
-        self.controlnet = self.controlnet.to(self.device)
+        if self.controlnet is not None:
+            self.controlnet = self.controlnet.to(self.device)
         logger.info(
-            "FMLightningModule.setup: trunk on %s (sha=%s) controlnet on %s regime=%s",
+            "FMLightningModule.setup: trunk on %s (sha=%s) controlnet=%s regime=%s",
             self._trunk_handle.device,
             self._trunk_handle.checkpoint_sha256[:12],
-            self.device,
+            "ON" if self.controlnet is not None else "DISABLED (Variant A)",
             self.trunk_config.regime,
         )
 
@@ -446,32 +482,63 @@ class FMLightningModule(pl.LightningModule):
 
     def _trunk_forward(
         self,
-        controlnet: AbstractControlNet,
+        controlnet: AbstractControlNet | None,
         x_t: torch.Tensor,
         timesteps: torch.Tensor,
-        cond: torch.Tensor,
+        cond: torch.Tensor | None,
         class_labels: torch.Tensor,
         spacing: torch.Tensor,
         probe: NFETimingProbe | None = None,
         trunk: torch.nn.Module | None = None,
+        latents_concat: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Run the (optionally-ControlNet-augmented) trunk forward.
+
+        S1 v3 (2026-06-22) adds two optional behaviours, both back-compat
+        with the S1 v2 caller:
+
+        * ``controlnet=None`` ⇒ Variant A path: skip the ControlNet forward
+          entirely; pass ``down_res=None, mid_res=None`` to the trunk. ``cond``
+          is ignored.
+        * ``latents_concat`` not None ⇒ build the trunk's ``x`` argument as
+          ``torch.cat([x_t_p, latents_concat_p], dim=1)``. The trunk's
+          ``conv_in`` must have been expanded (via
+          :func:`vena.model.fm.maisi.conv_in_expand.expand_conv_in`) to accept
+          the wider input. The ControlNet (if present) still receives the
+          plain ``x_t_p`` — its conditioning is the mask only in v3.
+        """
         # ``trunk`` defaults to the live trunk (training path). The EMA-call
         # closure passes the EMA trunk shadow so sampling uses smoothed weights.
         trunk_model = trunk if trunk is not None else self.trunk
         x_t_p, pad = self._pad_to_multiple(x_t, multiple=8)
-        cond_p, _ = self._pad_to_multiple(cond, multiple=8)
-        cn_ctx = probe.section("controlnet") if probe is not None else nullcontext()
-        with cn_ctx:
-            down_res, mid_res = controlnet(
-                x=x_t_p,
-                timesteps=timesteps,
-                controlnet_cond=cond_p,
-                class_labels=class_labels,
-            )
+
+        # ControlNet branch (Variant B) — optional.
+        down_res = None
+        mid_res = None
+        if controlnet is not None and cond is not None:
+            cond_p, _ = self._pad_to_multiple(cond, multiple=8)
+            cn_ctx = probe.section("controlnet") if probe is not None else nullcontext()
+            with cn_ctx:
+                down_res, mid_res = controlnet(
+                    x=x_t_p,
+                    timesteps=timesteps,
+                    controlnet_cond=cond_p,
+                    class_labels=class_labels,
+                )
+
+        # Build the trunk's input. If ``latents_concat`` is supplied
+        # (S1 v3 Variants A + B), channel-concat after padding so spatial
+        # shapes align.
+        if latents_concat is not None:
+            latents_concat_p, _ = self._pad_to_multiple(latents_concat, multiple=8)
+            trunk_input = torch.cat([x_t_p, latents_concat_p], dim=1)
+        else:
+            trunk_input = x_t_p
+
         trunk_ctx = probe.section("trunk") if probe is not None else nullcontext()
         with trunk_ctx:
             v_p = trunk_model(
-                x=x_t_p,
+                x=trunk_input,
                 timesteps=timesteps,
                 class_labels=class_labels,
                 spacing_tensor=spacing,
@@ -479,6 +546,31 @@ class FMLightningModule(pl.LightningModule):
                 mid_block_additional_residual=mid_res,
             )
         return self._unpad(v_p, pad)
+
+    def _build_trunk_input_latents_concat(
+        self, batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor | None:
+        """Assemble the channel-concat conditioning tensor for the trunk input.
+
+        Returns ``None`` when input-concat is disabled (S1 v2 behaviour). When
+        enabled, concatenates ``batch["z_<name>"]`` for each name in
+        ``input_concat_cfg.cond_latents`` along the channel axis. The result
+        has shape ``(B, sum_channels, h, w, d)`` and is concatenated to ``x_t``
+        in :meth:`_trunk_forward` to form the trunk's first-conv input.
+        """
+        if not self._input_concat_enabled:
+            return None
+        if not self._input_concat_cond_latents:
+            return None
+        pieces: list[torch.Tensor] = []
+        for name in self._input_concat_cond_latents:
+            key = f"z_{name}"
+            if key not in batch:
+                raise KeyError(
+                    f"input_concat_cfg requested latent '{name}' but batch is missing key '{key}'"
+                )
+            pieces.append(batch[key])
+        return torch.cat(pieces, dim=1)
 
     # ------------------------------------------------------------------
     # Classifier-free-guidance dropout helper.
@@ -503,6 +595,10 @@ class FMLightningModule(pl.LightningModule):
         directly — byte-identical to the legacy path. Logs
         ``train/cfg_dropout_active_frac`` as a per-step Bernoulli observation.
         """
+        # Variant A: no ConditioningAssembler — return None and let the
+        # caller pass that through to _trunk_forward, which skips CN.
+        if self.conditioning is None:
+            return None  # type: ignore[return-value]
         if self.conditioning_dropout_p <= 0.0:
             return self.conditioning(batch)
 
@@ -549,12 +645,22 @@ class FMLightningModule(pl.LightningModule):
         # conditioning keys). ``conditioning_dropout_p == 0`` is the legacy path
         # — a single ``self.conditioning(batch)`` call. See doc CHANGE 3.
         cond_orig = self._build_conditioning_with_cfg_dropout(batch, B, device)
+        # S1 v3: when input_concat is enabled, build the channel-concat tensor
+        # once and reuse for both the v_orig and v_perturb passes (its content
+        # is identical across CFG-dropout choices).
+        latents_concat = self._build_trunk_input_latents_concat(batch)
         v_orig = self._trunk_forward(
-            self.controlnet, x_t, timesteps, cond_orig, class_labels, spacing
+            self.controlnet,
+            x_t,
+            timesteps,
+            cond_orig,
+            class_labels,
+            spacing,
+            latents_concat=latents_concat,
         )
 
         v_perturb: torch.Tensor | None = None
-        if self.composite.requires_perturbed_pass:
+        if self.composite.requires_perturbed_pass and self.conditioning is not None:
             cond_perturb = self.conditioning(batch, perturb_keys=self.perturb_keys)
             v_perturb = self._trunk_forward(
                 self.controlnet,
@@ -563,6 +669,7 @@ class FMLightningModule(pl.LightningModule):
                 cond_perturb,
                 class_labels,
                 spacing,
+                latents_concat=latents_concat,
             )
 
         m_wt = batch.get("m_wt")
@@ -572,6 +679,7 @@ class FMLightningModule(pl.LightningModule):
             else None
         )
         m_brain = batch.get("m_brain")
+        m_tumor = batch.get("m_tumor")
         inputs = LossInputs(
             x_clean=x1,
             noise=x0,
@@ -583,6 +691,7 @@ class FMLightningModule(pl.LightningModule):
             m_wt=m_wt,
             m_bg=m_bg,
             m_brain=m_brain,
+            m_tumor=m_tumor,
         )
         total_steps = self._estimated_total_steps()
         total, per_term = self.composite(
@@ -664,6 +773,13 @@ class FMLightningModule(pl.LightningModule):
                 lpl_scalar, lpl_break = self.lpl_loss(phi_pred, phi_tgt, m_wt, m_brain, t_dn)
                 total = total + lam_active * lpl_scalar
                 per_term["lpl"] = lpl_scalar.detach()
+                # CSV-monitor parity (LPL FIX 2026-06-20):
+                # ``CompositeLoss.forward`` writes ``per_term["total"]`` at
+                # ``losses/base.py:167`` *before* the LPL term is added to the
+                # local ``total`` above, so the per-step CSV column ``total``
+                # equals cfm even when LPL is active. Refresh it here so the
+                # CSV matches the value that goes to ``loss.backward()``.
+                per_term["total"] = total.detach()
                 # Overwrite the per-term breakdown with real values now that we
                 # made it past the partial decode.
                 for k, v in lpl_break.items():
@@ -763,7 +879,39 @@ class FMLightningModule(pl.LightningModule):
         # checkpoint monitor (ema_best) selects on this when in-process
         # validation is offloaded to the async second-GPU job. Distinct name so
         # the per-step ``train/total`` key the train CSV reads is not renamed.
-        self.log("train/total_epoch", total, on_step=False, on_epoch=True, batch_size=B)
+        #
+        # LPL FIX 2026-06-20: during S3 warmup the schedule ramps
+        # ``lam_active`` from 0 to ``lambda_max`` over ``warmup_epochs``,
+        # which makes the *live* ``total`` grow monotonically purely from
+        # the weight schedule — not from loss-quality degradation. With
+        # ``EarlyStopping(monitor="train/total_epoch", mode="min")`` and
+        # ``patience == warmup_epochs`` this kills training at exactly the
+        # post-warmup epoch where LPL would start to teach. Project the
+        # monitor onto the steady-state lambda_max so EarlyStopping sees
+        # the objective the run is actually minimising. S1/S2 (no LPL) is
+        # untouched: ``lpl`` is absent from ``per_term`` and the original
+        # ``total`` is logged. ``cfm_epoch`` is exported as a stable
+        # secondary signal for diagnostics and post-hoc analysis.
+        monitor_total = total
+        lpl_val = per_term.get("lpl")
+        cfm_val = per_term.get("cfm")
+        if (
+            self.lpl_loss is not None
+            and self.lpl_config is not None
+            and isinstance(lpl_val, torch.Tensor)
+            and torch.is_tensor(cfm_val)
+            and torch.isfinite(lpl_val).all()
+        ):
+            schedule = getattr(self.lpl_config, "schedule", None)
+            lam_max = (
+                float(getattr(schedule, "lambda_max", lam_active))
+                if schedule is not None
+                else float(lam_active)
+            )
+            monitor_total = cfm_val + lam_max * lpl_val
+        self.log("train/total_epoch", monitor_total, on_step=False, on_epoch=True, batch_size=B)
+        if torch.is_tensor(cfm_val):
+            self.log("train/cfm_epoch", cfm_val, on_step=False, on_epoch=True, batch_size=B)
         # Sanity on the timestep sampler (should hover near T/2 for uniform).
         self.log("train/t_mean", timesteps.float().mean(), on_step=True, on_epoch=False)
         if self._step_t0 is not None:
@@ -800,16 +948,22 @@ class FMLightningModule(pl.LightningModule):
         if step <= self._last_ema_step:
             return
         self._last_ema_step = step
-        self.ema.update()
+        if self.ema is not None:
+            self.ema.update()
         if self.trunk_ema is not None:
             # Same once-per-optimiser-step gate as the ControlNet EMA above.
             self.trunk_ema.update()
-        self.log(
-            "train/ema_decay",
-            self.ema.get_current_decay(),
-            on_step=True,
-            on_epoch=False,
-        )
+        # Log the EMA decay used this step. Prefer the ControlNet EMA's value
+        # (S1 v2 default); fall back to the trunk EMA when no CN EMA exists
+        # (S1 v3 Variant A). When neither EMA exists, the log is skipped.
+        active_ema = self.ema if self.ema is not None else self.trunk_ema
+        if active_ema is not None:
+            self.log(
+                "train/ema_decay",
+                active_ema.get_current_decay(),
+                on_step=True,
+                on_epoch=False,
+            )
 
     def _estimated_total_steps(self) -> int | None:
         """Total optimiser-step budget for this run, used by weight schedules.
@@ -837,14 +991,16 @@ class FMLightningModule(pl.LightningModule):
     def _trainable_grad_norm(self) -> torch.Tensor:
         """Global L2 norm over all optimised parameters.
 
-        ControlNet always; plus the trunk when ``trunk_config.trainable`` (the
-        unfrozen-trunk ablation), so the logged norm matches the parameter set
-        the gradient clip actually acts on.
+        ControlNet (when enabled) + the trunk when ``trunk_config.trainable``
+        (the unfrozen-trunk ablation). Variant A (no ControlNet) returns the
+        trunk grad norm alone — matches the optimiser's param set.
         """
         sq_sum = torch.zeros((), device=self.device)
-        params = list(self.controlnet.parameters())
+        params: list[torch.nn.Parameter] = []
+        if self.controlnet is not None:
+            params.extend(self.controlnet.parameters())
         if self.trunk_config.trainable:
-            params += list(self.trunk.parameters())
+            params.extend(self.trunk.parameters())
         for p in params:
             if p.grad is not None:
                 sq_sum = sq_sum + p.grad.detach().float().pow(2).sum()
@@ -917,10 +1073,25 @@ class FMLightningModule(pl.LightningModule):
         When ``probe`` is given, the controlnet and trunk forwards inside each
         sampler step are wrapped in CUDA-synchronised timing sections so the
         per-component NFE timing can be reported.
+
+        Variant A (``self.controlnet is None``) has no ControlNet EMA; the
+        closure passes ``controlnet=None`` to :meth:`_trunk_forward` so the
+        sampler runs the trunk alone. ``self._val_cond`` is also None on
+        that path and ignored by ``_trunk_forward``.
         """
-        ema_cn = self.ema.ema_model if self.ema is not None else self.controlnet
-        ema_cn.eval()
+        if self.controlnet is not None:
+            ema_cn: torch.nn.Module | None = (
+                self.ema.ema_model if self.ema is not None else self.controlnet
+            )
+            ema_cn.eval()  # type: ignore[union-attr]
+        else:
+            ema_cn = None
         ema_trunk = self._ema_trunk()
+        # S1 v3: rebuild the channel-concat tensor for the trunk input
+        # closure-side. Validation conditioning is set by
+        # ``compute_val_conditioning``; for the latents-concat path we read
+        # the saved cache populated in the same call.
+        latents_concat = getattr(self, "_val_latents_concat", None)
 
         def model_call(x_t: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
             B = x_t.shape[0]
@@ -929,7 +1100,15 @@ class FMLightningModule(pl.LightningModule):
             spacing = self.trunk_config.make_spacing_tensor(B, device)
             cond = self._val_cond  # set by validation_step before calling sampler
             return self._trunk_forward(
-                ema_cn, x_t, timesteps, cond, class_labels, spacing, probe=probe, trunk=ema_trunk
+                ema_cn,
+                x_t,
+                timesteps,
+                cond,
+                class_labels,
+                spacing,
+                probe=probe,
+                trunk=ema_trunk,
+                latents_concat=latents_concat,
             )
 
         return model_call
@@ -946,15 +1125,26 @@ class FMLightningModule(pl.LightningModule):
             return shadow
         return self.trunk
 
-    def compute_val_conditioning(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def compute_val_conditioning(self, batch: dict[str, torch.Tensor]) -> torch.Tensor | None:
         """Build the validation conditioning tensor for ``batch`` and stash it.
 
         Called from ``validation_step`` and from the external exhaustive-val
         engine. The result is also written to ``self._val_cond`` so the closure
         returned by :meth:`_make_ema_call` reads the same conditioning across
         every NFE in the sweep.
+
+        S1 v3 also caches the channel-concat latents tensor in
+        ``self._val_latents_concat`` so the EMA-call closure can reproduce the
+        same trunk input at every NFE.
+
+        Variant A (``self.conditioning is None``) returns ``None`` for the
+        ControlNet conditioning and only populates the latents-concat cache.
         """
-        self._val_cond = self.conditioning(batch)
+        if self.conditioning is not None:
+            self._val_cond = self.conditioning(batch)
+        else:
+            self._val_cond = None  # type: ignore[assignment]
+        self._val_latents_concat = self._build_trunk_input_latents_concat(batch)
         return self._val_cond
 
     def _which_nfes(self, epoch: int) -> list[int]:
@@ -1367,7 +1557,13 @@ class FMLightningModule(pl.LightningModule):
         # standard HuggingFace PEFT recipe; otherwise the adapters decay too
         # fast and cancel the gains from joint trunk fine-tuning. ControlNet
         # + non-LoRA trainable params keep the standard weight_decay.).
-        cn_params = [p for p in self.controlnet.parameters() if p.requires_grad]
+        # Variant A (controlnet disabled): no CN params; the trunk
+        # parameters carry the optimisation budget alone.
+        cn_params: list[torch.nn.Parameter] = (
+            [p for p in self.controlnet.parameters() if p.requires_grad]
+            if self.controlnet is not None
+            else []
+        )
         trunk_params: list[torch.nn.Parameter] = []
         if self.trunk_config.trainable:
             trunk_params = [p for p in self.trunk.parameters() if p.requires_grad]

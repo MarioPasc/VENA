@@ -94,7 +94,17 @@ proposal wins.
     and the exhaustive job sample via the module's `_make_ema_call()` closure so
     EMA sampling is identical to training. NFE timing uses
     `inference/timing.py::NFETimingProbe` (CUDA-synced `section()` contexts);
-    drop the first sampler step as warm-up when `nfe > 1`.
+    drop the first sampler step as warm-up when `nfe > 1`. **Load-bearing
+    pitfall (2026-06-20):** when the scheduler runs with
+    `use_timestep_transform=True`, MONAI's `set_timesteps` requires
+    `input_img_size_numel` to be passed through or `timestep_transform` divides
+    `None / int` and every per-patient exhaustive-val pass silently fails with
+    a WARNING (the empty `metrics.csv` trap in
+    `.claude/skills/server3/SKILL.md`). The patched
+    `routines/fm/exhaustive_val/engine.py` sampler construction reads
+    `cfg.rflow.base_img_size_numel` and falls back to `48*56*48` (VENA's
+    brain-box latent). Any new sampler that wraps `RFlowScheduler` must plumb
+    the same kwarg through.
 13. **Region masks via GPU ops, never CPU loops.** `metrics/regions.py` derives
     `wt_dilated` with `F.max_pool3d` (stride 1, `padding=k//2`) — exact binary
     dilation for an all-ones element, no NumPy/CPU round-trip. New region
@@ -130,13 +140,28 @@ proposal wins.
     (schema-versioned, per `h5-design-principles.md`), and `figure_{best,worst}.png`
     (best/worst patient by mean SSIM across NFE). A `gpu_usage.log` records both
     devices' memory at each launch (overlap evidence).
+18a. **Comparison-figure conventions (2026-06-20 global overhaul, applies to
+     every regime that uses `exhaustive_val`):** `render_comparison_figure` in
+     `vena.model.fm.eval.exhaustive` produces a black-background panel with one
+     row per NFE sorted by SSIM **descending** (best-quality synthesis
+     immediately below the real T1c row). Each NFE row's ylabel carries
+     `NFE=N (t=...s) / SSIM=... / PSNR=... dB` derived from a per-(patient, NFE)
+     index built from `metric_rows` in the engine. The suptitle is bare
+     `"<TAG> — <patient>"` — no aggregate SSIM. Each column anchors the synth
+     `imshow(vmin, vmax)` to the **real slice's** per-slice `(min, max)` so
+     pixels are visually comparable against the same reference window
+     (constant-real-slice fallback `[0, 1]`). Don't reintroduce the `mean_ssim`
+     kwarg — the unit test `test_render_figure_signature_dropped_mean_ssim`
+     guards against it.
 
 ## Frozen weights & adapters
 
 19. **Never edit `src/external/*` and never write to checkpoint paths**
     (`external-deps.md`). Adapters wrap the frozen MAISI VAE / trunk in
     `src/vena/model/fm/` (e.g. the ControlNet built around the frozen trunk via
-    `init_from_trunk` + zero-init output projections). Log the resolved checkpoint
+    `init_from_trunk` + zero-init output projections, then scale-ramped to ~1
+    over `output_scale_ramp.ramp_steps` via `OutputScaleRampCallback` — see
+    `CLAUDE.md::S1 v2 baseline recipe`). Log the resolved checkpoint
     SHA-256 at first load.
 
 ## Cross-cutting helpers (mandatory imports)
@@ -161,6 +186,31 @@ proposal wins.
 24. **Aggregation helpers** (`_finite_mean`, `_finite_std` in `module.py`) are
     module-level. Do not redefine inside `collapse_*` loops (per
     `coding-standards.md` rule 16).
+
+## ControlNet scale-ramp + conditioning assembler
+
+22a. **`MaisiControlNet.output_scale` is the canonical post-zero-init lever.**
+     The buffer is non-persistent (`persistent=False`); the ramp formula is a
+     pure function of `trainer.global_step`, so on resume the
+     `OutputScaleRampCallback` recomputes the correct value at the first batch
+     and the buffer state does not need to round-trip through `last.ckpt`. The
+     scalar is multiplied into every element of `down_block_res_samples` and
+     into `mid_block_res_sample` **inside `MaisiControlNet.forward`** —
+     upstream of the `maisi/grad_safe.py` out-of-place residual-add patch — so
+     gradient checkpointing and the trainable-trunk path are byte-identical
+     when `output_scale == 1.0`.
+22b. **Downsampler `out_channels` contract** (2026-06-20).
+     `AbstractDownsampler.out_channels` returns `None` by default ("same as
+     input — kind-based default applies"). Channel-lifting operators
+     (currently `LiftTo4ChDownsampler`; future SPADE-style modulators)
+     override the property with a concrete `int`. The assembler's
+     `channels_per_spec` consults this and never assumes a fixed mask channel
+     count. New downsamplers that lift channels MUST override `out_channels`
+     or the assembler underestimates `total_channels` silently and the
+     ControlNet's first conv is built with the wrong `in_channels`. The
+     `mask:wt:zero_out` operator (used by S1 to drop mask conditioning while
+     preserving the channel slot for S2/S3 warm-start) is stateless: it
+     returns `out_channels=None` and the slot stays at `mask_channels=1`.
 
 ## Testing
 

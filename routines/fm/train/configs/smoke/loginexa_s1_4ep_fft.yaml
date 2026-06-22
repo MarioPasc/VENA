@@ -16,6 +16,9 @@
 
 run:
   stage: s1
+  # Required by ``_RunCfg`` schema; mirrors the production recipe tag so the
+  # smoke exercises the same run_id format the engine emits on Picasso.
+  tag: fft_cfm
   resume_from: null
   seed: 1337
   device: cuda
@@ -39,8 +42,9 @@ data:
   # epoch-end hook (including exhaustive_val). Empirically N=20 fits ≈30 min
   # (over budget); N=10 fits ≈15-18 min wallclock.
   max_train_patients_per_cohort: 10
-  augmentation_config_path: routines/fm/train/configs/augmentations/equivariant_v1.yaml
-  preflight_decision_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/latent_aug_equivariance/LATEST/decision.json
+  # Online augmentation disabled — see production YAML comment.
+  augmentation_config_path: null
+  preflight_decision_path: null
   dedup_decisions_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
   use_offline_augmented_data: true
   variant_weights:
@@ -64,21 +68,30 @@ model:
       - latent:t1pre
       - latent:t2
       - latent:flair
-      - mask:wt:identity
+      # S1 v2: WT-mask slot reserved-but-zero. See production YAML.
+      - mask:wt:zero_out
     arch_overrides: {}
     perturb_keys: []
+    output_scale_ramp:
+      enabled: true
+      # 200 ≪ 5000 so the smoke's 4 epochs ≈ 360 steps actually exercise the
+      # ramp midpoint and completion (would otherwise stay near 0 the whole run).
+      ramp_steps: 200
+      steepness: 10.0
   vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
 
 loss:
   cfm:
     weight: 1.0
     reduction: mean
-    norm: l2
+    norm: l1
 
 rflow:
   num_train_timesteps: 1000
   use_discrete_timesteps: true
   sample_method: logit-normal
+  use_timestep_transform: true
+  base_img_size_numel: 129024
 
 optim:
   lr: 1.0e-4
