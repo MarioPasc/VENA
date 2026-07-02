@@ -1,0 +1,192 @@
+# Picasso — S3 LPL warm-started from S1 v3b_rw (full v3 recipe: concat + CN3ch + RW), STANDARD LPL.
+#
+# Ablation row S3-C (PRIMARY) of the 2026-06-28 S3-on-top-of-v3 tournament.
+#
+# Sibling docs (see picasso_s3_v3a_k5_standard_fft.yaml header).
+#
+# Primary question: does S3 LPL improve the strongest S1 winner?
+# v3b_rw S1 endpoint (WIP @ ep ~975, impl-note): UCSF PSNR_ET = 17.30 dB,
+# avg across 9 cohorts ~+1.3 dB over v3b. Adding LPL on top should refine
+# the high-SNR, foreground decoder features without disturbing the CFM
+# region-weighted convergence (CFM-RW upweights WT, LPL standard treats
+# WT/notWT equally — directions are not opposed).
+#
+# WARM_START source (Picasso absolute path):
+#   /mnt/home/.../2026-06-22_15-20-57_s1_v3b_rw_concat_plus_cn3ch_fft_320b5ddd/checkpoints/ema_best.ckpt
+# The v3b_rw S1 run dir is intact on Picasso; local rsync is still in flight
+# but is not a blocker — the S3 job reads directly from the Picasso path.
+
+run:
+  stage: s3
+  tag: v3b_rw_lpl_k5_standard_fft_s1warm
+  resume_from: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/2026-06-22_15-20-57_s1_v3b_rw_concat_plus_cn3ch_fft_320b5ddd/checkpoints/ema_best.ckpt
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
+
+data:
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  batch_size: 2
+  num_workers: 8
+  pin_memory: true
+  tau: 0.5
+  dedup_decisions_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
+  use_offline_augmented_data: true
+  variant_weights:
+    v0: 0.2
+    v1: 0.2
+    v2: 0.2
+    v3: 0.2
+    v4: 0.2
+  decoder_lpl_decision_path: /mnt/home/users/tic_163_uma/mpascual/execs/vena/artifacts/preflights/decoder_lpl_profile/LATEST/decision.json
+
+model:
+  trunk:
+    # Copy v3b_rw model.trunk verbatim (identical to v3b).
+    checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides:
+      in_channels: 16
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+    trainable: true
+    regime: fft
+    input_concat:
+      enabled: true
+      cond_latents: [t1pre, t2, flair]
+      cond_masks: []
+      zero_init_new_channels: true
+      ramp_steps: 0
+      ramp_steepness: 10.0
+  controlnet:
+    # Copy v3b_rw model.controlnet verbatim (CN on 3-channel [NETC, ED, ET] soft mask).
+    enabled: true
+    init_from_trunk: false
+    conditioning_inputs:
+      - mask:netc:identity
+      - mask:ed:identity
+      - mask:et:identity
+    arch_overrides: {}
+    perturb_keys: []
+    output_scale_ramp:
+      # CN output_scale already saturated at 1.0 by S1 end; disable the ramp
+      # at S3 so the buffer holds at default 1.0 (see S3-B sibling).
+      enabled: false
+      ramp_steps: 5000
+      steepness: 10.0
+  vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+
+loss:
+  cfm:
+    # Match v3b_rw S1 verbatim — region-weighted L1 (reduction=none + region_weights).
+    # CFM stays region-weighted across the S1→S3 transition; the LPL adds on top.
+    weight: 1.0
+    reduction: none
+    norm: l1
+    region_weights:
+      enabled: true
+      bg: 1.0
+      brain_not_wt: 1.0
+      netc: 50.0
+      ed: 50.0
+      et: 300.0
+      wt: null                # null = use per-sub-region weights
+      threshold: 0.5
+  lpl:
+    # Standard LPL (uniform α across WT/notWT). Pair with S3-D (region α) to
+    # isolate the LPL region-weighting axis on the v3b_rw warm-start.
+    schedule:
+      kind: linear
+      warmup_epochs: 30
+      lambda_min: 0.0
+      lambda_max: 1.0
+    alpha_override:
+      wt: 1.0
+      notwt: 1.0
+    A_override: [2, 5]
+    w_l_override:
+      2: 1.0
+      5: 2.0
+    outlier_k_override:
+      2: 5.0
+      5: 5.0
+    soft_region: false
+    grad_checkpoint_segments: 4
+
+rflow:
+  num_train_timesteps: 1000
+  use_discrete_timesteps: true
+  sample_method: logit-normal
+  use_timestep_transform: true
+  base_img_size_numel: 129024
+
+optim:
+  lr: 5.0e-5
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  warmup_steps: 500
+  scheduler: cosine
+
+ema:
+  decay: 0.999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 41600
+  max_epochs: 200
+  batch_size: 2
+  grad_accum: 4
+  checkpoint_every_epochs: 25
+  log_train_every_steps: 100
+  best_metric_name: mse_latent
+  best_metric_region: bg
+  best_metric_nfe: 5
+  gradient_clip_val: 1.0
+  patience: 30
+
+validation:
+  every_epochs: 0
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 999999
+  sweep_nfes: [1, 2, 5, 10, 20]
+  qualitative_every_epochs: 999999
+  image_metrics: false
+
+exhaustive_val:
+  enabled: true
+  every_epochs: 25
+  n_patients: 10
+  nfe_levels: [1, 5, 20]
+  integrator: euler
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  device: cuda:1
+  python_executable: /mnt/home/users/tic_163_uma/mpascual/fscratch/conda_envs/vena/bin/python
+  block_until_complete: true
+  figure_top_k: 5
+  export_per_block_figures: false
+
+output:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments
+  retention_n_checkpoints: 3
+  tensorboard: false
+  wandb: false
+
+regions:
+  brain:
+    source: latents_h5
+  wt:
+    source: derived_from_tumor_latent
+    threshold: 0.5
+  wt_dilated:
+    source: derived_via_scipy_binary_dilation
+    structure: ones_3x3x3
+  bg:
+    source: derived
+  vessel:
+    source: skipped

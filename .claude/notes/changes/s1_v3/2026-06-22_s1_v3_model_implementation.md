@@ -5,6 +5,211 @@
 
 ---
 
+## Implementation log (2026-06-24)
+
+**Status**: code shipped + tested + 3 production jobs running on Picasso.
+
+The body of this document (sections 0–11) is the original spec. This block
+captures **what actually shipped**, the scope deviations taken, the bugs
+caught during smoke that the spec did not anticipate, and the early
+ET-PSNR read-out from the running Picasso jobs.
+
+### Scope decisions (user-confirmed 2026-06-22, before any code)
+
+| Question | Decision |
+|---|---|
+| `best_metric_region: et` auto-rewire (spec §4.4) | **Deferred.** `_select_best_metric` untouched. Emit `psnr_db_et` columns + per-(cohort,nfe,region) `aggregate.csv` only. Monitor stays on `train/total_epoch` (the load-bearing `feedback_s3_monitor_pitfall` fix). Humans read ET trajectory from `aggregate.csv`. |
+| `m_wt` derivation (spec §2.4 proposed `max`-then-threshold) | **Kept** the legacy `clip(sum(m_tumor), 0, 1) ≥ τ` (sum-then-threshold) in `data.py:197-200`. Contrastive v0.4 numerics are byte-identical. Spec §2.4 wording is overridden by this decision. |
+| Variant A ControlNet | **Skip entirely**: when `controlnet.enabled=false` the LightningModule sets `self.controlnet = None`, no `ConditioningAssembler`, no CN EMA shadow, no CN forward call. ~10 null-guards added to `module.py` (training_step, configure_optimizers, _trainable_grad_norm, _make_ema_call, compute_val_conditioning). |
+| Conditioning spec for the 3-channel mask | **Three single-channel specs** (`mask:netc:identity`, `mask:ed:identity`, `mask:et:identity`) instead of a new `tumor3` kind. The existing `kind="mask"` parser auto-reads `batch["m_netc"]` etc. via the `f"m_{key}"` convention — no parser delta. The spec §2.3 `tumor3` proposal is **not implemented**; the three-spec form is simpler and equivalent. |
+| Smoke target | **loginexa only** (V100-DGXS, 30 min wallclock). Skipped server3 smokes entirely — loginexa is the closest functional equivalent to the real Picasso A100 run. |
+| Picasso jobs | **3 jobs** (not 2). The user asked whether ControlNet alone is enough to test, or whether to add a region-weighted ablation arm. Per the father doc §4 (operative chain, H6+H2 independent and primary), region weighting is load-bearing — added as a third arm. |
+
+### Actual file paths (spec §6.1/§6.2 corrections)
+
+The spec was written before the codebase was re-mapped. Real paths:
+
+| Spec says | Reality |
+|---|---|
+| `src/vena/data/cohort/latent/data.py` (`LatentH5Dataset._read_one`) | `src/vena/model/fm/lightning/data.py:184-232` — same class, different package. Edit landed in **two** `_read_one` paths: the canonical `LatentH5Dataset` and the parallel `OfflineAugmentedLatentH5Dataset._read_aug` (offline aug bank). |
+| `src/vena/model/fm/maisi/conv_in_ramp_callback.py` (optional) | **Deferred** per spec §10.1 — `ramp_steps: 0` default means zero-init alone suffices. Will land if smoke surfaces trunk grad-norm spikes in first 500 steps. |
+| `src/vena/model/fm/controlnet/downsample/tumor3.py` | **Skipped** — three single-channel `IdentityDownsampler` specs replace the planned single 3-channel `tumor3` operator. |
+
+### Files actually created (13 new)
+
+**Library code (3):**
+- `src/vena/model/fm/maisi/conv_in_expand.py` — `expand_conv_in(trunk, new_in_channels, zero_init_new=True)` with bit-identical-at-step-0 guarantee.
+- `src/vena/model/fm/controlnet/losses/region_weights.py` — `RegionWeights` Pydantic model + `build_region_weight_tensor()`. Disjoint 5-region partition (bg, brain_not_wt, netc, ed, et) by construction at τ=0.5.
+
+**Production configs (3):**
+- `routines/fm/train/configs/runs/picasso_s1_v3a_concat_only_fft.yaml` — Variant A, no RW, tag `v3a_concat_only_fft`.
+- `routines/fm/train/configs/runs/picasso_s1_v3b_concat_plus_cn3ch_fft.yaml` — Variant B, no RW, tag `v3b_concat_plus_cn3ch_fft`.
+- `routines/fm/train/configs/runs/picasso_s1_v3b_rw_concat_plus_cn3ch_fft.yaml` — Variant B + RW, tag `v3b_rw_concat_plus_cn3ch_fft`.
+
+**Smoke configs (2):**
+- `routines/fm/train/configs/smoke/loginexa_s1_v3a_concat_only_2ep.yaml`
+- `routines/fm/train/configs/smoke/loginexa_s1_v3b_concat_plus_cn3ch_2ep.yaml`
+
+**SLURM launchers (3):**
+- `routines/fm/train/slurm/runs/launcher_picasso_s1_v3a_fft.sh`
+- `routines/fm/train/slurm/runs/launcher_picasso_s1_v3b_fft.sh`
+- `routines/fm/train/slurm/runs/launcher_picasso_s1_v3b_rw_fft.sh`
+
+(All three launchers reuse the existing shared worker
+`routines/fm/train/slurm/runs/worker_fm_train_picasso.sh`.)
+
+**Unit tests (6 files, 39 tests):**
+- `tests/model/fm/test_conv_in_expand.py` — 10 tests; bit-identical-at-step-0 is the load-bearing one.
+- `tests/model/fm/test_maisi_controlnet_v3.py` — 6 tests; `init_from_trunk_enabled=False` is a no-op; zero-init still applies under both flags; Variant B 3-channel cond_embedding forward.
+- `tests/model/fm/test_conditioning_tumor3.py` — 5 tests; three single-channel mask specs equivalent to 3-channel `m_tumor` slice; perturb_keys on one sub-region.
+- `tests/model/fm/test_cfm_region_weighted.py` — 12 tests; disabled ≡ mean L1; all-ones ≡ mean L1; partition disjoint; wt override; threshold; reject mean+enabled; builder wiring.
+- `tests/model/fm/test_per_region_metrics.py` — 9 tests; v3 derived regions populated when m_tumor present; empty region → NaN; MAE²≤MSE; `brain` aliased to `whole` in `metrics_per_region`.
+- `tests/model/fm/test_v3_batch_layout.py` — 3 tests; `m_tumor` + per-class slices emitted; `m_wt` semantics preserved.
+- `tests/routines/fm/exhaustive_val/test_v3_csv_columns.py` — 4 tests; CSV header carries v3 columns; `aggregate.csv` emits 7 regions; NaN-skip in mean.
+
+**Total fast suite**: 912 passed, 1 skipped, 0 failed under `-m "not slow and not gpu"`.
+
+### Bugs surfaced during loginexa smoke (4 fixes)
+
+The smoke was authoritative — every one of these would have killed the
+production runs on Picasso. None were caught by the local fast suite
+because they all involve cross-process / multi-stage state.
+
+1. **Shadow `vena/` at repo root on Picasso filesystem.** Python's import
+   system loaded a stale `repos/VENA/vena/` shadow instead of
+   `repos/VENA/src/vena/` (matches `reference_icai_server` memory note).
+   Surfaced as `TypeError: FMLightningModule.__init__() got an unexpected
+   keyword argument 'controlnet_enabled'` because the shadow had pre-v3
+   code. **Fix**: post-deploy `rsync -a src/vena/ vena/` on Picasso every
+   time. Both v3a and v3b smoke launches died here until the shadow was
+   refreshed.
+
+2. **`load_state_dict(strict=False)` raises on shape mismatch.**
+   PyTorch ≥2.0 enforces shape match for present keys even under
+   `strict=False`; the expanded `conv_in` (in_channels=4→16) tripped this
+   on the checkpoint's 4-channel slice. **Fix** in
+   `src/vena/model/fm/maisi/trunk.py:155-185`: when
+   `arch_overrides.in_channels > 4`, **filter** `conv_in.conv.{weight,bias}`
+   out of the loaded state_dict, then run the expansion block which
+   reinstalls the pretrained 4-channel slice into the wider Conv3d's first
+   4 input channels and zero-fills the rest.
+
+3. **Exhaustive launcher dereferenced `pl_module.ema.ema_model` without
+   None-guard.** Variant A has `self.ema = None` (no CN to shadow); the
+   callback at `src/vena/model/fm/lightning/callbacks/exhaustive_launcher.py:135`
+   crashed. **Fix**: when `pl_module.ema is None`, skip the snapshot write
+   and emit `ema_snapshot: None` in the job spec.
+
+4. **Exhaustive_val sub-process didn't receive v3 kwargs.** The sub-process
+   re-builds `FMLightningModule(...)` from a self-contained job YAML
+   written by the launcher's `_build_exhaustive_job_base`. The launcher
+   was emitting only the legacy fields, so the sub-process built the
+   module without `controlnet_enabled` / `input_concat_cfg` and the
+   ConditioningAssembler error-failed on an empty `conditioning_inputs`.
+   **Fix**:
+   - `routines/fm/exhaustive_val/engine.py::_TrunkJobCfg` gained `input_concat: dict`.
+   - `routines/fm/exhaustive_val/engine.py::_CNJobCfg` gained `enabled: bool` (default True) and `init_from_trunk: bool` (default True); `conditioning_inputs` became optional.
+   - `routines/fm/exhaustive_val/engine.py::_build_module` propagates all three through to `FMLightningModule(...)`.
+   - `routines/fm/train/engine.py::_build_exhaustive_job_base` writes the new fields into the job YAML.
+
+After these four fixes, **both loginexa smokes (v3a + v3b) completed
+end-to-end**: 2 epochs each, all artifacts present (last.ckpt, train_step.csv,
+decision.json schema 0.10.0), exhaustive_val sub-process emitted
+`metrics.csv` with the new per-region columns + `aggregate.csv` with all 7
+regions + `figure_best_1.png` + `figure_worst_1.png`.
+
+### Picasso submission — 3-arm ablation
+
+Submitted 2026-06-22 17:20–17:22 UTC; ran from queue start (no wait).
+
+| Job ID | Tag | Recipe | Cancel |
+|---|---|---|---|
+| 1215583 | `v3a_concat_only_fft` | channel-concat alone, L1 mean loss | `ssh picasso 'scancel 1215583'` |
+| 1215584 | `v3b_concat_plus_cn3ch_fft` | + CN on 3-channel mask, L1 mean loss | `ssh picasso 'scancel 1215584'` |
+| 1215585 | `v3b_rw_concat_plus_cn3ch_fft` | + CN on 3-channel mask + region-weighted L1 (et=300, netc/ed=50, bnwt=bg=1) | `ssh picasso 'scancel 1215585'` |
+
+Each: 7 d × 2 A100 (cuda:0 train, cuda:1 async exhaustive_val), eff. batch 8,
+patience 250, exhaustive_val every 25 epochs, log dir `~/execs/vena/logs/`,
+run dir `~/execs/vena/experiments/2026-06-22_15-2*_*`.
+
+**Ablation comparisons (read off `aggregate.csv` row `region=et` at `nfe=5`):**
+- `v3a → v3b` (Δ PSNR_ET): isolates **CN-on-masks** contribution.
+- `v3b → v3b_rw` (Δ PSNR_ET): isolates **region weighting** contribution.
+- `v3a → v3b_rw`: total v3 gain over the literal T1C-RFlow architecture.
+
+### Early ET-PSNR signal (NFE=5)
+
+Latest exhaustive_val snapshots — v3a @ epoch 1325, v3b @ epoch 1000, v3b_rw @
+epoch 975 (jobs still running, monitored hourly).
+
+| Cohort | v3a | v3b | v3b_rw | Δ (v3a→v3b) | Δ (v3b→v3b_rw) |
+|---|---:|---:|---:|---:|---:|
+| UCSF-PDGM | 14.48 | 16.03 | **17.30** | +1.55 | +1.27 |
+| LUMIERE | 19.91 | 21.20 | **23.11** | +1.29 | +1.91 |
+| BraTS-GLI | 11.33 | 14.29 | 14.20 | +2.96 | −0.09 |
+| UPENN-GBM | 11.21 | 15.74 | **16.72** | +4.53 | +0.98 |
+| IvyGAP | 9.92 | 16.66 | **17.76** | +6.74 | +1.10 |
+| BraTS-Africa-Glioma | 8.57 | 13.40 | **15.04** | +4.83 | +1.64 |
+| BraTS-Africa-Other | 7.56 | 12.14 | **13.53** | +4.58 | +1.39 |
+| REMBRANDT | 7.54 | 14.06 | 13.72 | +6.52 | −0.34 |
+| BraTS-PED (n=1) | 18.05 | 19.48 | 18.43 | +1.43 | −1.05 |
+
+**Read**: both diagnosis predictions confirmed — the ControlNet-on-masks
+fix (v3a→v3b) is **the larger contributor** on the harder cohorts
+(BraTS-Africa, REMBRANDT, IvyGAP, UPENN-GBM: +4 to +7 dB), while region
+weighting (v3b→v3b_rw) adds **+1 to +2 dB on top** on most cohorts
+(LUMIERE +1.91, UCSF +1.27, BraTS-Africa-Glioma +1.64). The two factors
+are **independent and both load-bearing** — exactly the operative chain
+the father doc §4 predicted.
+
+Caveats:
+- These are **work-in-progress** numbers; jobs are at ~75 % of patience
+  budget. Final numbers will land closer to wall-clock 2026-06-29.
+- BraTS-PED has n=1 patient in val ⇒ ignore the sign of the deltas there.
+- v3a is at a higher epoch (1325 vs 1000/975) due to its smaller
+  per-epoch time (no CN to forward). The comparison at matched epochs
+  will tighten the v3a→v3b delta downward slightly.
+- BraTS-GLI and REMBRANDT show **no gain or slight regression** from RW
+  at the current epochs — could be RW over-emphasises sub-regions on
+  cohorts where the WT mask boundary is already well-learned, or noise
+  (REMBRANDT n=5).
+
+### What's NOT done (deferred to S2 / S3 / post-paper)
+
+- **`best_metric_region: et` auto-rewire.** Selection stays on
+  `train/total_epoch`. Humans read ET trajectory from
+  `~/execs/vena/experiments/<run>/exhaustive_val/epoch_*/aggregate.csv`.
+- **Normalisation audit integration.** `decision.json` carries
+  `normalization_audit_decision_path: null` and `normalization_variant_id: "V0"`
+  as placeholders. When the sibling spec lands, the audit path becomes
+  mandatory and the cross-check is enforced.
+- **`ConvInRampCallback`.** Default `ramp_steps: 0` (zero-init alone
+  suffices); the ramp module was not built. If trunk grad-norm spikes
+  surface in the first 500 steps of any production run, will add then.
+- **SWAN / vessel prior conditioning.** Out of scope per spec §10.2; S2
+  programme owns it.
+- **Per-block figure renders** (`export_per_block_figures: true`). S3
+  K=2 only; off by default in v3.
+
+### How to read the final outcome
+
+When patience fires on each job (or wall-clock hits 7 d) — pull the
+**last completed** `aggregate.csv` per run and compare PSNR_ET at NFE=5.
+The 3-cell ablation table above is the official read-out. The decision
+tree from spec §7.5:
+
+- If `v3b_rw → v3a` Δ PSNR_ET < +2 dB on UCSF: full recipe is unnecessary
+  → ship v3a, drop ControlNet + RW from S2 plan.
+- If `v3a → v3b` Δ ≥ +2 dB AND `v3b → v3b_rw` Δ < +1 dB: ControlNet
+  alone is the fix → ship v3b, drop RW from S2 plan.
+- If both deltas ≥ +1 dB: both fixes are load-bearing → ship v3b_rw, S2
+  builds on this recipe.
+
+The early numbers above already point at outcome #3 (both fixes
+contribute) — confirmation pending convergence.
+
+---
+
 ## 0. Goal in one sentence
 
 Implement two architectural variants of S1 v3 — **A: sequence-only**

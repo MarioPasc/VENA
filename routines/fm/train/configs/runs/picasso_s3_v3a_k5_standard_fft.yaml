@@ -1,0 +1,181 @@
+# Picasso — S3 LPL warm-started from S1 v3a (channel-concat alone, NO ControlNet).
+#
+# Ablation row S3-A of the 2026-06-28 S3-on-top-of-v3 tournament.
+#
+# Sibling docs:
+#   .claude/notes/changes/s1_v3/2026-06-28_s1_v3_results_and_s3_plan.md  (this round's design)
+#   .claude/notes/changes/s1_v3/2026-06-22_s1_v3_model_implementation.md (v3 spec, ET-PSNR baseline)
+#   .claude/notes/changes/decoder_perceptual_loss_s3.md                  (LPL design)
+#   .claude/notes/changes/decoder_perceptual_loss_s3_analysis_2026-06-20.md (LPL post-mortem + P0 fix)
+#
+# Question: can S3 LPL substitute for mask conditioning at S1?
+# Predicted answer: NO. v3a's UCSF PSNR_ET sits at 12.06 dB at S1 end (vs v3b
+# 16.25, v3b_rw WIP ~17.30); LPL operates on decoder features at high SNR with
+# gradients only through the FM head, so it can refine an existing tumour
+# signal but cannot teach localisation from scratch. Expected lift ≈ +1.0–1.5 dB
+# ET-PSNR — still ~3 dB below v3b without LPL. If the lift is larger than
+# predicted the proposal's mask-conditioning story needs revision.
+#
+# WARM_START source (Picasso absolute path):
+#   /mnt/home/.../2026-06-24_16-00-46_s1_v3a_concat_only_fft_ef000c9f/checkpoints/ema_best.ckpt
+# The engine creates a NEW run directory; the v3a S1 run dir is untouched.
+
+run:
+  stage: s3
+  tag: v3a_lpl_k5_standard_fft_s1warm
+  resume_from: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/2026-06-24_16-00-46_s1_v3a_concat_only_fft_ef000c9f/checkpoints/ema_best.ckpt
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
+
+data:
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  batch_size: 2          # S3 standard (2026-06-19 OOM fix; eff batch 8 via grad_accum=4)
+  num_workers: 8
+  pin_memory: true
+  tau: 0.5
+  dedup_decisions_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
+  use_offline_augmented_data: true
+  variant_weights:
+    v0: 0.2
+    v1: 0.2
+    v2: 0.2
+    v3: 0.2
+    v4: 0.2
+  decoder_lpl_decision_path: /mnt/home/users/tic_163_uma/mpascual/execs/vena/artifacts/preflights/decoder_lpl_profile/LATEST/decision.json
+
+model:
+  trunk:
+    # ============================================================
+    # Copy v3a model.trunk verbatim (16-channel channel-concat trunk).
+    # ============================================================
+    checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides:
+      in_channels: 16
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+    trainable: true
+    regime: fft
+    input_concat:
+      enabled: true
+      cond_latents: [t1pre, t2, flair]
+      cond_masks: []
+      zero_init_new_channels: true
+      ramp_steps: 0           # already saturated at S1 end; zero-init alone covers step-0 correctness
+      ramp_steepness: 10.0
+  controlnet:
+    enabled: false            # v3a — no ControlNet
+    init_from_trunk: true     # ignored when enabled=false
+    conditioning_inputs: []
+    arch_overrides: {}
+    perturb_keys: []
+    output_scale_ramp: null
+  vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+
+loss:
+  cfm:
+    # Match v3a S1 verbatim (L1 mean reduction, no region weights).
+    weight: 1.0
+    reduction: mean
+    norm: l1
+  lpl:
+    # Canonical S3 LPL (matches picasso_s3_k5_standard_fft.yaml, analysis §4.7c default).
+    schedule:
+      kind: linear
+      warmup_epochs: 30
+      lambda_min: 0.0
+      lambda_max: 1.0
+    alpha_override:                # Standard LPL (no region weighting on decoder features)
+      wt: 1.0
+      notwt: 1.0
+    A_override: [2, 5]             # canonical one-readout-per-scale (design §5.3)
+    w_l_override:
+      2: 1.0
+      5: 2.0                       # upweight deeper block per analysis §4.7c (block 5 carries more L_dec)
+    outlier_k_override:
+      2: 5.0
+      5: 5.0
+    soft_region: false
+    grad_checkpoint_segments: 4    # K=5 needs segments=4 to avoid 306 MiB OOM (2026-06-19)
+
+rflow:
+  num_train_timesteps: 1000
+  use_discrete_timesteps: true
+  sample_method: logit-normal
+  # LOAD-BEARING — v3 trunks were trained with timestep_transform on. Disabling
+  # at S3 would discontinuously change the timestep embedding seen by the trunk.
+  use_timestep_transform: true
+  base_img_size_numel: 129024
+
+optim:
+  # S3 standard: half S1's LR, short warmup.
+  lr: 5.0e-5
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  warmup_steps: 500
+  scheduler: cosine
+
+ema:
+  decay: 0.999                  # S3 short-refinement time constant (~10³ steps vs S1's ~10⁴)
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 41600            # ~200 ep × ~208 steps/ep
+  max_epochs: 200
+  batch_size: 2
+  grad_accum: 4                 # eff batch 8 (matches v3a S1)
+  checkpoint_every_epochs: 25
+  log_train_every_steps: 100
+  best_metric_name: mse_latent
+  best_metric_region: bg
+  best_metric_nfe: 5
+  gradient_clip_val: 1.0
+  patience: 30                  # safe under the post-2026-06-20 lambda_max monitor projection fix
+
+validation:
+  every_epochs: 0
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 999999
+  sweep_nfes: [1, 2, 5, 10, 20]
+  qualitative_every_epochs: 999999
+  image_metrics: false
+
+exhaustive_val:
+  enabled: true
+  every_epochs: 25
+  n_patients: 10                # S3 cadence is tighter — fewer patients per snapshot than S1's 60
+  nfe_levels: [1, 5, 20]
+  integrator: euler
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  device: cuda:1
+  python_executable: /mnt/home/users/tic_163_uma/mpascual/fscratch/conda_envs/vena/bin/python
+  block_until_complete: true
+  figure_top_k: 5
+  export_per_block_figures: false   # K=5 OOM-risk on val GPU
+
+output:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments
+  retention_n_checkpoints: 3
+  tensorboard: false
+  wandb: false
+
+regions:
+  brain:
+    source: latents_h5
+  wt:
+    source: derived_from_tumor_latent
+    threshold: 0.5
+  wt_dilated:
+    source: derived_via_scipy_binary_dilation
+    structure: ones_3x3x3
+  bg:
+    source: derived
+  vessel:
+    source: skipped

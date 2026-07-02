@@ -935,7 +935,13 @@ class FMLightningModule(pl.LightningModule):
         return total
 
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
-        if self.ema is None:
+        # S1 v3 Variant A (controlnet disabled) has ``self.ema is None`` but
+        # still tracks the fine-tuned trunk via ``self.trunk_ema``. Short-
+        # circuiting on ``self.ema is None`` froze the trunk EMA shadow at its
+        # init state (pretrained MAISI weights + zero-init for the conv_in
+        # expansion channels) and exhaustive_val sampled an unconditional
+        # MAISI baseline ⇒ pure noise. Gate on "no EMA at all" instead.
+        if self.ema is None and self.trunk_ema is None:
             return
         # ``on_train_batch_end`` fires once per *micro-batch*. With gradient
         # accumulation (``accumulate_grad_batches > 1``) the optimizer steps
