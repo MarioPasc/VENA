@@ -53,7 +53,7 @@ from vena.inference.h5_writer import (
 )
 from vena.inference.image_dataset import (
     harmonised_modalities_for_record,
-    resolve_test_patient_ids,
+    resolve_test_scan_patient_pairs,
 )
 
 logger = logging.getLogger(__name__)
@@ -139,6 +139,10 @@ class InferenceEngine:
     def __init__(self, cfg: InferenceJobConfig) -> None:
         self.cfg = cfg
         self.run_dir = (cfg.output_root / cfg.run_id_tag).expanduser().resolve()
+        # (cohort, scan_id) -> true CSR patient key, so each predictions-H5
+        # row records its patient for Phase-2 patient-level pooling and
+        # patient-stratified bootstrap (validation §6.4).
+        self._scan_to_patient: dict[tuple[str, str], str] = {}
 
     # ------------------------------------------------------------------ entry
 
@@ -153,17 +157,24 @@ class InferenceEngine:
         models_yaml = self._load_models_yaml()
         method_entries = self._filter_methods(models_yaml.methods)
 
-        # Resolve patient IDs per cohort up-front (smoke truncates here).
+        # Resolve (scan_id, patient_id) pairs per cohort up-front (smoke
+        # truncates here). Scan IDs drive the per-scan inference; the patient
+        # key is stashed so each predictions-H5 row records its true patient
+        # for Phase-2 patient-level pooling (validation §6.4).
         cohort_patients: dict[str, list[str]] = {}
         for c in cohorts:
-            pids = resolve_test_patient_ids(c, fold=self.cfg.fold)
+            pairs = resolve_test_scan_patient_pairs(c, fold=self.cfg.fold)
             if self.cfg.smoke.enabled:
-                pids = pids[: self.cfg.smoke.n_patients_per_cohort]
-            if not pids:
+                pairs = pairs[: self.cfg.smoke.n_patients_per_cohort]
+            if not pairs:
                 logger.warning("cohort '%s' has no resolved test patients; skipping", c.name)
                 continue
-            cohort_patients[c.name] = pids
-            logger.info("cohort '%s': %d test patients to process", c.name, len(pids))
+            for scan_id, patient_id in pairs:
+                self._scan_to_patient[(c.name, scan_id)] = patient_id
+            cohort_patients[c.name] = [scan_id for scan_id, _ in pairs]
+            logger.info(
+                "cohort '%s': %d test scans to process", c.name, len(cohort_patients[c.name])
+            )
 
         # Pre-compute reference modalities + masks once per (cohort, patient) so
         # every method's H5 row gets the same reference block byte-for-byte.
@@ -458,7 +469,8 @@ class InferenceEngine:
 
             records_by_nfe[nfe].append(
                 PerPatientRecord(
-                    patient_id=patient_id,
+                    patient_id=self._scan_to_patient.get((cohort.name, patient_id), patient_id),
+                    scan_id=patient_id,
                     cohort=cohort.name,
                     t1c_synthetic_harmonised=harmonised_np,
                     t1c_synthetic_raw=raw_np,

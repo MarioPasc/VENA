@@ -20,7 +20,9 @@ from vena.inference.h5_writer import (
 pytestmark = pytest.mark.unit
 
 
-def _make_record(pid: str, shape=(8, 8, 8), seed: int = 0) -> PerPatientRecord:
+def _make_record(
+    pid: str, shape=(8, 8, 8), seed: int = 0, scan_id: str | None = None
+) -> PerPatientRecord:
     rng = np.random.default_rng(seed)
     brain = np.zeros(shape, dtype=np.int8)
     brain[2:6, 2:6, 2:6] = 1
@@ -31,6 +33,7 @@ def _make_record(pid: str, shape=(8, 8, 8), seed: int = 0) -> PerPatientRecord:
     wt[3:5, 3:5, 3:5] = 1
     return PerPatientRecord(
         patient_id=pid,
+        scan_id=scan_id if scan_id is not None else pid,
         cohort="TEST",
         t1c_synthetic_harmonised=synth,
         t1c_synthetic_raw=raw,
@@ -118,10 +121,35 @@ def test_shape_mismatch_raises(tmp_path: Path) -> None:
         write_predictions_h5(tmp_path / "x.h5", [r1, r2], method="X", cohort="C", nfe=1, ring="A")
 
 
-def test_duplicate_patient_id_caught_by_validator(tmp_path: Path) -> None:
-    r1 = _make_record("DUP", seed=0)
-    r2 = _make_record("DUP", seed=1)
+def test_duplicate_scan_id_caught_by_validator(tmp_path: Path) -> None:
+    # Two rows with the same scan_id is a real error (one row per scan).
+    r1 = _make_record("PAT", seed=0, scan_id="DUP")
+    r2 = _make_record("PAT", seed=1, scan_id="DUP")
     path = tmp_path / "dup.h5"
     write_predictions_h5(path, [r1, r2], method="X", cohort="C", nfe=1, ring="A")
     violations = validate_predictions(path)
-    assert any("duplicates" in v for v in violations)
+    assert any("scan_id has duplicates" in v for v in violations)
+
+
+def test_repeated_patient_id_distinct_scan_ok(tmp_path: Path) -> None:
+    # Longitudinal cohort: one patient, two timepoints -> shared patient_id,
+    # distinct scan_id. Must validate cleanly (validation §6.4 grouping key).
+    r1 = _make_record("PAT", seed=0, scan_id="PAT_t0")
+    r2 = _make_record("PAT", seed=1, scan_id="PAT_t1")
+    path = tmp_path / "long.h5"
+    write_predictions_h5(path, [r1, r2], method="X", cohort="C", nfe=1, ring="A")
+    assert validate_predictions(path) == []
+
+
+def test_scan_and_patient_ids_written(tmp_path: Path) -> None:
+    records = [
+        _make_record("PAT", seed=0, scan_id="PAT_t0"),
+        _make_record("PAT", seed=1, scan_id="PAT_t1"),
+    ]
+    path = tmp_path / "prov.h5"
+    write_predictions_h5(path, records, method="X", cohort="C", nfe=1, ring="A")
+    with h5py.File(path, "r") as f:
+        sids = [b.decode() for b in f["metadata/scan_id"][:]]
+        pids = [b.decode() for b in f["metadata/patient_id"][:]]
+    assert sids == ["PAT_t0", "PAT_t1"]
+    assert pids == ["PAT", "PAT"]

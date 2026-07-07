@@ -37,7 +37,7 @@ from vena.inference.harmonisation import HARMONISATION_RECIPE
 # Anchor the _dt usage at module scope so ruff autoflake never strips the import.
 _DATETIME_MOD = _dt
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 PRODUCER = "routines.fm.inference:v0.1.0"
 
 _RTOL_RESIDUAL = 1e-5
@@ -50,9 +50,19 @@ class PredictionsH5Error(Exception):
 
 @dataclass(frozen=True)
 class PerPatientRecord:
-    """One row of the predictions H5 (one patient × one NFE)."""
+    """One row of the predictions H5 (one scan × one NFE).
+
+    ``scan_id`` is the ``/ids`` row identifier and is unique per row;
+    ``patient_id`` is the CSR patient key the scan belongs to. For a
+    longitudinal cohort (LUMIERE, BraTS-GLI) several ``scan_id`` rows
+    share one ``patient_id`` — the field Phase-2 statistics group by so a
+    longitudinal patient contributes one observation, not one per
+    timepoint (validation §6.4 patient-level pooling / patient-stratified
+    bootstrap).
+    """
 
     patient_id: str
+    scan_id: str
     cohort: str
     t1c_synthetic_harmonised: np.ndarray  # (H, W, D) float32 in [0, 1]
     t1c_synthetic_raw: np.ndarray  # (H, W, D) float32
@@ -130,8 +140,8 @@ def write_predictions_h5(
     for r in records[1:]:
         if r.shape() != shape_ref:
             raise PredictionsH5Error(
-                f"shape mismatch across records: {records[0].patient_id} "
-                f"has {shape_ref}, {r.patient_id} has {r.shape()}"
+                f"shape mismatch across records: {records[0].scan_id} "
+                f"has {shape_ref}, {r.scan_id} has {r.shape()}"
             )
 
     n = len(records)
@@ -246,6 +256,7 @@ def write_predictions_h5(
         g_meta = f.create_group("metadata")
         g_meta.attrs["description"] = "Per-scan provenance and per-volume timing."
         _vlen_str_dataset(g_meta, "patient_id", [r.patient_id for r in records])
+        _vlen_str_dataset(g_meta, "scan_id", [r.scan_id for r in records])
         _vlen_str_dataset(g_meta, "cohort", [r.cohort for r in records])
         g_meta.create_dataset(
             "inference_seconds",
@@ -333,6 +344,7 @@ def validate_predictions(path: Path | str) -> list[str]:
             "masks/wt",
             "residuals/raw",
             "metadata/patient_id",
+            "metadata/scan_id",
             "metadata/cohort",
             "metadata/inference_seconds",
             "metadata/peak_vram_mb",
@@ -362,14 +374,21 @@ def validate_predictions(path: Path | str) -> list[str]:
                 f"!= masks/brain shape {brain.shape}"
             )
 
-        # 4. patient_id uniqueness + length consistency
+        # 4. scan_id uniqueness (one row per scan) + length consistency.
+        #    patient_id may legitimately repeat for longitudinal cohorts
+        #    (LUMIERE, BraTS-GLI); it is the Phase-2 grouping key, not a row
+        #    identifier, so it is NOT checked for uniqueness.
         n = synth.shape[0]
+        sid_raw = f["metadata/scan_id"][:]
+        sids = [b.decode() if isinstance(b, bytes) else str(b) for b in sid_raw]
         pid_raw = f["metadata/patient_id"][:]
         pids = [b.decode() if isinstance(b, bytes) else str(b) for b in pid_raw]
+        if len(sids) != n:
+            violations.append(f"metadata/scan_id has {len(sids)} entries, expected {n}")
         if len(pids) != n:
             violations.append(f"metadata/patient_id has {len(pids)} entries, expected {n}")
-        if len(set(pids)) != len(pids):
-            violations.append("metadata/patient_id has duplicates")
+        if len(set(sids)) != len(sids):
+            violations.append("metadata/scan_id has duplicates")
 
         # 5. per-scan numeric checks — cheap; iterate at most n scans
         for i in range(n):
@@ -377,23 +396,23 @@ def validate_predictions(path: Path | str) -> list[str]:
             r_i = real[i]
             b = brain[i].astype(bool)
             if not np.all(np.isfinite(s)):
-                violations.append(f"row {i} (pid={pids[i]}): NaN/Inf in t1c_synthetic_harmonised")
+                violations.append(f"row {i} (scan={sids[i]}): NaN/Inf in t1c_synthetic_harmonised")
                 continue
             if not np.all(np.isfinite(r_i)):
-                violations.append(f"row {i} (pid={pids[i]}): NaN/Inf in t1c_real_harmonised")
+                violations.append(f"row {i} (scan={sids[i]}): NaN/Inf in t1c_real_harmonised")
                 continue
             # range [0, 1] inside brain mask, exterior == 0
             if b.any():
                 inside = s[b]
                 if (inside < -1e-6).any() or (inside > 1.0 + 1e-6).any():
                     violations.append(
-                        f"row {i} (pid={pids[i]}): synth out of [0, 1] inside brain mask "
+                        f"row {i} (scan={sids[i]}): synth out of [0, 1] inside brain mask "
                         f"(min={float(inside.min()):.4f} max={float(inside.max()):.4f})"
                     )
                 outside = s[~b]
                 if outside.size and float(np.max(np.abs(outside))) > 1e-6:
                     violations.append(
-                        f"row {i} (pid={pids[i]}): synth nonzero outside brain mask "
+                        f"row {i} (scan={sids[i]}): synth nonzero outside brain mask "
                         f"(max|outside|={float(np.max(np.abs(outside))):.4f})"
                     )
             # residual identity
@@ -401,7 +420,7 @@ def validate_predictions(path: Path | str) -> list[str]:
             got = resid[i]
             if not np.allclose(expected, got, rtol=_RTOL_RESIDUAL, atol=_ATOL_RESIDUAL):
                 violations.append(
-                    f"row {i} (pid={pids[i]}): residuals/raw != real - synth "
+                    f"row {i} (scan={sids[i]}): residuals/raw != real - synth "
                     f"(max|diff|={float(np.max(np.abs(expected - got))):.4f})"
                 )
 

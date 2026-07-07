@@ -100,8 +100,11 @@ methods:
       vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
       checkpoint_epoch: best
       input_latents: [t1pre, flair]
-      nfe_list: [50, 100, 200]
-      selection_nfe: 100
+      # Matched-NFE policy (validation §5.1): share the {1,2,5,10,20} grid
+      # with VENA/A1 so the primary head-to-head is at a common NFE=5; keep
+      # NFE=100 as the DiT-native cost-quality anchor.
+      nfe_list: [1, 2, 5, 10, 20, 100]
+      selection_nfe: 5
 
   # ----------------------------------------------------------------- C5-T1C-RFlow
   - name: C5-T1C-RFlow
@@ -112,8 +115,11 @@ methods:
       vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
       checkpoint_epoch: best
       input_latents: [t1pre, flair]
-      nfe_list: [50, 100, 200]
-      selection_nfe: 100
+      # Matched-NFE policy (validation §5.1): RFlow is few-step by design;
+      # share the {1,2,5,10,20} grid with VENA/A1 for the matched NFE=5
+      # head-to-head, keep NFE=100 as the cost-quality anchor.
+      nfe_list: [1, 2, 5, 10, 20, 100]
+      selection_nfe: 5
 
   # ----------------------------------------------------------------- C6-3D-LDDPM
   # NFE policy: only NFE=1000 (paper-faithful Ho et al. 2020 default).
@@ -129,7 +135,11 @@ methods:
       vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
       checkpoint_epoch: best
       input_latents: [t1pre, flair]
-      nfe_list: [1000]
+      # Matched-NFE policy: add the {5,10,20} matched grid so a common-NFE
+      # Pareto row exists against RFlow/VENA (the RFlow-vs-DDPM few-step
+      # advantage, Eidex 2025 §5); NFE=1000 stays the DDPM-faithful best and
+      # remains the headline selection point for this method.
+      nfe_list: [5, 10, 20, 1000]
       selection_nfe: 1000
 
   # ----------------------------------------------------------------- C7-3D-Latent-Pix2Pix

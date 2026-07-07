@@ -91,6 +91,29 @@ def resolve_test_patient_ids(cohort: CohortEntry, fold: int = 0) -> list[str]:
     list[str]
         Scan IDs in deterministic patient-then-scan order.
     """
+    return [scan_id for scan_id, _ in resolve_test_scan_patient_pairs(cohort, fold)]
+
+
+def resolve_test_scan_patient_pairs(
+    cohort: CohortEntry, fold: int = 0
+) -> list[tuple[str, str]]:
+    """Resolve test ``(scan_id, patient_id)`` pairs for one cohort.
+
+    Same held-out ``splits/test`` (``role=cv``) or all-patients
+    (``role=test_only``) selection and CSR expansion as
+    :func:`resolve_test_patient_ids`, but returns the provenance pair per
+    row so the predictions H5 can record the true patient key alongside
+    the scan id. For a longitudinal cohort one patient maps to several
+    scans; the pair lets Phase-2 statistics group by patient so a
+    longitudinal patient contributes a single observation (validation
+    §6.4 patient-level pooling / patient-stratified bootstrap).
+
+    Returns
+    -------
+    list[tuple[str, str]]
+        ``(scan_id, patient_id)`` in deterministic patient-then-scan
+        order. When the H5 predates CSR grouping, ``scan_id == patient_id``.
+    """
     del fold  # fold-independent test partition; arg kept for future-proofing
     image_h5 = Path(cohort.image_h5)
     if not image_h5.is_file():
@@ -104,16 +127,16 @@ def resolve_test_patient_ids(cohort: CohortEntry, fold: int = 0) -> list[str]:
                     f"cohort {cohort.name}: image H5 lacks 'splits/test' (CV cohort)"
                 )
             patient_keys = _decode_str(f["splits/test"][:])
-        # CSR expand patient_id → scan_ids. If `patients/*` is absent
-        # (rare; some old converters skipped the CSR), fall back to the
-        # raw patient_keys assuming patient == scan.
+        # CSR expand patient_id → (scan_id, patient_id). If `patients/*` is
+        # absent (rare; some old converters skipped the CSR), fall back to
+        # the raw patient_keys assuming patient == scan.
         if "patients/keys" not in f or "patients/offsets" not in f or "ids" not in f:
-            return sorted(set(patient_keys))
+            return [(k, k) for k in sorted(set(patient_keys))]
         csr_keys = _decode_str(f["patients/keys"][:])
         offsets = f["patients/offsets"][:]
         all_ids = _decode_str(f["ids"][:])
         key_to_pos = {k: i for i, k in enumerate(csr_keys)}
-        scan_ids: list[str] = []
+        pairs: list[tuple[str, str]] = []
         for pk in patient_keys:
             if pk not in key_to_pos:
                 # Patient ID is in splits/test but absent from patients/keys.
@@ -122,8 +145,8 @@ def resolve_test_patient_ids(cohort: CohortEntry, fold: int = 0) -> list[str]:
             pos = key_to_pos[pk]
             start, end = int(offsets[pos]), int(offsets[pos + 1])
             for row in range(start, end):
-                scan_ids.append(all_ids[row])
-        return scan_ids
+                pairs.append((all_ids[row], pk))
+        return pairs
 
 
 def load_image_modalities(
