@@ -82,6 +82,39 @@ class VenaFMAdapterError(InferenceModelError):
 #: set are still treated as a hard error.
 _TRAIN_ONLY_PREFIXES: tuple[str, ...] = ("lpl_loss.", "feature_stats.")
 
+#: Fallback for `rflow.base_img_size_numel` — VENA's brain-box latent (48x56x48).
+#: Only used if a run's config omits the key while enabling the timestep transform.
+_BRAIN_BOX_LATENT_NUMEL: int = 48 * 56 * 48
+
+
+def resolve_timestep_transform_kwargs(rflow_cfg: dict[str, Any] | None) -> dict[str, int]:
+    """Sampler kwargs implied by a run's ``rflow`` config.
+
+    When a run trained with MONAI's SD3-style timestep transform
+    (``use_timestep_transform: true`` — true for every S1 v3 run), the sampler's
+    ``set_timesteps`` requires ``input_img_size_numel``. Omit it and MONAI's
+    ``timestep_transform`` evaluates ``None / int``, which fails every patient
+    behind a WARNING instead of an exception — the failure mode is a silently
+    empty output tree, not a crash.
+
+    Parameters
+    ----------
+    rflow_cfg
+        The run's ``rflow`` block from ``config.yaml`` (``None`` if absent).
+
+    Returns
+    -------
+    dict[str, int]
+        ``{"input_img_size_numel": N}`` when the transform is on, else ``{}``.
+        The key must be omitted entirely when the transform is off — a scheduler
+        built without it does not accept the kwarg.
+    """
+    cfg = rflow_cfg or {}
+    if not cfg.get("use_timestep_transform"):
+        return {}
+    numel = cfg.get("base_img_size_numel") or _BRAIN_BOX_LATENT_NUMEL
+    return {"input_img_size_numel": int(numel)}
+
 
 @register_inference_model("vena_fm")
 class VenaFMAdapter(InferenceModel):
@@ -137,10 +170,20 @@ class VenaFMAdapter(InferenceModel):
         module.eval()
         self._module = module
 
-        # Sampler over the rebuilt RFlow scheduler.
+        # Sampler over the rebuilt RFlow scheduler. The timestep-transform kwarg
+        # is load-bearing — see resolve_timestep_transform_kwargs.
         from vena.model.fm.inference import get_sampler
 
-        self._sampler = get_sampler(self.integrator)(scheduler=module.rflow.scheduler)
+        ts_kwargs = resolve_timestep_transform_kwargs(self._train_cfg.get("rflow"))
+        if ts_kwargs:
+            logger.info(
+                "%s: timestep transform on — input_img_size_numel=%d",
+                self.name,
+                ts_kwargs["input_img_size_numel"],
+            )
+        self._sampler = get_sampler(self.integrator)(
+            scheduler=module.rflow.scheduler, **ts_kwargs
+        )
 
         # VAE for image-space decode.
         self._vae = MaisiDecoder(

@@ -17,7 +17,11 @@ from typing import Any
 import pytest
 import torch
 
-from vena.inference.adapters.vena_fm_adapter import VenaFMAdapter, VenaFMAdapterError
+from vena.inference.adapters.vena_fm_adapter import (
+    VenaFMAdapter,
+    VenaFMAdapterError,
+    resolve_timestep_transform_kwargs,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -97,3 +101,33 @@ def test_genuinely_unexpected_key_still_raises(tmp_path: Path) -> None:
 
     with pytest.raises(VenaFMAdapterError, match="unexpected keys"):
         _adapter(ckpt)._load_state_dict(module)
+
+
+# ---------------------------------------------------------------- timestep transform
+
+
+def test_timestep_transform_forwards_img_size_numel() -> None:
+    """use_timestep_transform=True MUST carry input_img_size_numel.
+
+    Omitting it makes MONAI's timestep_transform compute `None / int`, which
+    fails every patient behind a WARNING rather than an exception — a silently
+    empty output tree, not a crash. Every S1 v3 run trains with the transform on
+    (`base_img_size_numel: 129024` == 48*56*48), so this guards all four VENA rows.
+    """
+    got = resolve_timestep_transform_kwargs(
+        {"use_timestep_transform": True, "base_img_size_numel": 129024}
+    )
+    assert got == {"input_img_size_numel": 129024}
+
+
+def test_timestep_transform_falls_back_to_brain_box() -> None:
+    """A run that enables the transform but omits the numel gets the box default."""
+    assert resolve_timestep_transform_kwargs({"use_timestep_transform": True}) == {
+        "input_img_size_numel": 48 * 56 * 48
+    }
+
+
+@pytest.mark.parametrize("cfg", [{"use_timestep_transform": False}, {}, None])
+def test_no_timestep_transform_omits_kwarg(cfg: dict[str, Any] | None) -> None:
+    """Transform off — the kwarg must NOT be injected (the scheduler rejects it)."""
+    assert resolve_timestep_transform_kwargs(cfg) == {}
