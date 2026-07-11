@@ -1,0 +1,41 @@
+# Shard C — latent generative sweeps (C4-3D-DiT, C5-T1C-RFlow).
+#
+# See picasso_shard_a_cheap.yaml for the sharding rationale.
+#
+# Both rows sweep {1,2,5,10,20,100} = 138 sampler steps/patient/row. The
+# {1,2,5,10,20} grid is shared with the VENA rows so the primary head-to-head
+# lands at a matched NFE=5 (validation §5.1); NFE=100 is each family's native
+# cost-quality anchor.
+#
+# 393 test patients x 2 rows. Estimated ~12 h.
+
+run_id_tag: picasso_shard_c_latent
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
+fold: 0
+device: cuda:0
+warmup_passes: 5
+
+cohorts:
+  cv_test: [UCSF-PDGM, BraTS-GLI, IvyGAP, LUMIERE, REMBRANDT, UPENN-GBM]
+  test_only: [BraTS-Africa-Glioma, BraTS-Africa-Other]
+  exclude: []
+
+methods:
+  include: [C4-3D-DiT, C5-T1C-RFlow]
+  exclude: []
+
+smoke:
+  enabled: false
+  n_patients_per_cohort: 1
+  use_selection_nfe_only: false
+
+nfe_override: null
+
+figure:
+  enabled: true
+  n_slices: 7
+  slice_offset: 10
+
+log_level: INFO

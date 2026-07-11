@@ -1,0 +1,43 @@
+# Shard B — the four VENA rows. Test-set predictions only.
+#
+# See picasso_shard_a_cheap.yaml for the sharding rationale (distinct run_id_tag
+# per shard under a shared output_root; shards are write-disjoint and merge
+# downstream by globbing `<output_root>/*/predictions/`).
+#
+# Rows: VENA-S1-v3a (concat-only ablation), VENA-S1-v3b, VENA-S1-v3b-rw
+# (HEADLINE), VENA-S3-LPL-b2c (the single LPL arm — the LPL programme was
+# stopped 2026-07-09 as optimisation-inert; this row reports the null).
+#
+# NFE sweep {1,2,5,10,20} = 38 sampler steps/patient/row.
+# 393 test patients x 4 rows. Estimated ~9 h.
+
+run_id_tag: picasso_shard_b_vena
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
+fold: 0
+device: cuda:0
+warmup_passes: 5
+
+cohorts:
+  cv_test: [UCSF-PDGM, BraTS-GLI, IvyGAP, LUMIERE, REMBRANDT, UPENN-GBM]
+  test_only: [BraTS-Africa-Glioma, BraTS-Africa-Other]
+  exclude: []
+
+methods:
+  include: [VENA-S1-v3a, VENA-S1-v3b, VENA-S1-v3b-rw, VENA-S3-LPL-b2c]
+  exclude: []
+
+smoke:
+  enabled: false
+  n_patients_per_cohort: 1
+  use_selection_nfe_only: false
+
+nfe_override: null
+
+figure:
+  enabled: true
+  n_slices: 7
+  slice_offset: 10
+
+log_level: INFO

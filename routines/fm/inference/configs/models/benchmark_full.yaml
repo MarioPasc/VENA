@@ -6,12 +6,19 @@
 # .claude/notes/validation/validation_proposal.md §5.1 for the per-family
 # selection NFE rationale.
 #
-# Paths are Picasso defaults. The corresponding server3 paths live in
-# the smoke YAMLs.
+# CHECKPOINT ROOT (2026-07-11). Every run_dir lives under
+#   /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/
+# The training tree was moved off `execs` (home) onto `fscratch` to clear the
+# home quota; `execs/vena/experiments/` is now EMPTY and vena_project is the
+# SOLE Picasso copy of these runs. Do not point a run_dir back at execs.
 #
-# C6-3D-LDDPM and C7-3D-Latent-Pix2Pix run_dir fields point at the
-# expected Picasso run dirs; if those training jobs have not completed,
-# add their names to `methods.exclude` in the job YAML.
+# The registry is run_dir-based, not file-based: adapters read siblings inside
+# run_dir (config.yaml, decision.json) as well as checkpoints/. Never flatten a
+# run_dir to a bare checkpoint path.
+#
+# `checkpoint_epoch: best` is resolved by string interpolation in each family's
+# _resolve_checkpoint (e.g. checkpoints/best_net_dit.pth). Verified 2026-07-11:
+# all seven competitor families have a real (non-symlink) best_* file on disk.
 
 schema_version: "1.0"
 methods:
@@ -27,7 +34,7 @@ methods:
   - name: C1-pGAN-t1pre
     type: pgan
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/pgan_cgan/2026-06-15T14-09-19_competitor_pgan_full_t1pre_t1c_68a229e
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/competitors/pgan_cgan/2026-06-15T14-09-19_competitor_pgan_full_t1pre_t1c_68a229e
       source_modality: t1pre
       target_modality: t1c
       checkpoint_epoch: best
@@ -36,7 +43,7 @@ methods:
   - name: C1-pGAN-t2
     type: pgan
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/pgan_cgan/2026-06-15T14-09-19_competitor_pgan_full_t2_t1c_68a229e
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/competitors/pgan_cgan/2026-06-15T14-09-19_competitor_pgan_full_t2_t1c_68a229e
       source_modality: t2
       target_modality: t1c
       checkpoint_epoch: best
@@ -45,7 +52,7 @@ methods:
   - name: C1-pGAN-flair
     type: pgan
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/pgan_cgan/2026-06-15T14-09-20_competitor_pgan_full_flair_t1c_68a229e
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/competitors/pgan_cgan/2026-06-15T14-09-20_competitor_pgan_full_flair_t1c_68a229e
       source_modality: flair
       target_modality: t1c
       checkpoint_epoch: best
@@ -56,7 +63,7 @@ methods:
   - name: C2-ResViT
     type: resvit
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/resvit/2026-06-15T15-31-02_competitor_resvit_full_multicohort_68a229e
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/competitors/resvit/2026-06-15T15-31-02_competitor_resvit_full_multicohort_68a229e
       source_modalities: [t1pre, t2, flair]
       target_modality: t1c
       checkpoint_epoch: best
@@ -67,7 +74,7 @@ methods:
   - name: C3-SynDiff-t1pre
     type: syndiff
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/syndiff/2026-06-15T14-10-18_competitor_syndiff_full_t1pre_t1c_68a229e
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/competitors/syndiff/2026-06-15T14-10-18_competitor_syndiff_full_t1pre_t1c_68a229e
       source_modality: t1pre
       target_modality: t1c
       checkpoint_epoch: best
@@ -76,7 +83,7 @@ methods:
   - name: C3-SynDiff-t2
     type: syndiff
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/syndiff/2026-06-15T14-10-19_competitor_syndiff_full_t2_t1c_68a229e
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/competitors/syndiff/2026-06-15T14-10-19_competitor_syndiff_full_t2_t1c_68a229e
       source_modality: t2
       target_modality: t1c
       checkpoint_epoch: best
@@ -85,7 +92,7 @@ methods:
   - name: C3-SynDiff-flair
     type: syndiff
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/syndiff/2026-06-15T14-10-19_competitor_syndiff_full_flair_t1c_68a229e
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/competitors/syndiff/2026-06-15T14-10-19_competitor_syndiff_full_flair_t1c_68a229e
       source_modality: flair
       target_modality: t1c
       checkpoint_epoch: best
@@ -96,12 +103,12 @@ methods:
   - name: C4-3D-DiT
     type: dit_3d
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/dit_3d/2026-06-16T00-20-33_competitor_dit_3d_full_multicohort_68a229e
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/competitors/dit_3d/2026-06-16T00-20-33_competitor_dit_3d_full_multicohort_68a229e
       vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
       checkpoint_epoch: best
       input_latents: [t1pre, flair]
       # Matched-NFE policy (validation §5.1): share the {1,2,5,10,20} grid
-      # with VENA/A1 so the primary head-to-head is at a common NFE=5; keep
+      # with VENA so the primary head-to-head is at a common NFE=5; keep
       # NFE=100 as the DiT-native cost-quality anchor.
       nfe_list: [1, 2, 5, 10, 20, 100]
       selection_nfe: 5
@@ -110,35 +117,29 @@ methods:
   - name: C5-T1C-RFlow
     type: t1c_rflow
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/t1c_rflow/2026-06-15T14-04-17_competitor_t1c_rflow_full_multicohort_68a229e
-      unet_arch_config: /home/mpascual/research/code/VENA/src/external/t1c_rflow/upstream/maisi/configs/config_maisi3d-rflow.json
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/competitors/t1c_rflow/2026-06-15T14-04-17_competitor_t1c_rflow_full_multicohort_68a229e
+      unet_arch_config: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/src/external/t1c_rflow/upstream/maisi/configs/config_maisi3d-rflow.json
       vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
       checkpoint_epoch: best
       input_latents: [t1pre, flair]
       # Matched-NFE policy (validation §5.1): RFlow is few-step by design;
-      # share the {1,2,5,10,20} grid with VENA/A1 for the matched NFE=5
+      # share the {1,2,5,10,20} grid with VENA for the matched NFE=5
       # head-to-head, keep NFE=100 as the cost-quality anchor.
       nfe_list: [1, 2, 5, 10, 20, 100]
       selection_nfe: 5
 
   # ----------------------------------------------------------------- C6-3D-LDDPM
-  # NFE policy: only NFE=1000 (paper-faithful Ho et al. 2020 default).
-  # Drops the {200, 500} sweep points to cut ~18 h off the Picasso wallclock
-  # and preserves the C5-RFlow-at-NFE=5 vs C6-DDPM-at-NFE=1000 head-to-head
-  # (the central claim of T1C-RFlow, Eidex 2025 §5). The {200, 500} cost-
-  # quality curve can be filled in as a supplementary table from a separate
-  # short job later.
+  # NFE policy: NFE=1000 is the paper-faithful Ho et al. 2020 default and stays
+  # the headline selection point. The {5,10,20} matched grid gives a common-NFE
+  # Pareto row against RFlow/VENA (the RFlow-vs-DDPM few-step advantage,
+  # Eidex 2025 §5). This row is the wallclock long pole — it gets its own shard.
   - name: C6-3D-LDDPM
     type: lddpm_3d
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/lddpm_3d/2026-06-17T09-55-42_competitor_lddpm_3d_full_multicohort_a1dd749
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/competitors/lddpm_3d/2026-06-17T09-55-42_competitor_lddpm_3d_full_multicohort_a1dd749
       vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
       checkpoint_epoch: best
       input_latents: [t1pre, flair]
-      # Matched-NFE policy: add the {5,10,20} matched grid so a common-NFE
-      # Pareto row exists against RFlow/VENA (the RFlow-vs-DDPM few-step
-      # advantage, Eidex 2025 §5); NFE=1000 stays the DDPM-faithful best and
-      # remains the headline selection point for this method.
       nfe_list: [5, 10, 20, 1000]
       selection_nfe: 1000
 
@@ -146,28 +147,68 @@ methods:
   - name: C7-3D-Latent-Pix2Pix
     type: lpix2pix_3d
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/competitors/lpix2pix_3d/2026-06-17T09-55-18_competitor_lpix2pix_3d_full_multicohort_a1dd749
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/competitors/lpix2pix_3d/2026-06-17T09-55-18_competitor_lpix2pix_3d_full_multicohort_a1dd749
       vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
       checkpoint_epoch: best
       input_latents: [t1pre, flair]
       nfe_list: [1]
       selection_nfe: 1
 
-  # ----------------------------------------------------------------- A1-VENA-S1-FFT
-  - name: A1-VENA-S1-FFT
+  # ================================================================= VENA
+  # The two former rows (A1-VENA-S1-FFT, VENA-S2-FFT) pointed at June-12 run
+  # dirs that were superseded and deleted long ago — the registry had ZERO
+  # working VENA rows. Replaced 2026-07-11 with the four runs that exist.
+  #
+  # All four are FFT (trainable-trunk) runs. The trunk-EMA shadow rides inside
+  # ema_best.ckpt as the `trunk_ema.*` keys (verified on disk), so the adapter's
+  # single load_state_dict restores it; the sibling trunk_ema_snapshot.pt is the
+  # exhaustive-val job's separate channel and is not read here.
+
+  # --- S1 v3a: concat-only conditioning (ablation — no mask conditioning)
+  - name: VENA-S1-v3a
     type: vena_fm
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/2026-06-12_01-27-55_s1_fft_cfm_c9b97556
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/2026-06-24_16-00-46_s1_v3a_concat_only_fft_ef000c9f
       checkpoint: ema_best.ckpt
       vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
       nfe_list: [1, 2, 5, 10, 20]
       selection_nfe: 5
 
-  # ----------------------------------------------------------------- VENA-S2-FFT
-  - name: VENA-S2-FFT
+  # --- S1 v3b: concat + 3-channel ControlNet conditioning
+  - name: VENA-S1-v3b
     type: vena_fm
     kwargs:
-      run_dir: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/2026-06-12_06-32-25_s2_fft_contrastive_a27962e7
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/2026-06-22_15-22-04_s1_v3b_concat_plus_cn3ch_fft_c698f45a
+      checkpoint: ema_best.ckpt
+      vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+      nfe_list: [1, 2, 5, 10, 20]
+      selection_nfe: 5
+
+  # --- S1 v3b-rw: concat + 3-ch ControlNet, region-weighted  << HEADLINE MODEL
+  - name: VENA-S1-v3b-rw
+    type: vena_fm
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/2026-06-22_15-20-57_s1_v3b_rw_concat_plus_cn3ch_fft_320b5ddd
+      checkpoint: ema_best.ckpt
+      vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+      nfe_list: [1, 2, 5, 10, 20]
+      selection_nfe: 5
+
+  # --- S3 LPL batch-2 arm C (lambda=0.12, region-weighted).
+  # ONE LPL arm, not four: the LPL programme was stopped on 2026-07-09 as
+  # optimisation-inert (all four arms' CFM endpoints agree to 4 dp — see
+  # .claude/notes/changes/lpl/2026-07-02_batch_2_lambda_calibration.md). This
+  # arm carries the largest (still ~1 sigma) OOD delta and exists to report the
+  # null result on the test set; four arms would be four near-identical rows.
+  #
+  # NOTE: S3 checkpoints carry training-only `lpl_loss.*` / `feature_stats.*`
+  # keys. The sampling module never builds them; the adapter strips them (see
+  # _TRAIN_ONLY_PREFIXES in vena_fm_adapter.py). Before that fix this row died
+  # at load with "unexpected keys".
+  - name: VENA-S3-LPL-b2c
+    type: vena_fm
+    kwargs:
+      run_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/2026-07-02_11-37-55_s3_b2_c_lambda012_region_fft_bea6d0ff
       checkpoint: ema_best.ckpt
       vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
       nfe_list: [1, 2, 5, 10, 20]

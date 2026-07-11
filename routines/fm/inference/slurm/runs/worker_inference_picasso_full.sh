@@ -6,12 +6,24 @@
 #SBATCH --mem=64G
 #SBATCH --constraint=dgx
 #SBATCH --partition=gpu_partition
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:A100:1
 #SBATCH --output=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/inference_picasso_full_%j.out
 #SBATCH --error=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/inference_picasso_full_%j.err
 
 # VENA unified validation-inference (per the validation §5 protocol).
 # Sweeps every method × test patient × full NFE list.
+#
+# Generic worker: fully parameterised by CONFIG_PATH + CONDA_ENV_NAME, so every
+# inference shard reuses this one script. The launcher overrides -J/--output/
+# --error/--time per shard.
+#
+# GPU PIN (2026-07-11, load-bearing). Picasso gained a 16x B200 cluster
+# alongside the A100s, and a bare `--gres=gpu:1` can now land on either.
+# B200 is Blackwell (sm_100); the `vena` env is built against cu124, which
+# cannot emit sm_100 kernels, so a B200 allocation dies with
+#   "CUDA error: no kernel image is available for execution on the device".
+# Keep `A100` in the gres spec. Targeting B200 requires rebuilding the env
+# against cu128+ (or `module load pytorch/2.12.2_cuda132`) and a fresh smoke.
 
 set -euo pipefail
 

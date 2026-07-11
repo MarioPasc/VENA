@@ -5,12 +5,17 @@
 # Mirrors the env-switch pattern used by SynDiff training at
 # `routines/competitors/syndiff/slurm/runs/worker_syndiff_picasso_full_*.sh`.
 #
-# Shares `run_id_tag` with picasso_full.yaml so per-method predictions land
-# under the same `<output_root>/<run_id_tag>/predictions/` tree and merge
-# automatically.
+# Shard E of the five-way split — see picasso_shard_a_cheap.yaml for the
+# sharding rationale. It carries its OWN `run_id_tag` (as every shard does):
+# the engine writes `<output_root>/<run_id_tag>/{predictions,logs,decision.json}`,
+# so shards sharing a tag would race on one log and one decision.json. Distinct
+# tags under the shared `output_root` keep the shards write-disjoint; the
+# downstream metrics routine globs `<output_root>/*/predictions/`.
+#
+# 393 test patients x 3 rows at NFE=4. Estimated ~2 h.
 
-run_id_tag: picasso_full
-output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/benchmarks/inference
+run_id_tag: picasso_shard_e_syndiff
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
 corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
 models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
 fold: 0

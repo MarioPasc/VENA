@@ -24,10 +24,22 @@ Inference per patient × per NFE:
 5. Apply :func:`apply_harmonisation` on top of the decoded volume so
    the H5 row matches the harmonisation recipe verbatim.
 
-Both A1 and VENA use this single class — they differ only in
-``run_dir`` (the S1 vs S2 checkpoint) and ``name`` (the YAML registry
-tag); the architecture is byte-identical because the only S1↔S2 delta
-is the loss configuration, which is irrelevant at inference time.
+Every VENA row uses this single class — rows differ only in ``run_dir``
+(which stage/recipe was trained) and ``name`` (the YAML registry tag).
+The sampling architecture is byte-identical across stages because the
+only S1 ↔ S2 ↔ S3 delta is the *loss* configuration, which is
+irrelevant at inference time.
+
+That last point has a concrete consequence for state restoration. An S3
+(decoder-perceptual-loss) run checkpoints two training-only submodules —
+``lpl_loss`` and ``feature_stats`` (the LPL feature-statistics EMA of
+Berrada 2025). :meth:`_build_module` rebuilds the module for *sampling*
+only and therefore passes no ``lpl_config``, so neither submodule exists
+on the inference module and their keys arrive as ``unexpected``. They are
+dropped in :meth:`_load_state_dict` (see ``_TRAIN_ONLY_PREFIXES``): they
+parameterise the loss, never the velocity field. Any *other* unexpected
+key still raises — that guard is what catches a genuinely mismatched
+checkpoint.
 """
 
 from __future__ import annotations
@@ -61,6 +73,14 @@ logger = logging.getLogger(__name__)
 
 class VenaFMAdapterError(InferenceModelError):
     """Raised on VENA-FM checkpoint or config-recovery failures."""
+
+
+#: State-dict prefixes that exist only while training and have no counterpart on
+#: the sampling module. ``lpl_loss`` / ``feature_stats`` are the S3 decoder-
+#: perceptual-loss submodules (Berrada 2025); they shape the *loss*, never the
+#: velocity field, so dropping them is a no-op for sampling. Keys outside this
+#: set are still treated as a hard error.
+_TRAIN_ONLY_PREFIXES: tuple[str, ...] = ("lpl_loss.", "feature_stats.")
 
 
 @register_inference_model("vena_fm")
@@ -171,12 +191,28 @@ class VenaFMAdapter(InferenceModel):
     def _load_state_dict(self, module: Any) -> None:
         """Load the Lightning checkpoint's ``state_dict`` into ``module``.
 
-        Strict by default because the Lightning ckpt and the freshly-built
-        module must align on every parameter — trunk-EMA + controlnet-EMA +
-        live trunk + live controlnet, all present.
+        The Lightning ckpt and the freshly-built module must align on every
+        parameter that participates in sampling — trunk-EMA + controlnet-EMA +
+        live trunk + live controlnet. Training-only submodules
+        (``_TRAIN_ONLY_PREFIXES``) are stripped first: an S3 run checkpoints its
+        LPL loss and feature-statistics EMA, which the sampling module never
+        builds. Any unexpected key that survives the strip is a genuine
+        checkpoint/architecture mismatch and raises.
         """
         ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
         state = ckpt.get("state_dict", ckpt)
+
+        dropped = [k for k in state if k.startswith(_TRAIN_ONLY_PREFIXES)]
+        if dropped:
+            state = {k: v for k, v in state.items() if not k.startswith(_TRAIN_ONLY_PREFIXES)}
+            logger.info(
+                "%s: dropped %d training-only key(s) absent from the sampling module "
+                "(LPL loss / feature-stats EMA); first=%s",
+                self.name,
+                len(dropped),
+                dropped[0],
+            )
+
         missing, unexpected = module.load_state_dict(state, strict=False)
         if unexpected:
             raise VenaFMAdapterError(

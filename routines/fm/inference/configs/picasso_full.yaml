@@ -1,9 +1,16 @@
 # Picasso full inference YAML — all test patients × all cohorts × full NFE
-# sweep per method's nfe_list. Runs on a single A100; total wallclock ~3 days
+# sweep per method's nfe_list, in ONE job. Single A100; ~3 days wallclock
 # (dominated by C6-LDDPM at NFE=1000).
+#
+# NOT the production path as of 2026-07-11. The benchmark is submitted as five
+# concurrent shards — picasso_shard_{a_cheap,b_vena,c_latent,d_lddpm}.yaml plus
+# picasso_full_syndiff.yaml — which cut the critical path from ~3 days to the
+# longest single shard (~36 h) and stop one failure from costing the whole
+# sweep. This file is retained as the single-job fallback; keep it in sync with
+# the shards' cohort list and warmup_passes.
 
 run_id_tag: picasso_full
-output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/benchmarks/inference
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
 corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
 models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
 fold: 0

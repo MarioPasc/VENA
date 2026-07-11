@@ -1,22 +1,34 @@
-# Loginexa smoke YAML — validates the unified pipeline shape on Picasso's
-# V100-DGXS-32GB login node (30-min wallclock, no queue) BEFORE submitting
-# the full Picasso A100 inference job. Per .claude/skills/test-picasso-loginexa.
+# Loginexa smoke — validates the pipeline shape on Picasso's V100-DGXS-32GB GPU
+# login node (~30-min wallclock, no queue) BEFORE submitting the sharded A100
+# inference jobs. Run the routine directly; there is no sbatch here.
 #
-# Scope: 1 patient per cohort × 8 cohorts (Ring A 6 cv + Ring B 2 test_only)
-# × all 16 method-rows × ONLY each method's selection NFE.
+# Scope: 1 patient per cohort x 8 cohorts x every included method-row x ONLY
+# each method's selection NFE. This is the "one image per dataset per method"
+# gate: it proves every adapter loads its checkpoint, resolves its run_dir
+# siblings, samples, decodes, and writes a valid predictions H5.
 #
-# Wallclock budget rationale: a single C6-3D-LDDPM at NFE=500 on V100 is ~10
-# minutes; 8 cohorts × 10 minutes = 80 minutes > 25-minute timeout. If C6 has
-# not finished training (no run_dir on disk yet) it MUST be excluded; otherwise
-# either (a) exclude C6 explicitly here and run it standalone on server3, or
-# (b) drop C6's selection_nfe to 200 in benchmark_full.yaml first.
+# Writes under its own run_id_tag, so smoke output never pollutes the real
+# benchmark tree even though it shares output_root.
+#
+# TWO ROWS ARE EXCLUDED HERE, both for mechanical reasons, both smoked separately:
+#
+#   C3-SynDiff x3 — needs the `vena-syndiff` env (Python 3.10, torch 2.5.1+cu121,
+#     JIT-compiled fused/upfirdn2d CUDA extensions) which will not load under the
+#     `vena` env. Smoke via smoke_loginexa_syndiff.yaml.
+#
+#   C6-3D-LDDPM — selection_nfe=1000 costs ~400 s/patient on a V100, so 8 cohorts
+#     is ~53 min, over the login-node wallclock cap. Smoke via
+#     smoke_loginexa_c6_only.yaml (or on server-3, where wallclock is unbounded).
+#
+# Everything else runs here, including all four VENA rows.
 
 run_id_tag: smoke_loginexa
-output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/benchmarks/inference
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
 corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
 models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
 fold: 0
 device: cuda:0
+# No warmup in the smoke — we are validating shape, not timing.
 warmup_passes: 0
 
 cohorts:
@@ -26,20 +38,7 @@ cohorts:
 
 methods:
   include: null
-  # Exclude C3-SynDiff in this smoke: SynDiff was trained against an older
-  # torch / Python 3.10 env (vena-v100-syndiff) with custom CUDA extensions
-  # (fused / upfirdn2d) that do not load under vena-v100 (torch 2.7 /
-  # Python 3.11). SynDiff is run as a separate companion smoke
-  # (smoke_loginexa_syndiff.yaml) that uses vena-v100-syndiff and writes
-  # to the same run_id_tag tree so the predictions merge.
-  # C6 + C7 are INCLUDED in this smoke now that their training runs finished
-  # and their run_dir is wired into benchmark_full.yaml. C6 only runs at
-  # NFE=1000 per the registry, so the per-patient cost is ~400 s on V100 ×
-  # 8 cohorts ≈ 53 min — over the 30-min loginexa wallclock. If you cannot
-  # afford that, add C6 back to this exclude list and validate it in the
-  # companion `smoke_loginexa_c6_only.yaml` on its own loginexa session
-  # (or on server-3 where the wallclock is unbounded).
-  exclude: [C3-SynDiff-t1pre, C3-SynDiff-t2, C3-SynDiff-flair]
+  exclude: [C3-SynDiff-t1pre, C3-SynDiff-t2, C3-SynDiff-flair, C6-3D-LDDPM]
 
 smoke:
   enabled: true

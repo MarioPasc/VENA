@@ -1,0 +1,47 @@
+# Shard A — single-step methods (NFE=1). Test-set predictions only.
+#
+# Sharding rationale (2026-07-11): the full benchmark's wallclock is dominated
+# by C6-LDDPM at NFE=1000, so the 16 method-rows are split across five A100 jobs
+# that run concurrently and merge downstream. Each shard keeps its OWN
+# `run_id_tag` under a SHARED `output_root`: the engine writes
+# `<output_root>/<run_id_tag>/{predictions,logs,figures,decision.json}`, so a
+# shared tag would have five jobs racing on one `logs/inference.log` and one
+# `decision.json` (last writer wins, and the provenance record would then
+# describe only that shard). Distinct tags make the shards write-disjoint; the
+# downstream metrics routine globs `<output_root>/*/predictions/`.
+#
+# This shard: C0 + C1-pGAN x3 + C2-ResViT + C7-Latent-Pix2Pix, all NFE=1.
+# 393 test patients x 6 rows. Estimated ~2 h.
+
+run_id_tag: picasso_shard_a_cheap
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
+fold: 0
+device: cuda:0
+# Validation §5.2 requires 5 untimed warmup passes per method before the timed
+# run (the reported gen-seconds must not include CUDA autotune / cudnn warmup).
+warmup_passes: 5
+
+cohorts:
+  cv_test: [UCSF-PDGM, BraTS-GLI, IvyGAP, LUMIERE, REMBRANDT, UPENN-GBM]
+  test_only: [BraTS-Africa-Glioma, BraTS-Africa-Other]
+  exclude: []
+
+methods:
+  include: [C0-Identity, C1-pGAN-t1pre, C1-pGAN-t2, C1-pGAN-flair, C2-ResViT, C7-3D-Latent-Pix2Pix]
+  exclude: []
+
+smoke:
+  enabled: false
+  n_patients_per_cohort: 1
+  use_selection_nfe_only: false
+
+nfe_override: null
+
+figure:
+  enabled: true
+  n_slices: 7
+  slice_offset: 10
+
+log_level: INFO
