@@ -1,13 +1,18 @@
-# Companion loginexa smoke for C6-3D-LDDPM alone — NFE=1000 on V100 costs
-# ~400 s/scan, so 8 cohorts × 1 patient ≈ 53 min (over the 30-min loginexa
-# wallclock). Run this **on its own loginexa session** so the timeout only
-# bounds C6's run, not the whole pipeline.
+# Companion loginexa smoke for C6-3D-LDDPM alone.
 #
-# If wallclock fails on loginexa, run the same YAML on server-3 (no time
-# limit) via the `server3` skill.
+# C6 is excluded from the main smoke because its selection NFE is 1000: at
+# ~400 s/scan on a V100 that is ~53 min for 8 cohorts, over the login-node
+# wallclock cap.
 #
-# Writes to the same `run_id_tag` as the main smoke so the C6 H5s merge
-# into the unified predictions tree.
+# This config therefore overrides NFE to 5 and sweeps all 8 cohorts (~2 min).
+# That is the right coverage for a smoke: what is cohort-specific is the data
+# path (latent read -> sample -> decode -> harmonise -> H5), and NFE=1000 is the
+# SAME sampler loop with more iterations — it cannot fail per-cohort in a way
+# NFE=5 does not. The expensive path is exercised separately, on one cohort, by
+# smoke_loginexa_c6_nfe1000.yaml, and for real in the picasso_shard_d_lddpm job.
+#
+# Writes to the same `run_id_tag` as the main smoke so the C6 H5s merge into the
+# unified predictions tree.
 
 run_id_tag: smoke_loginexa
 output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
@@ -31,7 +36,9 @@ smoke:
   n_patients_per_cohort: 1
   use_selection_nfe_only: true
 
-nfe_override: null
+# Override C6's selection NFE (1000) down to 5 — see the header. Keeps the
+# 8-cohort sweep inside the login-node wallclock.
+nfe_override: [5]
 
 figure:
   enabled: false  # The main unified-env smoke renders the cross-method

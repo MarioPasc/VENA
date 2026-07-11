@@ -1,0 +1,40 @@
+# C6-3D-LDDPM at its REAL selection NFE (1000), on ONE cohort, one patient.
+#
+# Companion to smoke_loginexa_c6_only.yaml, which sweeps all 8 cohorts but
+# overrides NFE down to 5 to fit the login-node wallclock. This config covers the
+# other half: it proves the expensive NFE=1000 path itself runs end-to-end before
+# the picasso_shard_d_lddpm job commits ~30 h to it.
+#
+# One patient at ~400 s on a V100 => ~7 min. Split this way, the two C6 smokes
+# together cover every cohort AND the real selection NFE, and both stay inside
+# the wallclock cap.
+
+run_id_tag: smoke_loginexa
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
+fold: 0
+device: cuda:0
+warmup_passes: 0
+
+cohorts:
+  cv_test: [UCSF-PDGM]
+  test_only: []
+  exclude: []
+
+methods:
+  include: [C6-3D-LDDPM]
+  exclude: []
+
+smoke:
+  enabled: true
+  n_patients_per_cohort: 1
+  # Use C6's declared selection_nfe (1000) — the whole point of this config.
+  use_selection_nfe_only: true
+
+nfe_override: null
+
+figure:
+  enabled: false
+
+log_level: INFO
