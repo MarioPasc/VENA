@@ -49,7 +49,9 @@ from vena.inference.h5_writer import (
     PRODUCER,
     PerPatientRecord,
     assert_predictions_valid,
+    assert_references_valid,
     write_predictions_h5,
+    write_references_h5,
 )
 from vena.inference.image_dataset import (
     harmonised_modalities_for_record,
@@ -177,7 +179,7 @@ class InferenceEngine:
             )
 
         # Pre-compute reference modalities + masks once per (cohort, patient) so
-        # every method's H5 row gets the same reference block byte-for-byte.
+        # every method's H5 row sees the same reference block byte-for-byte.
         reference_cache = self._build_reference_cache(cohorts, cohort_patients)
 
         # Per-method sweep. The adapter teardown frees GPU memory before the
@@ -187,6 +189,14 @@ class InferenceEngine:
         }
         per_method_payload: dict[str, dict[str, Any]] = {}
         git_sha = _git_sha_or_none()
+
+        # Schema 2.0: serialise the references ONCE PER COHORT. Under schema 1.1
+        # they were copied into every prediction file — identical bytes re-written
+        # for all 45 (method, NFE) pairs, ~70% of a ~424 GB sweep. Prediction files
+        # now just name their cohort's file in the `references_h5` root attr.
+        references_by_cohort = self._write_reference_files(
+            cohorts, cohort_patients, reference_cache, git_sha
+        )
 
         failed_methods: list[tuple[str, str]] = []
         for entry in method_entries:
@@ -273,6 +283,7 @@ class InferenceEngine:
                                 ring=_ring_for_role(cohort.role),
                                 git_sha=git_sha,
                                 run_id_tag=self.cfg.run_id_tag,
+                                references_h5=references_by_cohort.get(cohort.name),
                                 extra_config={
                                     "method_type": entry.type,
                                     "kwargs": entry.kwargs,
@@ -500,6 +511,67 @@ class InferenceEngine:
                     torch.from_numpy(harmonised_np),
                 )
                 per_cohort_selection_pred[cohort.name][patient_id] = bucket  # type: ignore[assignment]
+
+    def _write_reference_files(
+        self,
+        cohorts: list[CohortEntry],
+        cohort_patients: dict[str, list[str]],
+        reference_cache: dict[tuple[str, str], dict[str, Any]],
+        git_sha: str | None,
+    ) -> dict[str, str]:
+        """Write ``references/<cohort>.h5`` once per cohort; return cohort -> rel path.
+
+        The reference modalities and masks do not vary with method or NFE, so they
+        are serialised once and pointed at from every prediction file (schema 2.0).
+        Returns the run-dir-relative path per cohort, for the ``references_h5``
+        root attr.
+        """
+        out: dict[str, str] = {}
+        for c in cohorts:
+            pids = [p for p in cohort_patients.get(c.name, []) if (c.name, p) in reference_cache]
+            if not pids:
+                continue
+            records = [
+                self._reference_record(c.name, pid, reference_cache[(c.name, pid)]) for pid in pids
+            ]
+            rel = f"references/{c.name}.h5"
+            path = self.run_dir / rel
+            write_references_h5(
+                path,
+                records,
+                cohort=c.name,
+                git_sha=git_sha,
+                run_id_tag=self.cfg.run_id_tag,
+            )
+            assert_references_valid(path)
+            out[c.name] = rel
+            logger.info("wrote %s (%d scans)", path, len(records))
+        return out
+
+    def _reference_record(self, cohort: str, pid: str, ref: dict[str, Any]) -> PerPatientRecord:
+        """A :class:`PerPatientRecord` carrying only the reference fields.
+
+        ``write_references_h5`` reads just the reference/mask fields, so the
+        synthetic slots are filled with the real T1c as an inert placeholder —
+        they are never serialised. ``scan_id`` / ``patient_id`` are resolved
+        exactly as in :meth:`_predict_one_patient`, so the join key matches.
+        """
+        real = ref["t1c_real_harmonised"]
+        return PerPatientRecord(
+            patient_id=self._scan_to_patient.get((cohort, pid), pid),
+            scan_id=pid,
+            cohort=cohort,
+            t1c_synthetic_harmonised=real,
+            t1c_synthetic_raw=real,
+            t1c_real_harmonised=real,
+            t1pre_harmonised=ref["t1pre_harmonised"],
+            t2_harmonised=ref["t2_harmonised"],
+            flair_harmonised=ref["flair_harmonised"],
+            brain_mask=ref["brain"],
+            wt_mask=ref["wt"],
+            inference_seconds=0.0,
+            peak_vram_mb=0.0,
+        )
 
     def _build_reference_cache(
         self,

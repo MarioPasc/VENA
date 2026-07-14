@@ -1,11 +1,33 @@
 """Predictions-H5 writer + validator (per validation §5.3 schema).
 
-The validation protocol §5.3 prescribes one HDF5 per (method × ring)
-holding the harmonised + raw predicted T1c, the harmonised reference
-modalities, brain/WT masks, per-volume residuals, and a metadata block.
-We persist at finer granularity — per (method × cohort × NFE) — and
-pool to ring-level downstream; the *contents* of each file match §5.3
-verbatim and the validator enforces the cross-field invariants.
+The validation protocol §5.3 prescribes one HDF5 per (method × ring) holding the
+harmonised + raw predicted T1c, the harmonised reference modalities, brain/WT
+masks, per-volume residuals, and a metadata block. We persist at finer
+granularity — per (method × cohort × NFE) — and pool to ring-level downstream.
+
+Schema 2.0 (2026-07-14) — references are stored ONCE PER COHORT
+---------------------------------------------------------------
+Schema 1.1 wrote the four reference modalities and the residual into *every*
+prediction file. Those volumes are identical across every NFE and every method,
+so the benchmark re-serialised them 45 times (once per method×NFE pair): a
+record cost 24 MB, and the full 17,685-record sweep projected to ~424 GB — over
+the home soft quota, ~70% of it duplicated bytes.
+
+Schema 2.0 splits them:
+
+* ``predictions/<method>/<cohort>/nfe_NNN.h5`` — the *varying* data only:
+  ``predictions/{t1c_synthetic_harmonised,t1c_synthetic_raw}``, ``masks/*`` and
+  ``metadata/*``. Masks stay local (int8, ~1 MB gzipped) so the file remains
+  self-validating without a second open. ~8 MB/record.
+* ``references/<cohort>.h5`` — written once per cohort by
+  :func:`write_references_h5`: ``reference/*`` + ``masks/*`` + the ID block.
+
+The residual is DROPPED, not relocated: it is exactly
+``t1c_real_harmonised - t1c_synthetic_harmonised``, so storing it was storing a
+subtraction. Consumers recompute it by joining on ``metadata/scan_id``; each
+prediction file names its partner in the ``references_h5`` root attr.
+
+Net: ~424 GB -> ~150 GB, no information lost.
 
 Storage policy (per ``.claude/rules/h5-design-principles.md``):
 
@@ -16,9 +38,9 @@ Storage policy (per ``.claude/rules/h5-design-principles.md``):
 * root carries ``schema_version``, ``created_at``, ``producer``,
   ``config_json``, ``git_sha`` so the file is self-describing.
 
-The validator returns the list of violations (empty when valid); the
-producer must call :func:`assert_predictions_valid` before returning a
-path from ``Engine.run()``.
+The validators return the list of violations (empty when valid); the producer
+must call :func:`assert_predictions_valid` / :func:`assert_references_valid`
+before returning a path from ``Engine.run()``.
 """
 
 from __future__ import annotations
@@ -37,15 +59,17 @@ from vena.inference.harmonisation import HARMONISATION_RECIPE
 # Anchor the _dt usage at module scope so ruff autoflake never strips the import.
 _DATETIME_MOD = _dt
 
-SCHEMA_VERSION = "1.1"
-PRODUCER = "routines.fm.inference:v0.1.0"
-
-_RTOL_RESIDUAL = 1e-5
-_ATOL_RESIDUAL = 1e-4
+SCHEMA_VERSION = "2.0"
+REFERENCES_SCHEMA_VERSION = "2.0"
+PRODUCER = "routines.fm.inference:v0.2.0"
 
 
 class PredictionsH5Error(Exception):
     """Raised on a malformed predictions H5 (write- or read-side)."""
+
+
+class ReferencesH5Error(Exception):
+    """Raised on a malformed per-cohort references H5 (write- or read-side)."""
 
 
 @dataclass(frozen=True)
@@ -106,6 +130,7 @@ def write_predictions_h5(
     checkpoint_sha256: str | None = None,
     vae_checkpoint_sha256: str | None = None,
     run_id_tag: str | None = None,
+    references_h5: str | None = None,
     extra_config: dict[str, object] | None = None,
 ) -> Path:
     """Write one (method × cohort × NFE) predictions H5 and return its path.
@@ -121,6 +146,12 @@ def write_predictions_h5(
         Provenance written to root attrs.
     git_sha, checkpoint_path, checkpoint_sha256, vae_checkpoint_sha256, run_id_tag
         Optional provenance.
+    references_h5
+        Path (relative to the run dir) of the cohort's reference H5, written to
+        the ``references_h5`` root attr. Schema 2.0 keeps the reference
+        modalities out of this file; a consumer that needs the real T1c — to
+        score, or to recompute the residual — resolves this pointer and joins on
+        ``metadata/scan_id``.
     extra_config
         Free-form JSON-serialisable dict, persisted as ``config_json``
         per ``h5-design-principles.md`` rule 3.
@@ -186,6 +217,8 @@ def write_predictions_h5(
             f.attrs["vae_checkpoint_sha256"] = vae_checkpoint_sha256
         if run_id_tag:
             f.attrs["run_id_tag"] = run_id_tag
+        if references_h5:
+            f.attrs["references_h5"] = references_h5
         f.attrs["config_json"] = json.dumps(extra_config or {}, sort_keys=True)
 
         # ---- volumetric datasets ----
@@ -206,33 +239,10 @@ def write_predictions_h5(
             "dimensionless",
         )
 
-        g_ref = f.create_group("reference")
-        g_ref.attrs["description"] = "Per-scan reference modalities (harmonised)."
-        ds_t1c = _vol_dset(
-            g_ref,
-            "t1c_real_harmonised",
-            np.float32,
-            "Real T1c after §4.1 harmonisation.",
-            "dimensionless",
-        )
-        ds_t1pre = _vol_dset(
-            g_ref,
-            "t1pre_harmonised",
-            np.float32,
-            "Real T1pre after §4.1 harmonisation.",
-            "dimensionless",
-        )
-        ds_t2 = _vol_dset(
-            g_ref, "t2_harmonised", np.float32, "Real T2 after §4.1 harmonisation.", "dimensionless"
-        )
-        ds_flair = _vol_dset(
-            g_ref,
-            "flair_harmonised",
-            np.float32,
-            "Real FLAIR after §4.1 harmonisation.",
-            "dimensionless",
-        )
-
+        # Schema 2.0: no `reference/` group and no `residuals/` group here. Both
+        # are invariant across NFE and method — see the module docstring. The
+        # reference modalities live once per cohort in `references/<cohort>.h5`
+        # (named below), and the residual is recomputed as real - synth.
         g_msk = f.create_group("masks")
         g_msk.attrs["description"] = "Binary brain and whole-tumour masks."
         ds_brain = _vol_dset(
@@ -240,16 +250,6 @@ def write_predictions_h5(
         )
         ds_wt = _vol_dset(
             g_msk, "wt", np.int8, "Whole-tumour mask, derived as (masks/tumor > 0).", "binary"
-        )
-
-        g_res = f.create_group("residuals")
-        g_res.attrs["description"] = "Per-scan residual maps (real - synth, harmonised)."
-        ds_resid = _vol_dset(
-            g_res,
-            "raw",
-            np.float32,
-            "t1c_real_harmonised - t1c_synthetic_harmonised.",
-            "dimensionless",
         )
 
         # ---- metadata datasets ----
@@ -288,26 +288,136 @@ def write_predictions_h5(
         g_meta["scan_shape"].attrs["units"] = "voxels"
         g_meta["scan_shape"].attrs["description"] = "Volume shape (H, W, D) per scan."
 
-        # ---- fill volumetric datasets, computing residuals in-line ----
+        # ---- fill volumetric datasets ----
         for i, r in enumerate(records):
-            synth = _as_np(r.t1c_synthetic_harmonised, np.float32)
-            raw = _as_np(r.t1c_synthetic_raw, np.float32)
-            t1c_real = _as_np(r.t1c_real_harmonised, np.float32)
-            t1pre = _as_np(r.t1pre_harmonised, np.float32)
-            t2 = _as_np(r.t2_harmonised, np.float32)
-            flair = _as_np(r.flair_harmonised, np.float32)
-            brain = _as_np(r.brain_mask, np.int8)
-            wt = _as_np(r.wt_mask, np.int8)
+            ds_synth[i] = _as_np(r.t1c_synthetic_harmonised, np.float32)
+            ds_raw[i] = _as_np(r.t1c_synthetic_raw, np.float32)
+            ds_brain[i] = _as_np(r.brain_mask, np.int8)
+            ds_wt[i] = _as_np(r.wt_mask, np.int8)
 
-            ds_synth[i] = synth
-            ds_raw[i] = raw
-            ds_t1c[i] = t1c_real
-            ds_t1pre[i] = t1pre
-            ds_t2[i] = t2
-            ds_flair[i] = flair
-            ds_brain[i] = brain
-            ds_wt[i] = wt
-            ds_resid[i] = t1c_real - synth
+    return path
+
+
+def write_references_h5(
+    path: Path | str,
+    records: list[PerPatientRecord],
+    *,
+    cohort: str,
+    git_sha: str | None = None,
+    run_id_tag: str | None = None,
+) -> Path:
+    """Write the once-per-cohort reference H5 and return its path.
+
+    Holds everything that does NOT vary with method or NFE: the four harmonised
+    reference modalities and the brain/WT masks, keyed by ``metadata/scan_id``.
+    Prediction files name this file in their ``references_h5`` root attr and join
+    on ``scan_id``.
+
+    Parameters
+    ----------
+    path
+        Destination file. Parent directories are created.
+    records
+        One :class:`PerPatientRecord` per scan in the cohort. Only the reference
+        fields are read; the synthetic fields are ignored, so any method's record
+        set for this cohort may be passed.
+    cohort
+        Cohort name, written to the root attrs.
+    git_sha, run_id_tag
+        Optional provenance.
+
+    Raises
+    ------
+    ReferencesH5Error
+        If the records are empty, shape-inconsistent, or carry duplicate scan_ids.
+    """
+    if not records:
+        raise ReferencesH5Error(f"write_references_h5: no records provided for cohort={cohort!r}")
+
+    shape_ref = records[0].shape()
+    for r in records[1:]:
+        if r.shape() != shape_ref:
+            raise ReferencesH5Error(
+                f"shape mismatch across records: {records[0].scan_id} has {shape_ref}, "
+                f"{r.scan_id} has {r.shape()}"
+            )
+
+    scan_ids = [r.scan_id for r in records]
+    if len(set(scan_ids)) != len(scan_ids):
+        raise ReferencesH5Error(f"duplicate scan_id in references for cohort={cohort!r}")
+
+    n = len(records)
+    h, w, d = shape_ref
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(path, "w") as f:
+        f.attrs["schema_version"] = REFERENCES_SCHEMA_VERSION
+        f.attrs["created_at"] = _dt.datetime.utcnow().isoformat() + "Z"
+        f.attrs["producer"] = PRODUCER
+        f.attrs["cohort"] = cohort
+        f.attrs["harmonisation_recipe"] = HARMONISATION_RECIPE
+        if git_sha:
+            f.attrs["git_sha"] = git_sha
+        if run_id_tag:
+            f.attrs["run_id_tag"] = run_id_tag
+
+        def _vol(grp: h5py.Group, key: str, dt: type[np.generic], desc: str, units: str):
+            ds = grp.create_dataset(
+                key,
+                shape=(n, h, w, d),
+                dtype=dt,
+                chunks=(1, h, w, d),
+                compression="gzip",
+                compression_opts=4,
+            )
+            ds.attrs["description"] = desc
+            ds.attrs["units"] = units
+            ds.attrs["dtype"] = np.dtype(dt).name
+            ds.attrs["leading_dim"] = "n_scans"
+            return ds
+
+        g_ref = f.create_group("reference")
+        g_ref.attrs["description"] = "Per-scan reference modalities (harmonised)."
+        ds_t1c = _vol(
+            g_ref, "t1c_real_harmonised", np.float32, "Real T1c after §4.1 harmonisation.", "dimensionless"
+        )
+        ds_t1pre = _vol(
+            g_ref, "t1pre_harmonised", np.float32, "Real T1pre after §4.1 harmonisation.", "dimensionless"
+        )
+        ds_t2 = _vol(
+            g_ref, "t2_harmonised", np.float32, "Real T2 after §4.1 harmonisation.", "dimensionless"
+        )
+        ds_flair = _vol(
+            g_ref, "flair_harmonised", np.float32, "Real FLAIR after §4.1 harmonisation.", "dimensionless"
+        )
+
+        g_msk = f.create_group("masks")
+        g_msk.attrs["description"] = "Binary brain and whole-tumour masks."
+        ds_brain = _vol(
+            g_msk, "brain", np.int8, "Brain mask (HD-BET / CBICA), binary {0, 1}.", "binary"
+        )
+        ds_wt = _vol(
+            g_msk, "wt", np.int8, "Whole-tumour mask, derived as (masks/tumor > 0).", "binary"
+        )
+
+        g_meta = f.create_group("metadata")
+        g_meta.attrs["description"] = "Per-scan identifiers; the join key for prediction files."
+        _vlen_str_dataset(g_meta, "patient_id", [r.patient_id for r in records])
+        _vlen_str_dataset(g_meta, "scan_id", scan_ids)
+        _vlen_str_dataset(g_meta, "cohort", [r.cohort for r in records])
+        scan_shape = np.tile(np.asarray(shape_ref, dtype=np.int32), (n, 1))
+        g_meta.create_dataset("scan_shape", data=scan_shape)
+        g_meta["scan_shape"].attrs["units"] = "voxels"
+        g_meta["scan_shape"].attrs["description"] = "Volume shape (H, W, D) per scan."
+
+        for i, r in enumerate(records):
+            ds_t1c[i] = _as_np(r.t1c_real_harmonised, np.float32)
+            ds_t1pre[i] = _as_np(r.t1pre_harmonised, np.float32)
+            ds_t2[i] = _as_np(r.t2_harmonised, np.float32)
+            ds_flair[i] = _as_np(r.flair_harmonised, np.float32)
+            ds_brain[i] = _as_np(r.brain_mask, np.int8)
+            ds_wt[i] = _as_np(r.wt_mask, np.int8)
 
     return path
 
@@ -332,17 +442,14 @@ def validate_predictions(path: Path | str) -> list[str]:
         if sv != SCHEMA_VERSION:
             violations.append(f"schema_version={sv!r} (expected {SCHEMA_VERSION!r})")
 
-        # 2. mandatory datasets
+        # 2. mandatory datasets. Schema 2.0 drops `reference/*` (now once per
+        #    cohort in references/<cohort>.h5) and `residuals/raw` (recomputed as
+        #    real - synth). Masks stay local so this check needs no second file.
         required = [
             "predictions/t1c_synthetic_harmonised",
             "predictions/t1c_synthetic_raw",
-            "reference/t1c_real_harmonised",
-            "reference/t1pre_harmonised",
-            "reference/t2_harmonised",
-            "reference/flair_harmonised",
             "masks/brain",
             "masks/wt",
-            "residuals/raw",
             "metadata/patient_id",
             "metadata/scan_id",
             "metadata/cohort",
@@ -357,17 +464,14 @@ def validate_predictions(path: Path | str) -> list[str]:
         if violations:
             return violations
 
+        # The reference partner must be nameable, or the file is unscoreable.
+        if not f.attrs.get("references_h5"):
+            violations.append("missing root attr: references_h5")
+
         synth = f["predictions/t1c_synthetic_harmonised"]
-        real = f["reference/t1c_real_harmonised"]
         brain = f["masks/brain"]
-        resid = f["residuals/raw"]
 
         # 3. shape match across volumetric datasets
-        if synth.shape != real.shape:
-            violations.append(
-                f"predictions/t1c_synthetic_harmonised shape {synth.shape} "
-                f"!= reference/t1c_real_harmonised shape {real.shape}"
-            )
         if synth.shape != brain.shape:
             violations.append(
                 f"predictions/t1c_synthetic_harmonised shape {synth.shape} "
@@ -393,13 +497,9 @@ def validate_predictions(path: Path | str) -> list[str]:
         # 5. per-scan numeric checks — cheap; iterate at most n scans
         for i in range(n):
             s = synth[i]
-            r_i = real[i]
             b = brain[i].astype(bool)
             if not np.all(np.isfinite(s)):
                 violations.append(f"row {i} (scan={sids[i]}): NaN/Inf in t1c_synthetic_harmonised")
-                continue
-            if not np.all(np.isfinite(r_i)):
-                violations.append(f"row {i} (scan={sids[i]}): NaN/Inf in t1c_real_harmonised")
                 continue
             # range [0, 1] inside brain mask, exterior == 0
             if b.any():
@@ -415,16 +515,68 @@ def validate_predictions(path: Path | str) -> list[str]:
                         f"row {i} (scan={sids[i]}): synth nonzero outside brain mask "
                         f"(max|outside|={float(np.max(np.abs(outside))):.4f})"
                     )
-            # residual identity
-            expected = r_i - s
-            got = resid[i]
-            if not np.allclose(expected, got, rtol=_RTOL_RESIDUAL, atol=_ATOL_RESIDUAL):
-                violations.append(
-                    f"row {i} (scan={sids[i]}): residuals/raw != real - synth "
-                    f"(max|diff|={float(np.max(np.abs(expected - got))):.4f})"
-                )
 
     return violations
+
+
+def validate_references(path: Path | str) -> list[str]:
+    """Return cross-field violations for a per-cohort references H5 (empty = valid)."""
+    violations: list[str] = []
+    path = Path(path)
+    if not path.is_file():
+        return [f"file not found: {path}"]
+
+    with h5py.File(path, "r") as f:
+        sv = f.attrs.get("schema_version")
+        if sv != REFERENCES_SCHEMA_VERSION:
+            violations.append(f"schema_version={sv!r} (expected {REFERENCES_SCHEMA_VERSION!r})")
+
+        required = [
+            "reference/t1c_real_harmonised",
+            "reference/t1pre_harmonised",
+            "reference/t2_harmonised",
+            "reference/flair_harmonised",
+            "masks/brain",
+            "masks/wt",
+            "metadata/patient_id",
+            "metadata/scan_id",
+            "metadata/cohort",
+            "metadata/scan_shape",
+        ]
+        for key in required:
+            if key not in f:
+                violations.append(f"missing dataset: {key}")
+        if violations:
+            return violations
+
+        real = f["reference/t1c_real_harmonised"]
+        n = real.shape[0]
+        for key in ("reference/t1pre_harmonised", "reference/t2_harmonised",
+                    "reference/flair_harmonised", "masks/brain", "masks/wt"):
+            if f[key].shape != real.shape:
+                violations.append(f"{key} shape {f[key].shape} != {real.shape}")
+
+        sid_raw = f["metadata/scan_id"][:]
+        sids = [b.decode() if isinstance(b, bytes) else str(b) for b in sid_raw]
+        if len(sids) != n:
+            violations.append(f"metadata/scan_id has {len(sids)} entries, expected {n}")
+        if len(set(sids)) != len(sids):
+            violations.append("metadata/scan_id has duplicates")
+
+        for i in range(n):
+            if not np.all(np.isfinite(real[i])):
+                violations.append(f"row {i} (scan={sids[i]}): NaN/Inf in t1c_real_harmonised")
+
+    return violations
+
+
+def assert_references_valid(path: Path | str) -> None:
+    """Raise :class:`ReferencesH5Error` if the references H5 is non-conformant."""
+    violations = validate_references(path)
+    if violations:
+        raise ReferencesH5Error(
+            f"references H5 {path} failed validation:\n  - " + "\n  - ".join(violations)
+        )
 
 
 def assert_predictions_valid(path: Path | str) -> None:

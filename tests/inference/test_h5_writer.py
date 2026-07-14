@@ -51,7 +51,15 @@ def _make_record(
 def test_write_and_validate_ok(tmp_path: Path) -> None:
     records = [_make_record(f"P{i:03d}", seed=i) for i in range(3)]
     path = tmp_path / "preds.h5"
-    write_predictions_h5(path, records, method="C0-Identity", cohort="TEST", nfe=1, ring="A")
+    write_predictions_h5(
+        path,
+        records,
+        method="C0-Identity",
+        cohort="TEST",
+        nfe=1,
+        ring="A",
+        references_h5="references/TEST.h5",
+    )
     assert_predictions_valid(path)  # no exception
     assert validate_predictions(path) == []
 
@@ -137,7 +145,9 @@ def test_repeated_patient_id_distinct_scan_ok(tmp_path: Path) -> None:
     r1 = _make_record("PAT", seed=0, scan_id="PAT_t0")
     r2 = _make_record("PAT", seed=1, scan_id="PAT_t1")
     path = tmp_path / "long.h5"
-    write_predictions_h5(path, [r1, r2], method="X", cohort="C", nfe=1, ring="A")
+    write_predictions_h5(
+        path, [r1, r2], method="X", cohort="C", nfe=1, ring="A", references_h5="references/C.h5"
+    )
     assert validate_predictions(path) == []
 
 

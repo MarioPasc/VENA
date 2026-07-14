@@ -93,13 +93,47 @@ def _load_synth(
             else:
                 return None
             synth = np.asarray(f["predictions/t1c_synthetic_harmonised"][idx], dtype=np.float32)
-            real = np.asarray(f["reference/t1c_real_harmonised"][idx], dtype=np.float32)
             nfe = int(f["metadata/nfe"][idx])
             seconds = float(f["metadata/inference_seconds"][idx])
+            # Schema 2.0: the real T1c lives once per cohort, not in this file.
+            # Resolve the pointer and join on scan_id (row order is not guaranteed
+            # to agree — the references file lists every scan of the cohort, while
+            # a prediction file may have dropped patients that failed).
+            scan_id = _decode_str(f["metadata/scan_id"][:])[idx]
+            references_h5 = f.attrs.get("references_h5")
+        real = _load_reference_t1c(Path(h5_path), references_h5, scan_id)
+        if real is None:
+            return None
     except (OSError, KeyError, ValueError) as exc:
         logger.warning("skipping %s: %s", h5_path, exc)
         return None
     return pid, synth, real, nfe, seconds
+
+
+def _load_reference_t1c(
+    pred_path: Path, references_h5: str | None, scan_id: str
+) -> np.ndarray | None:
+    """Read one scan's real T1c from the cohort references H5 named by a prediction file.
+
+    ``references_h5`` is stored run-dir-relative; a prediction file sits at
+    ``<run_dir>/predictions/<method>/<cohort>/nfe_NNN.h5``, so the run dir is three
+    parents up.
+    """
+    if not references_h5:
+        logger.warning("%s has no references_h5 attr (pre-2.0 file?)", pred_path)
+        return None
+    ref_path = pred_path.parents[3] / references_h5
+    if not ref_path.is_file():
+        logger.warning("references H5 not found at %s", ref_path)
+        return None
+    with h5py.File(ref_path, "r") as rf:
+        scan_ids = _decode_str(rf["metadata/scan_id"][:])
+        if scan_id not in scan_ids:
+            logger.warning("scan %s absent from %s", scan_id, ref_path)
+            return None
+        return np.asarray(
+            rf["reference/t1c_real_harmonised"][scan_ids.index(scan_id)], dtype=np.float32
+        )
 
 
 def render_for_cohort(
