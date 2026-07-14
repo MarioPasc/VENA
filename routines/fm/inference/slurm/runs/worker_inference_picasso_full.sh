@@ -4,9 +4,9 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --constraint=dgx
+#SBATCH --constraint=a100
 #SBATCH --partition=gpu_partition
-#SBATCH --gres=gpu:A100:1
+#SBATCH --gres=gpu:1
 #SBATCH --output=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/inference_picasso_full_%j.out
 #SBATCH --error=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/inference_picasso_full_%j.err
 
@@ -17,13 +17,19 @@
 # inference shard reuses this one script. The launcher overrides -J/--output/
 # --error/--time per shard.
 #
-# GPU PIN (2026-07-11, load-bearing). Picasso gained a 16x B200 cluster
-# alongside the A100s, and a bare `--gres=gpu:1` can now land on either.
-# B200 is Blackwell (sm_100); the `vena` env is built against cu124, which
-# cannot emit sm_100 kernels, so a B200 allocation dies with
-#   "CUDA error: no kernel image is available for execution on the device".
-# Keep `A100` in the gres spec. Targeting B200 requires rebuilding the env
-# against cu128+ (or `module load pytorch/2.12.2_cuda132`) and a fresh smoke.
+# GPU PIN (2026-07-14, load-bearing). Picasso gained a B200 cluster alongside the
+# A100s, so a bare `--gres=gpu:1` can now land on either. B200 is Blackwell
+# (sm_100); the `vena` env is cu124 and cannot emit sm_100 kernels, so a B200
+# allocation dies with "CUDA error: no kernel image is available for execution on
+# the device".
+#
+# Pin via the node FEATURE, not a GRES type. `sinfo` on this cluster reports:
+#     exa[01-04]  gres=gpu:8         features=dgx,gpu,a100
+#     blk[01-02]  gres=gpu:B200:8    features=dgx,gpu,b200
+# The A100 nodes expose an UNTYPED gres, so `--gres=gpu:A100:1` matches no node
+# and sbatch rejects the job outright with "Requested node configuration is not
+# available". Only B200 is typed. Hence: `--gres=gpu:1 --constraint=a100`.
+# Note `--constraint=dgx` is NOT sufficient — both A100 and B200 nodes carry it.
 
 set -euo pipefail
 

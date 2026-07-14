@@ -17,9 +17,14 @@
 # 2.5.1+cu121 + JIT-compiled fused/upfirdn2d CUDA extensions) and therefore
 # uses its own worker script.
 #
-# GPU: every shard pins --gres=gpu:A100:1. Picasso gained a B200 (Blackwell,
-# sm_100) cluster on 2026-07-11 and a bare `gpu:1` can now land there; the
-# `vena` env is cu124 and dies on B200 with "no kernel image is available".
+# GPU: every shard pins A100 via `--gres=gpu:1 --constraint=a100`. Picasso gained
+# a B200 (Blackwell, sm_100) cluster and a bare `gpu:1` can land there; the `vena`
+# env is cu124 and dies on B200 with "no kernel image is available".
+# The pin MUST be the node feature, not a GRES type — sinfo shows the A100 nodes
+# (exa01-04) expose an UNTYPED `gpu:8`, so `--gres=gpu:A100:1` matches no node and
+# sbatch rejects it with "Requested node configuration is not available". Only the
+# B200 nodes are typed (`gpu:B200:8`). `--constraint=dgx` is not enough — both
+# A100 and B200 nodes carry the dgx feature.
 #
 # Usage:
 #   bash launcher_inference_picasso_shards.sh             # submit all five
@@ -70,7 +75,7 @@ for row in "${SHARDS[@]}"; do
     sbatch_cmd="sbatch --parsable \
         -J ${job_name} \
         --time=${walltime} \
-        --gres=gpu:A100:1 \
+        --gres=gpu:1 --constraint=a100 \
         --output=${LOGS_DIR}/inference_${shard}_%j.out \
         --error=${LOGS_DIR}/inference_${shard}_%j.err \
         --export=ALL,CONDA_ENV_NAME=${env},REPO_DIR=${REPO_DIR},CONFIG_PATH=${config_path} \

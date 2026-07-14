@@ -4,9 +4,9 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --constraint=dgx
+#SBATCH --constraint=a100
 #SBATCH --partition=gpu_partition
-#SBATCH --gres=gpu:A100:1
+#SBATCH --gres=gpu:1
 #SBATCH --output=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/inference_picasso_syndiff_%j.out
 #SBATCH --error=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/inference_picasso_syndiff_%j.err
 
