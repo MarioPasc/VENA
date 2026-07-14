@@ -217,15 +217,36 @@ class VenaFMAdapter(InferenceModel):
         stage = cfg["run"]["stage"]
         stage = stage.upper() if str(stage).startswith("s") else stage
 
+        # The three S1-v3 (2026-06-22) knobs. Forwarding them is mandatory —
+        # omitting any one silently rebuilds a DIFFERENT architecture than the
+        # checkpoint was trained with:
+        #
+        #  * `controlnet.enabled: false` (v3a, the concat-only ablation) means
+        #    Variant A: no ControlNet and no ConditioningAssembler at all. Passing
+        #    the default `True` with an empty `conditioning_inputs` made the
+        #    assembler raise "requires at least one spec" and the row was skipped.
+        #
+        #  * `trunk.input_concat` (every v3b* run) channel-concatenates the
+        #    conditioning latents onto x_t, which is why those runs carry
+        #    `arch_overrides.in_channels: 16` (4 noisy + 3x4 cond). Omitting it
+        #    built a 16-channel conv_in and then fed it 4 channels — every patient
+        #    died on "expected input to have 16 channels, but got 4".
+        #
+        # The module handles both paths internally: compute_val_conditioning()
+        # caches the concat tensor and _make_ema_call() reads it, so nothing else
+        # in the sampling path needs to change.
         module = FMLightningModule(
             trunk_config=trunk_cfg,
-            conditioning_specs=list(controlnet_yaml["conditioning_inputs"]),
+            conditioning_specs=list(controlnet_yaml.get("conditioning_inputs") or []),
             stage=stage,
             controlnet_arch_overrides=controlnet_yaml.get("arch_overrides", {}),
             rflow_cfg=dict(rflow_yaml) if isinstance(rflow_yaml, dict) else {},
             ema_cfg=dict(ema_yaml) if isinstance(ema_yaml, dict) else {},
             region_resolver=None,
             vae_decoder=None,
+            controlnet_enabled=bool(controlnet_yaml.get("enabled", True)),
+            controlnet_init_from_trunk_enabled=bool(controlnet_yaml.get("init_from_trunk", True)),
+            input_concat_cfg=trunk_yaml.get("input_concat"),
         )
         module = module.to(self.device)
         module.setup()

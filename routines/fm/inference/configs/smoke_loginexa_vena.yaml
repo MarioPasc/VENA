@@ -1,0 +1,47 @@
+# VENA-rows-only loginexa smoke — the fast gate for the four VENA method-rows.
+#
+# Exists because the VENA rows are the ones that keep breaking: they are the only
+# rows whose architecture is reconstructed from the training run's config.yaml
+# rather than being fixed by the adapter, so an adapter that lags the training
+# recipe rebuilds the WRONG network and either raises or silently mis-samples.
+# Re-running the full 12-row smoke to test a VENA-only change costs ~8 min of
+# competitor re-runs for nothing; this config isolates them (~1 min).
+#
+# The three failures this config guards against, all seen on 2026-07-11:
+#   1. v3a (`controlnet.enabled: false`) -> "ConditioningAssembler requires at
+#      least one spec" when the adapter builds a ControlNet regardless.
+#   2. v3b* (`trunk.input_concat`) -> "expected input to have 16 channels, but
+#      got 4" when the adapter omits the channel-concat conditioning.
+#   3. use_timestep_transform without input_img_size_numel -> every patient fails
+#      behind a WARNING, producing a silently EMPTY tree (no exception at all).
+#
+# A green run here means: 4 rows x 8 cohorts = 32 predictions, zero warnings.
+
+run_id_tag: smoke_loginexa_vena
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/train/configs/corpus/corpus_picasso.json
+models_yaml: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/fm/inference/configs/models/benchmark_full.yaml
+fold: 0
+device: cuda:0
+warmup_passes: 0
+
+cohorts:
+  cv_test: [UCSF-PDGM, BraTS-GLI, IvyGAP, LUMIERE, REMBRANDT, UPENN-GBM]
+  test_only: [BraTS-Africa-Glioma, BraTS-Africa-Other]
+  exclude: []
+
+methods:
+  include: [VENA-S1-v3a, VENA-S1-v3b, VENA-S1-v3b-rw, VENA-S3-LPL-b2c]
+  exclude: []
+
+smoke:
+  enabled: true
+  n_patients_per_cohort: 1
+  use_selection_nfe_only: true
+
+nfe_override: null
+
+figure:
+  enabled: false
+
+log_level: INFO
