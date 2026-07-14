@@ -3,7 +3,7 @@
 #SBATCH --time=1-00:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=150G
 #SBATCH --constraint=a100
 #SBATCH --partition=gpu_partition
 #SBATCH --gres=gpu:1

@@ -3,7 +3,12 @@
 #SBATCH --time=4-00:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+# 64G OOM-killed every shard on 2026-07-14 before a single prediction was written:
+# the engine pre-builds a reference cache for all 393 test patients (~63 GB) and
+# then accumulates a whole cohort x every NFE of full-resolution records. The
+# launcher overrides --mem per shard (see its SHARDS table); this is the floor for
+# a direct sbatch. exa nodes have 900 GB.
+#SBATCH --mem=150G
 #SBATCH --constraint=a100
 #SBATCH --partition=gpu_partition
 #SBATCH --gres=gpu:1

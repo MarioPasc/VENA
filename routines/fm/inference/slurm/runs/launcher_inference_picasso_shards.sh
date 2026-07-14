@@ -46,14 +46,37 @@ if [[ "${1:-}" == "--dry-run" ]]; then
     shift
 fi
 
-# shard | config basename | conda env | walltime | worker
+# HOST-RAM SIZING (2026-07-14, load-bearing). The first submission attempt ran
+# with the worker's default --mem=64G and all three shards were OOM_KILLED at
+# ~10 min having written NOTHING. Host RAM, not VRAM. Two additive consumers:
+#
+#  1. `_build_reference_cache` (engine.py:181) is built ONCE, UP FRONT, for every
+#     patient of every cohort: 4 reference volumes + 2 masks ~= 161 MB/patient
+#     x 393 test patients ~= 63 GB before a single prediction is made. This alone
+#     exceeded 64G, which is why even the 1-NFE a_cheap shard died.
+#  2. `records_by_nfe` accumulates a whole cohort x every NFE before flushing.
+#     A PerPatientRecord is ~232 MB (6 float32 volumes + 2 int8 masks), and the
+#     reference volumes are duplicated into EVERY NFE's record. Peak is the
+#     largest cohort, BraTS-GLI at 114 patients:
+#         a_cheap   1 NFE  x 114 x 232 MB =  26 GB
+#         b_vena    5 NFE  x 114 x 232 MB = 132 GB
+#         c_latent  6 NFE  x 114 x 232 MB = 158 GB
+#         d_lddpm   4 NFE  x 114 x 232 MB = 105 GB
+#         e_syndiff 1 NFE  x 114 x 232 MB =  26 GB
+#
+# --mem below is (63 GB cache + the row above) with ~30% headroom. The exa nodes
+# carry 900 GB each, so this is comfortably affordable; do not trim it back to a
+# round 64G. The real fix is to stream the H5 writes and make the reference cache
+# per-cohort rather than global — until then, memory is the cost of the design.
+#
+# shard | config basename | conda env | walltime | mem | worker
 # Walltimes are ~2x the estimate so a slow queue/node never truncates a shard.
 SHARDS=(
-    "a_cheap|picasso_shard_a_cheap.yaml|vena|06:00:00|worker_inference_picasso_full.sh"
-    "b_vena|picasso_shard_b_vena.yaml|vena|1-00:00:00|worker_inference_picasso_full.sh"
-    "c_latent|picasso_shard_c_latent.yaml|vena|1-00:00:00|worker_inference_picasso_full.sh"
-    "d_lddpm|picasso_shard_d_lddpm.yaml|vena|3-00:00:00|worker_inference_picasso_full.sh"
-    "e_syndiff|picasso_full_syndiff.yaml|vena-syndiff|12:00:00|worker_inference_picasso_syndiff.sh"
+    "a_cheap|picasso_shard_a_cheap.yaml|vena|06:00:00|150G|worker_inference_picasso_full.sh"
+    "b_vena|picasso_shard_b_vena.yaml|vena|1-00:00:00|260G|worker_inference_picasso_full.sh"
+    "c_latent|picasso_shard_c_latent.yaml|vena|1-00:00:00|300G|worker_inference_picasso_full.sh"
+    "d_lddpm|picasso_shard_d_lddpm.yaml|vena|3-00:00:00|230G|worker_inference_picasso_full.sh"
+    "e_syndiff|picasso_full_syndiff.yaml|vena-syndiff|12:00:00|150G|worker_inference_picasso_syndiff.sh"
 )
 
 WANTED=("$@")
@@ -66,7 +89,7 @@ want() {
 
 SUBMITTED=()
 for row in "${SHARDS[@]}"; do
-    IFS="|" read -r shard cfg env walltime worker <<<"${row}"
+    IFS="|" read -r shard cfg env walltime mem worker <<<"${row}"
     want "${shard}" || continue
 
     config_path="${CFG_DIR}/${cfg}"
@@ -75,6 +98,7 @@ for row in "${SHARDS[@]}"; do
     sbatch_cmd="sbatch --parsable \
         -J ${job_name} \
         --time=${walltime} \
+        --mem=${mem} \
         --gres=gpu:1 --constraint=a100 \
         --output=${LOGS_DIR}/inference_${shard}_%j.out \
         --error=${LOGS_DIR}/inference_${shard}_%j.err \
@@ -88,7 +112,7 @@ for row in "${SHARDS[@]}"; do
 
     job_id=$(eval "${sbatch_cmd}")
     SUBMITTED+=("${job_id} ${job_name}")
-    echo "Submitted ${job_id}  ${job_name}  (${walltime}, env=${env})"
+    echo "Submitted ${job_id}  ${job_name}  (${walltime}, mem=${mem}, env=${env})"
 done
 
 ${DRY_RUN} && exit 0
