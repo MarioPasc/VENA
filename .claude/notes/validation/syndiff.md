@@ -331,10 +331,59 @@ training set".
    real T1c NIfTI by `patient_id`, so affine alignment isn't load-bearing.
    Flag if a downstream consumer assumes scanner-space affines.
 
+## Contingency C1 is ACTIVE on Picasso (2026-07-14)
+
+`PATCHES.md` requires the activation of C1 to be recorded here. It is active,
+and it is now the *default* path for SynDiff inference on Picasso.
+
+**Why.** The `vena-syndiff` env no longer exists — it was deleted from
+`fscratch/conda_envs/` some time after the 2026-06-15 training runs. Rebuilding
+it from the recipe in this file (§"vena-syndiff — Picasso A100 recipe") does not
+work:
+
+- The recipe pins `python=3.10`, but `pyproject.toml` now sets
+  `requires-python = ">=3.11"`, so `pip install -e .` refuses outright.
+- The resulting toolchain cannot compile the StyleGAN2 fused kernels. Installing
+  only `cuda-nvcc` leaves `cusparse.h` missing (torch's `CUDAContextLight.h`
+  needs the full toolkit), and conda's `gxx_linux-64` resolves to a gcc that
+  nvcc rejects with `'timespec_get' has not been declared in '::'`. pip also
+  quietly upgraded torch off the 2.4/cu124 pin while resolving the deps.
+- The main `vena` env has no `ninja`, so the JIT build cannot even start there.
+
+**What runs instead.** `_ensure_stylegan_ops()` in
+`src/vena/competitors/syndiff/runner.py` attempts the fused kernels first and,
+on any build failure, pre-seeds `sys.modules` with the pure-PyTorch equivalents
+in `src/vena/competitors/syndiff/fused_ops_fallback.py` before the vendored
+backbones import `utils.op`. `PATCHES.md` phrases C1 as editing
+`utils/op/__init__.py`; `external-deps.md` forbids touching `src/external/`, so
+C1 is applied from our side instead. Nothing under `src/external/` was modified.
+
+**Numerics.** Not an approximation. Both upstream op modules already ship this
+exact arithmetic as their `device.type == "cpu"` branch; the CUDA kernels are a
+fused spelling of it. The shim keeps `FusedLeakyReLU.bias`'s name and shape (so
+the trained checkpoint loads unchanged) and honours `negative_slope`, which the
+CUDA kernel does and upstream's CPU branch does not (it hard-codes 0.2 — moot
+here, since SynDiff only uses the 0.2 default). Cost is ~2-4x per layer, which
+is irrelevant at SynDiff's NFE=4. Pinned by
+`tests/competitors/test_syndiff_fused_fallback.py`.
+
+**Consequence.** SynDiff needs no special env and no compiler. The Picasso
+inference shard (`e_syndiff`) runs in the plain `vena` env.
+
+**Evidence.** loginexa smoke 2026-07-14: 24/24 predictions (3 rows x 8 cohorts),
+zero failures, log shows
+`SynDiff fused CUDA ops unavailable (RuntimeError: Ninja is required to load C++
+extensions) — activating PATCHES.md contingency C1`.
+
+If a future host does have a working CUDA toolchain, the fused kernels are used
+automatically and C1 stays dormant — no code change needed.
+
 ## Open follow-ups
 
-- Run server-3 smoke once `vena-syndiff` is built on icai-server.
-- Run loginexa smoke once `vena-v100-syndiff` is built.
-- Submit Picasso panel (t1pre / t2 / flair) after both smokes pass.
+- ~~Run loginexa smoke once `vena-v100-syndiff` is built.~~ Done via C1
+  (2026-07-14) — no SynDiff-specific env is needed any more.
+- ~~Submit Picasso panel (t1pre / t2 / flair).~~ Submitted 2026-07-14 as the
+  `e_syndiff` inference shard.
+- Server-3 runs, if ever needed, take the same C1 path; no env to build.
 - After Picasso runs land, write a brief comparison vs `pgan_cgan` (PSNR /
   SSIM table, computational footprint). Not in scope for this integration.
