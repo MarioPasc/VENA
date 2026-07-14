@@ -45,6 +45,43 @@ _UPSTREAM_DIR = (Path(__file__).resolve().parent.parent.parent.parent
                  / "external" / "syndiff" / "upstream")
 
 
+def _ensure_stylegan_ops() -> None:
+    """Make ``utils.op`` importable, with or without a working CUDA toolchain.
+
+    The vendored ``utils.op`` submodules call ``cpp_extension.load`` at *import*
+    time, so importing them JIT-builds the StyleGAN2 fused kernels. Try that first
+    — when it works we keep the fast fused path. When it does not (no ninja in the
+    env, or an nvcc/gcc combination that will not compile the ``.cu`` sources, both
+    of which we hit on Picasso), fall back to contingency C1 from
+    ``src/external/syndiff/PATCHES.md``: the pure-PyTorch reference ops, which
+    compute the same arithmetic and need no build.
+
+    Must run before the vendored backbones are imported — they pull in ``utils.op``
+    transitively.
+    """
+    try:
+        import utils.op  # noqa: F401
+
+        logger.debug("SynDiff fused CUDA ops built/loaded")
+        return
+    except (ImportError, RuntimeError, OSError) as exc:
+        logger.warning(
+            "SynDiff fused CUDA ops unavailable (%s: %s) — activating PATCHES.md "
+            "contingency C1 (pure-PyTorch reference ops)",
+            type(exc).__name__,
+            str(exc).splitlines()[0] if str(exc) else "",
+        )
+
+    # A failed `load()` can leave a half-initialised entry behind; clear it so the
+    # shim is what the backbones actually resolve.
+    for name in [n for n in sys.modules if n == "utils.op" or n.startswith("utils.op.")]:
+        del sys.modules[name]
+
+    from .fused_ops_fallback import install as install_native_fused_ops
+
+    install_native_fused_ops()
+
+
 def _import_upstream():
     """Inject the vendored ``upstream/`` directory into ``sys.path`` and import.
 
@@ -59,6 +96,7 @@ def _import_upstream():
     upstream = str(_UPSTREAM_DIR)
     if upstream not in sys.path:
         sys.path.insert(0, upstream)
+    _ensure_stylegan_ops()
     try:
         from backbones.discriminator import Discriminator_large
         from backbones.generator_resnet import define_D, define_G

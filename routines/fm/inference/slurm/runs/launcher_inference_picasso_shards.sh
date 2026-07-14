@@ -76,8 +76,22 @@ SHARDS=(
     "b_vena|picasso_shard_b_vena.yaml|vena|1-00:00:00|260G|worker_inference_picasso_full.sh"
     "c_latent|picasso_shard_c_latent.yaml|vena|1-00:00:00|300G|worker_inference_picasso_full.sh"
     "d_lddpm|picasso_shard_d_lddpm.yaml|vena|3-00:00:00|230G|worker_inference_picasso_full.sh"
-    "e_syndiff|picasso_full_syndiff.yaml|vena-syndiff|12:00:00|150G|worker_inference_picasso_syndiff.sh"
+    "e_syndiff|picasso_full_syndiff.yaml|vena|12:00:00|150G|worker_inference_picasso_full.sh"
 )
+
+# SHARD E runs in the plain `vena` env, NOT `vena-syndiff` (2026-07-14).
+# The `vena-syndiff` env was deleted from fscratch/conda_envs after the 2026-06-15
+# SynDiff training runs, and rebuilding it did not work: the recipe pins python
+# 3.10 while pyproject requires >=3.11, and the resulting toolchain could not
+# compile the StyleGAN2 fused CUDA kernels (missing cusparse.h; nvcc rejecting the
+# conda gcc with "'timespec_get' has not been declared").
+#
+# Instead we take contingency C1 from src/external/syndiff/PATCHES.md:
+# `_ensure_stylegan_ops()` (src/vena/competitors/syndiff/runner.py) tries the fused
+# kernels first and, when they will not build, transparently substitutes the
+# pure-PyTorch reference ops — same arithmetic, no nvcc/ninja, ~2-4x slower per
+# layer, which is irrelevant at SynDiff's NFE=4. So SynDiff needs no special env
+# and no compiler at all.
 
 WANTED=("$@")
 want() {
