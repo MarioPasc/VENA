@@ -54,6 +54,14 @@ fi
 #     patient of every cohort: 4 reference volumes + 2 masks ~= 161 MB/patient
 #     x 393 test patients ~= 63 GB before a single prediction is made. This alone
 #     exceeded 64G, which is why even the 1-NFE a_cheap shard died.
+#  0. `per_cohort_selection_pred` (engine.py) caches one DECODED selection-NFE
+#     tensor per (cohort, patient, method) for the best/worst comparison figures,
+#     and is not freed until figure rendering at the very end. It therefore
+#     scales with METHOD COUNT, so the a_cheap shard — the cheapest per-method but
+#     with the MOST methods (6) — peaks highest: 6 x 393 x ~36 MB ~= 84 GB on top
+#     of the ~63 GB reference cache = ~147 GB, which OOM-killed it at --mem=150G
+#     (job 1574657, 41/48 files). Hence a_cheap alone is bumped to 300G. The real
+#     fix is to free the tensor cache per method once its figure is rendered.
 #  2. `records_by_nfe` accumulates a whole cohort x every NFE before flushing.
 #     A PerPatientRecord is ~232 MB (6 float32 volumes + 2 int8 masks), and the
 #     reference volumes are duplicated into EVERY NFE's record. Peak is the
@@ -72,7 +80,7 @@ fi
 # shard | config basename | conda env | walltime | mem | worker
 # Walltimes are ~2x the estimate so a slow queue/node never truncates a shard.
 SHARDS=(
-    "a_cheap|picasso_shard_a_cheap.yaml|vena|06:00:00|150G|worker_inference_picasso_full.sh"
+    "a_cheap|picasso_shard_a_cheap.yaml|vena|06:00:00|300G|worker_inference_picasso_full.sh"
     "b_vena|picasso_shard_b_vena.yaml|vena|1-00:00:00|260G|worker_inference_picasso_full.sh"
     "c_latent|picasso_shard_c_latent.yaml|vena|1-00:00:00|300G|worker_inference_picasso_full.sh"
     "d_lddpm|picasso_shard_d_lddpm.yaml|vena|3-00:00:00|230G|worker_inference_picasso_full.sh"
