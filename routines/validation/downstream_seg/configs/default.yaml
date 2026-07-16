@@ -1,0 +1,31 @@
+# Downstream-seg routine — §4.4
+# Full sweep: all methods × all Ring-A + Ring-B cohorts.
+# Override inference_root / output_root / corpus_map for your host.
+
+inference_root: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/results/fm/inference
+output_root:    /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/results/fm/analyses
+
+bundle_path:    /mnt/home/users/tic_163_uma/mpascual/fscratch/bundles/brats_mri_segmentation
+
+corpus_map:
+  UCSF-PDGM:    /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSFPDGM_image.h5
+  BraTS-GLI:    /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/BraTSGLI_image.h5
+  IvyGAP:       /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/IvyGAP_image.h5
+  BraTS-Africa-Glioma: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/BraTSAfricaGlioma_image.h5
+
+ring_partitions_path: results/fm/analyses/preregister/LATEST/ring_partitions.json
+
+# Empty = all discovered methods; set to a list to shard by method for Picasso fan-out.
+methods: []
+
+# Empty = all cohorts with a corpus_map entry; set to restrict a job.
+cohorts: []
+
+device: cuda:0
+amp:    true
+
+# Only run each method at its pre-registered selection_nfe (default: true).
+# Set false to generate all NFE levels (for ablation / NFE-sensitivity tables).
+selection_nfe_only: true
+
+log_level: INFO

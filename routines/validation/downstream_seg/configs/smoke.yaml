@@ -1,0 +1,35 @@
+# Downstream-seg SMOKE config — IvyGAP 5 scans x C0-Identity NFE=1.
+# Target: < 10 min on one A100 (smoke only; do not submit full sweep).
+#
+# Canaries to verify (docs/05_downstream_seg.md §3.2):
+#   Dice_real WT ~ 0.85-0.92  (near-zero => channel-order bug)
+#   Dice_real TC ~ 0.80-0.88
+#   Dice_real ET ~ 0.70-0.85  (NaN for non-enhancing cases)
+#   WT join proof: delta_wt for C0-Identity ~ 0.0 (identity model copies real T1c)
+#
+# Paths verified 2026-07-16 (Picasso).
+# Corpus H5 pattern: fscratch/datasets/vena/<COHORT>/h5/<NAME>_image.h5
+# ring_partitions.json written by T0 preregister at analyses/preregister/LATEST/
+
+inference_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+output_root:    /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference/analyses
+
+bundle_path:    /mnt/home/users/tic_163_uma/mpascual/fscratch/bundles/brats_mri_segmentation
+
+corpus_map:
+  IvyGAP: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/IvyGAP/h5/IvyGAP_image.h5
+
+ring_partitions_path: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference/analyses/preregister/LATEST/ring_partitions.json
+
+# Restrict to Identity (fastest; provides WT join proof canary).
+methods:
+  - C0-Identity
+
+cohorts:
+  - IvyGAP
+
+device: cuda:0
+amp:    true
+selection_nfe_only: true
+
+log_level: INFO
