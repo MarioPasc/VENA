@@ -245,7 +245,6 @@ class PairedFidelityEngine:
         cfg = self.cfg
 
         # ---- Setup ----
-        # make_run_dir creates <output_root>/<routine_name>/<UTC-stamp>/ with sub-dirs
         run_dir = make_run_dir(cfg.output_root, "paired_fidelity")
         logger.info("Run directory: %s", run_dir)
 
@@ -268,8 +267,7 @@ class PairedFidelityEngine:
             shard_discovery.skipped_smoke or "none",
         )
 
-        # ---- Build index (calls discover_shards internally; consistent because
-        #      smoke filtering is content-based, not directory-name-based) ----
+        # ---- Build index ----
         logger.info("Building index from %s …", cfg.data_root)
         index = build_index(cfg.data_root)
         if index.empty:
@@ -301,17 +299,63 @@ class PairedFidelityEngine:
         if not rows:
             raise PairedFidelityError("No scans processed — check filters and data paths.")
 
-        # ---- Write per-scan CSV ----
         per_scan_df = pd.DataFrame(rows)
-        # Ensure frozen column order (no white cells).
-        # pred_mode is string metadata (not averaged in collapse) — placed in id_cols.
-        # raw_p995 is a float audit column — placed in _METRIC_COLS for collapse.
+        elapsed = time.perf_counter() - t_start
+
+        return self.run_postprocess(
+            run_dir,
+            per_scan_df=per_scan_df,
+            n_files=n_files,
+            n_scans=n_scans,
+            elapsed_s=elapsed,
+            skipped_smoke_shards=shard_discovery.skipped_smoke,
+        )
+
+    def run_postprocess(
+        self,
+        run_dir: Path,
+        *,
+        per_scan_df: pd.DataFrame,
+        n_files: int,
+        n_scans: int,
+        elapsed_s: float,
+        skipped_smoke_shards: list[str],
+    ) -> Path:
+        """Run the analysis phase from a pre-collected per-scan DataFrame.
+
+        Called by :meth:`run` (smoke / single-node) and by ``cli_merge`` after
+        concatenating sweep shards.  The collapse and Holm correction run
+        exactly once here — never per shard.
+
+        Parameters
+        ----------
+        run_dir :
+            Destination artifact directory (already created by the caller).
+        per_scan_df :
+            One row per (scan × method × cohort × nfe) with all metric columns.
+        n_files :
+            Number of prediction files (or shards) consumed upstream.
+        n_scans :
+            Total scan rows before patient collapse.
+        elapsed_s :
+            Wall-clock seconds for the upstream work (scan loop or shard concat).
+        skipped_smoke_shards :
+            Shard names excluded by ``discover_shards`` (passed through to the
+            decision payload for auditability).
+
+        Returns
+        -------
+        Path
+            The artifact directory.
+        """
+        if per_scan_df.empty:
+            raise PairedFidelityError("per_scan_df is empty — nothing to analyse.")
+
+        # ---- Enforce frozen column order (no white cells) ----
         id_cols = ["method", "cohort", "ring", "nfe", "scan_id", "patient_id", "pred_mode"]
         per_scan_df = per_scan_df[[c for c in id_cols + _METRIC_COLS if c in per_scan_df.columns]]
 
         # ---- Scoring-space audit: per-method mode counts ----
-        # Records how many scans of each method were scored in "raw" vs "harmonised" space.
-        # Expected: 15 methods → "raw"; C0-Identity (scanner units) → "harmonised".
         if "pred_mode" in per_scan_df.columns:
             _mode_pivot = (
                 per_scan_df.groupby("method")["pred_mode"].value_counts().unstack(fill_value=0)
@@ -325,10 +369,7 @@ class PairedFidelityEngine:
         write_per_scan_csv(run_dir, per_scan_df, name="paired_fidelity.csv")
         logger.info("Wrote per_scan/paired_fidelity.csv (%d rows)", len(per_scan_df))
 
-        # ---- Patient-level collapse ----
-        # Include "ring" in the groupby so the column survives into per_patient_df.
-        # collapse_to_patient defaults to ("method","cohort","nfe","patient_id");
-        # adding "ring" preserves the ring label for Ring-A statistical gating.
+        # ---- Patient-level collapse (ONCE — not per shard) ----
         value_cols = [c for c in _METRIC_COLS if c in per_scan_df.columns]
         per_patient_df = collapse_to_patient(
             per_scan_df,
@@ -344,7 +385,7 @@ class PairedFidelityEngine:
         # ---- LUMIERE collapse sanity check ----
         self._check_lumiere_collapse(per_scan_df, per_patient_df)
 
-        # ---- Statistical pass (Ring A only) ----
+        # ---- Statistical pass — Ring A, Holm correction (ONCE) ----
         ring_a_pt = per_patient_df[per_patient_df["ring"] == "A"].copy()
         holm_tables = self._statistical_pass(ring_a_pt, run_dir)
 
@@ -360,7 +401,6 @@ class PairedFidelityEngine:
         # ---- Figures ----
         self._make_figures(run_dir, per_scan_df, per_patient_df, holm_tables, c0_results)
 
-        elapsed = time.perf_counter() - t_start
         n_patients = len(per_patient_df["patient_id"].unique())
 
         # ---- decision.json ----
@@ -369,21 +409,21 @@ class PairedFidelityEngine:
             n_files=n_files,
             n_scans=n_scans,
             n_patients=n_patients,
-            elapsed_s=elapsed,
+            elapsed_s=elapsed_s,
             c0_results=c0_results,
             pred_mode_counts=pred_mode_counts,
-            skipped_smoke_shards=shard_discovery.skipped_smoke,
+            skipped_smoke_shards=skipped_smoke_shards,
         )
 
         self._write_report(
             run_dir,
             n_scans=n_scans,
             n_patients=n_patients,
-            elapsed_s=elapsed,
+            elapsed_s=elapsed_s,
             c0_results=c0_results,
         )
         symlink_latest(run_dir)
-        logger.info("Done in %.1f s — artifact: %s", elapsed, run_dir)
+        logger.info("Done in %.1f s — artifact: %s", elapsed_s, run_dir)
         return run_dir
 
     # ------------------------------------------------------------------
