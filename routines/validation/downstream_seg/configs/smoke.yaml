@@ -30,9 +30,21 @@
 #      A delta_et near 0 would indicate an error (e.g. T1pre ≈ T1c —
 #      biologically impossible for IvyGAP GBMs).
 #
+# Sweep extrapolation (measured 2026-07-16, IvyGAP smoke):
+#   1.18 s / arm call (segmenter invocation), model pre-loaded.
+#   Current test set: Ring A (321) + Ring B without PED (146) = 467 unique scans.
+#   Real-arm calls (cached after first method):  467
+#   Synth-arm calls: 467 × 16 methods           = 7 472
+#   Total: 7 939 × 1.18 s ≈ 9 370 s ≈ 2.6 GPU-hours on one A100.
+#   With BraTS-PED backfill (727 scans total): ≈ 4.0 GPU-hours.
+#   Sharding by cohort (9 jobs) → < 1 h per shard; worker already requests 4 h.
+#   N.B. The prior estimate of 19 h was wrong — it used full corpus sizes
+#   (3 498 scans) instead of test-split sizes (467 scans). SHARED_CONTRACTS §5
+#   is the authoritative source; IvyGAP=5 was confirmed by the smoke itself.
+#
 # Paths from corpus_picasso.json (source of truth — dir names are lowercase).
 # ring_partitions_bootstrap.json is used until vena-validation-preregister lands;
-# it derives Ring A (role=cv) / Ring B (role=test_only) from corpus_picasso.json.
+# it carries test-split n_scans per cohort (NOT full-corpus sizes).
 
 inference_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
 output_root:    /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference/analyses

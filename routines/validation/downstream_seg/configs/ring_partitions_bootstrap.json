@@ -1,14 +1,15 @@
 {
   "_comment": "Bootstrap ring_partitions.json derived from corpus_picasso.json. Role=cv -> Ring A, role=test_only -> Ring B. Replace with the output of vena-validation-preregister when that routine lands.",
+  "_n_scans_note": "n_scans = test-split size (held-out predictions), NOT full-corpus size. Ring A cohorts expose only their test partition; Ring B cohorts are test_only (no train/val split). Source: SHARED_CONTRACTS §5. IvyGAP=5 confirmed empirically from smoke (2026-07-16).",
   "rings": {
     "A": {
       "cohorts": {
-        "UCSF-PDGM":   {"n_scans": 495},
-        "BraTS-GLI":   {"n_scans": 1251},
-        "UPENN-GBM":   {"n_scans": 611},
-        "IvyGAP":      {"n_scans": 34},
-        "LUMIERE":     {"n_scans": 638},
-        "REMBRANDT":   {"n_scans": 63}
+        "UCSF-PDGM":   {"n_scans": 50},
+        "BraTS-GLI":   {"n_scans": 127},
+        "UPENN-GBM":   {"n_scans": 62},
+        "IvyGAP":      {"n_scans": 5},
+        "LUMIERE":     {"n_scans": 72},
+        "REMBRANDT":   {"n_scans": 5}
       }
     },
     "B": {
