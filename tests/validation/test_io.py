@@ -1,0 +1,305 @@
+"""Tests for vena.validation.io.
+
+Focus: join correctness (by scan_id, not by row index), missing-scan
+behaviour, and streaming memory contract.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import h5py
+import numpy as np
+import pytest
+
+pytestmark = pytest.mark.validation
+
+
+# ---------------------------------------------------------------------------
+# Synthetic H5 helpers
+# ---------------------------------------------------------------------------
+
+H, W, D = 16, 16, 16  # small shape for fast tests
+
+
+def _vlen_str(grp: h5py.Group, name: str, values: list[str]) -> None:
+    dt = h5py.string_dtype(encoding="utf-8")
+    grp.create_dataset(name, data=np.asarray(values, dtype=object), dtype=dt)
+
+
+def _make_pred_h5(
+    path: Path,
+    scan_ids: list[str],
+    patient_ids: list[str],
+    *,
+    method: str = "VENA-test",
+    cohort: str = "TestCohort",
+    nfe: int = 5,
+    ring: str = "A",
+    references_h5: str = "references/TestCohort.h5",
+) -> None:
+    """Write a minimal schema-2.0 prediction H5."""
+    n = len(scan_ids)
+    with h5py.File(path, "w") as f:
+        f.attrs["schema_version"] = "2.0"
+        f.attrs["method"] = method
+        f.attrs["cohort"] = cohort
+        f.attrs["nfe"] = nfe
+        f.attrs["ring"] = ring
+        f.attrs["references_h5"] = references_h5
+
+        g = f.create_group("predictions")
+        data = np.random.default_rng(0).random((n, H, W, D), dtype=np.float32)
+        g.create_dataset(
+            "t1c_synthetic_harmonised",
+            data=data,
+            chunks=(1, H, W, D),
+        )
+        g.create_dataset(
+            "t1c_synthetic_raw",
+            data=data.copy(),
+            chunks=(1, H, W, D),
+        )
+
+        g_msk = f.create_group("masks")
+        masks_int = np.ones((n, H, W, D), dtype=np.int8)
+        g_msk.create_dataset("brain", data=masks_int, chunks=(1, H, W, D))
+        g_msk.create_dataset("wt", data=masks_int, chunks=(1, H, W, D))
+
+        g_meta = f.create_group("metadata")
+        _vlen_str(g_meta, "scan_id", scan_ids)
+        _vlen_str(g_meta, "patient_id", patient_ids)
+        _vlen_str(g_meta, "cohort", [cohort] * n)
+        g_meta.create_dataset(
+            "inference_seconds",
+            data=np.ones(n, dtype=np.float32),
+        )
+        g_meta.create_dataset(
+            "peak_vram_mb",
+            data=np.full(n, 1000.0, dtype=np.float32),
+        )
+        g_meta.create_dataset("nfe", data=np.full(n, nfe, dtype=np.int32))
+
+
+def _make_ref_h5(
+    path: Path,
+    scan_ids: list[str],
+    patient_ids: list[str],
+    *,
+    cohort: str = "TestCohort",
+) -> None:
+    """Write a minimal schema-2.0 reference H5."""
+    n = len(scan_ids)
+    rng = np.random.default_rng(42)
+    with h5py.File(path, "w") as f:
+        f.attrs["schema_version"] = "2.0"
+        f.attrs["cohort"] = cohort
+
+        g_ref = f.create_group("reference")
+        vol = rng.random((n, H, W, D), dtype=np.float32)
+        for name in (
+            "t1c_real_harmonised",
+            "t1pre_harmonised",
+            "t2_harmonised",
+            "flair_harmonised",
+        ):
+            g_ref.create_dataset(name, data=vol.copy(), chunks=(1, H, W, D))
+
+        g_msk = f.create_group("masks")
+        masks_int = np.ones((n, H, W, D), dtype=np.int8)
+        g_msk.create_dataset("brain", data=masks_int, chunks=(1, H, W, D))
+        g_msk.create_dataset("wt", data=masks_int, chunks=(1, H, W, D))
+
+        g_meta = f.create_group("metadata")
+        _vlen_str(g_meta, "scan_id", scan_ids)
+        _vlen_str(g_meta, "patient_id", patient_ids)
+        _vlen_str(g_meta, "cohort", [cohort] * n)
+
+
+# ---------------------------------------------------------------------------
+# Tests — join by scan_id
+# ---------------------------------------------------------------------------
+
+
+def test_iter_scans_join_by_scan_id_not_row_order(tmp_path: Path) -> None:
+    """The join must be by scan_id even when reference rows are shuffled.
+
+    An index-join would pass a naive test but fail this one.
+    """
+    from vena.validation.io import ReferenceCache, iter_scans
+
+    # 3 scans in prediction order: A, B, C
+    pred_scan_ids = ["scan_A", "scan_B", "scan_C"]
+    pred_patient_ids = ["pt_A", "pt_B", "pt_C"]
+
+    # Reference stores them in REVERSED order: C, B, A
+    ref_scan_ids = ["scan_C", "scan_B", "scan_A"]
+    ref_patient_ids = ["pt_C", "pt_B", "pt_A"]
+
+    shard = tmp_path / "shard"
+    pred_dir = shard / "predictions" / "VENA-test" / "TestCohort"
+    pred_dir.mkdir(parents=True)
+    ref_dir = shard / "references"
+    ref_dir.mkdir(parents=True)
+
+    pred_path = pred_dir / "nfe_5.h5"
+    ref_path = ref_dir / "TestCohort.h5"
+
+    # Write unique deterministic values per scan so we can assert correct matching.
+    n = 3
+    with h5py.File(pred_path, "w") as f:
+        f.attrs["schema_version"] = "2.0"
+        f.attrs["method"] = "VENA-test"
+        f.attrs["cohort"] = "TestCohort"
+        f.attrs["nfe"] = 5
+        f.attrs["ring"] = "A"
+        f.attrs["references_h5"] = "references/TestCohort.h5"
+
+        g = f.create_group("predictions")
+        # Each scan gets a unique fill value: 0.1, 0.2, 0.3
+        data = np.stack([np.full((H, W, D), 0.1 * (i + 1), dtype=np.float32) for i in range(n)])
+        g.create_dataset("t1c_synthetic_harmonised", data=data, chunks=(1, H, W, D))
+        g.create_dataset("t1c_synthetic_raw", data=data, chunks=(1, H, W, D))
+        g_msk = f.create_group("masks")
+        m = np.ones((n, H, W, D), dtype=np.int8)
+        g_msk.create_dataset("brain", data=m, chunks=(1, H, W, D))
+        g_msk.create_dataset("wt", data=m, chunks=(1, H, W, D))
+        g_meta = f.create_group("metadata")
+        dt = h5py.string_dtype(encoding="utf-8")
+        g_meta.create_dataset("scan_id", data=np.asarray(pred_scan_ids, dtype=object), dtype=dt)
+        g_meta.create_dataset(
+            "patient_id", data=np.asarray(pred_patient_ids, dtype=object), dtype=dt
+        )
+        g_meta.create_dataset("cohort", data=np.asarray(["TestCohort"] * n, dtype=object), dtype=dt)
+        g_meta.create_dataset("inference_seconds", data=np.ones(n, dtype=np.float32))
+        g_meta.create_dataset("peak_vram_mb", data=np.ones(n, dtype=np.float32))
+        g_meta.create_dataset("nfe", data=np.full(n, 5, dtype=np.int32))
+
+    with h5py.File(ref_path, "w") as f:
+        f.attrs["schema_version"] = "2.0"
+        f.attrs["cohort"] = "TestCohort"
+        g_ref = f.create_group("reference")
+        # Reference volumes: unique fill values 0.9, 0.8, 0.7 for C, B, A
+        ref_data = np.stack([np.full((H, W, D), 0.9 - 0.1 * i, dtype=np.float32) for i in range(n)])
+        g_ref.create_dataset("t1c_real_harmonised", data=ref_data, chunks=(1, H, W, D))
+        for name in ("t1pre_harmonised", "t2_harmonised", "flair_harmonised"):
+            g_ref.create_dataset(name, data=ref_data, chunks=(1, H, W, D))
+        g_msk = f.create_group("masks")
+        m = np.ones((n, H, W, D), dtype=np.int8)
+        g_msk.create_dataset("brain", data=m, chunks=(1, H, W, D))
+        g_msk.create_dataset("wt", data=m, chunks=(1, H, W, D))
+        g_meta = f.create_group("metadata")
+        dt = h5py.string_dtype(encoding="utf-8")
+        g_meta.create_dataset("scan_id", data=np.asarray(ref_scan_ids, dtype=object), dtype=dt)
+        g_meta.create_dataset(
+            "patient_id", data=np.asarray(ref_patient_ids, dtype=object), dtype=dt
+        )
+        g_meta.create_dataset("cohort", data=np.asarray(["TestCohort"] * n, dtype=object), dtype=dt)
+
+    cache = ReferenceCache()
+    samples = list(iter_scans(pred_path, reference_cache=cache))
+
+    assert len(samples) == 3
+
+    # scan_A is row 0 in pred (pred val ≈ 0.1), row 2 in ref (real val ≈ 0.7).
+    # If the join were by row index: scan_A would get real val ≈ 0.9 (row 0 in ref = scan_C).
+    sid_to_sample = {s.scan_id: s for s in samples}
+
+    assert "scan_A" in sid_to_sample
+    assert "scan_B" in sid_to_sample
+    assert "scan_C" in sid_to_sample
+
+    # scan_A: pred fill = 0.1, real fill = 0.7 (row 2 in ref)
+    assert abs(float(sid_to_sample["scan_A"].pred.flat[0]) - 0.1) < 1e-5
+    assert abs(float(sid_to_sample["scan_A"].real.flat[0]) - 0.7) < 1e-5
+
+    # scan_C: pred fill = 0.3, real fill = 0.9 (row 0 in ref)
+    assert abs(float(sid_to_sample["scan_C"].pred.flat[0]) - 0.3) < 1e-5
+    assert abs(float(sid_to_sample["scan_C"].real.flat[0]) - 0.9) < 1e-5
+
+
+def test_iter_scans_missing_reference_warns_not_crash(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A scan present in pred but absent from ref produces a WARNING, not an error."""
+    import logging
+
+    from vena.validation.io import ReferenceCache, iter_scans
+
+    shard = tmp_path / "shard"
+    pred_dir = shard / "predictions" / "VENA-test" / "TestCohort"
+    pred_dir.mkdir(parents=True)
+    ref_dir = shard / "references"
+    ref_dir.mkdir(parents=True)
+
+    pred_path = pred_dir / "nfe_5.h5"
+    ref_path = ref_dir / "TestCohort.h5"
+
+    # Prediction has 3 scans; reference has only 2 of them.
+    _make_pred_h5(
+        pred_path,
+        ["A", "B", "C"],
+        ["pA", "pB", "pC"],
+    )
+    _make_ref_h5(ref_path, ["A", "C"], ["pA", "pC"])  # B is missing from ref
+
+    cache = ReferenceCache()
+    with caplog.at_level(logging.WARNING, logger="vena.validation.io"):
+        samples = list(iter_scans(pred_path, reference_cache=cache))
+
+    assert len(samples) == 2
+    scan_ids = {s.scan_id for s in samples}
+    assert scan_ids == {"A", "C"}
+
+    # A warning must have been emitted for the missing scan.
+    assert any("B" in r.message for r in caplog.records)
+
+
+def test_build_index_discovers_files(tmp_path: Path) -> None:
+    """build_index returns one row per nfe_*.h5 file discovered."""
+    from vena.validation.io import build_index
+
+    shard = tmp_path / "shard"
+    for method in ("VENA-test", "C0-Identity"):
+        for cohort in ("CohortA", "CohortB"):
+            d = shard / "predictions" / method / cohort
+            d.mkdir(parents=True)
+            ref_dir = shard / "references"
+            ref_dir.mkdir(parents=True, exist_ok=True)
+            # Write a tiny valid H5.
+            _make_pred_h5(
+                d / "nfe_1.h5",
+                ["scan1"],
+                ["p1"],
+                method=method,
+                cohort=cohort,
+                nfe=1,
+                references_h5=f"references/{cohort}.h5",
+            )
+            _make_ref_h5(ref_dir / f"{cohort}.h5", ["scan1"], ["p1"], cohort=cohort)
+
+    index = build_index(tmp_path)
+    assert len(index) == 4  # 2 methods × 2 cohorts
+    assert set(index["method"]) == {"VENA-test", "C0-Identity"}
+    assert set(index["cohort"]) == {"CohortA", "CohortB"}
+
+
+def test_iter_scans_scan_ids_filter(tmp_path: Path) -> None:
+    """scan_ids parameter filters the output to only the requested scans."""
+    from vena.validation.io import ReferenceCache, iter_scans
+
+    shard = tmp_path / "shard"
+    pred_dir = shard / "predictions" / "VENA-test" / "TestCohort"
+    pred_dir.mkdir(parents=True)
+    (shard / "references").mkdir(parents=True)
+
+    pred_path = pred_dir / "nfe_5.h5"
+    ref_path = shard / "references" / "TestCohort.h5"
+
+    _make_pred_h5(pred_path, ["A", "B", "C"], ["pA", "pB", "pC"])
+    _make_ref_h5(ref_path, ["A", "B", "C"], ["pA", "pB", "pC"])
+
+    cache = ReferenceCache()
+    samples = list(iter_scans(pred_path, reference_cache=cache, scan_ids=["B"]))
+    assert len(samples) == 1
+    assert samples[0].scan_id == "B"

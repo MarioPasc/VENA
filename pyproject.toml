@@ -177,6 +177,10 @@ vena-competitor-lpix2pix-3d = "routines.competitors.lpix2pix_3d.cli:main"
 vena-competitor-lpix2pix-3d-infer = "routines.competitors.lpix2pix_3d.infer_cli:main"
 vena-competitor-lddpm-3d = "routines.competitors.lddpm_3d.cli:main"
 vena-competitor-lddpm-3d-infer = "routines.competitors.lddpm_3d.infer_cli:main"
+vena-validation-preregister      = "routines.validation.preregister.cli:main"
+vena-validation-paired-fidelity  = "routines.validation.paired_fidelity.cli:main"
+vena-validation-spatial-residual = "routines.validation.spatial_residual.cli:main"
+vena-validation-downstream-seg   = "routines.validation.downstream_seg.cli:main"
 
 # ----------------------------------------------------------------------------
 # Setuptools layout — src/-layout for the library, flat-layout for routines/
@@ -266,6 +270,7 @@ markers = [
     "preflight_vessel: vessel-mask preflight components",
     "fm: flow-matching training/inference components",
     "repa: REPA loss / projection-head components",
+    "validation: Phase-2 benchmark analysis components",
     "gpu: requires CUDA",
     "slow: wall-clock > 30 s",
 ]

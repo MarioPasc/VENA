@@ -485,7 +485,7 @@ than inherit blame for pre-existing state.
 
 | Check | Baseline |
 |---|---|
-| `python -m pytest -m "not slow and not gpu" -q` | **943 passed, 4 deselected** — green. Your merge must keep it green **and not lower the count**. |
+| `python -m pytest -m "not slow and not gpu" -q` | **1000 passed, 4 deselected** after T0 landed (was 943 + 57 new). Must stay green; **never lower the count**. |
 | `python -m ruff check src/ routines/ tests/` | **475 pre-existing errors** |
 | `python -m ruff format --check src/ routines/ tests/` | **70 files would be reformatted** |
 
@@ -497,6 +497,28 @@ dependency. torch 2.12.0+cu130 / monai 1.5.2 confirmed unperturbed.
 
 The 475 errors and 70 reformats are **pre-existing drift** — the repo was
 linted with a much older ruff, and 0.15 added rules and changed formatting.
+
+### 14.1 MANDATORY: always pass `--basetemp` — the suite writes 31 GB per run
+
+**One `pytest` run of this suite writes ~31 GB into `tmp_path`.** pytest retains
+the last 3 runs, so `/tmp/pytest-of-mpascual` reaches ~93 GB. `/tmp` lives on the
+**137 GB root filesystem**, which this actually filled to **0 bytes free** on
+2026-07-16 — killing pytest, the agent harness's own output capture, and all
+work until it was cleared. `/home` has ~495 GB free; `/` does not.
+
+**Therefore every pytest invocation you make MUST redirect basetemp to /home:**
+
+```bash
+~/.conda/envs/vena/bin/python -m pytest -m "not slow and not gpu" -q \
+    --basetemp=/home/mpascual/.pytest-tmp-vena
+```
+
+Use that exact path. If three agents each run the suite without it, `/` refills
+within minutes and every one of you stops. This is not optional hygiene — it is
+the difference between the fan-out working and the machine wedging.
+
+(The 31 GB/run is a pre-existing repo problem — some test writes multi-GB
+volumes into `tmp_path`. **Not yours to fix**; just don't aim it at `/`.)
 
 **Therefore the lint rule for you is:**
 

@@ -1,0 +1,11 @@
+# Preregister — freeze ring partitions from the local inference tree.
+# Run: vena-validation-preregister routines/validation/preregister/configs/default.yaml
+
+inference_root: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference
+
+output_root: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference/analyses
+
+# Optional: path to a corpus registry JSON for cross-checking scan lists
+# against the expected test splits.  Set to null to skip the cross-check.
+# On Picasso use corpus_picasso.json; locally corpus_icai.json.
+corpus_registry: null
