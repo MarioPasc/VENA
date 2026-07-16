@@ -49,6 +49,9 @@ coverage.xml
 *.py.cover
 .hypothesis/
 .pytest_cache/
+# pytest falls back to writing tmp_path under the CWD when TMPDIR is full; this
+# suite writes ~1.4 GB per multicohort test, so the fallback drops ~31 GB here.
+pytest-of-*/
 cover/
 
 # Translations

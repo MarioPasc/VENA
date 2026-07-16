@@ -506,16 +506,31 @@ the last 3 runs, so `/tmp/pytest-of-mpascual` reaches ~93 GB. `/tmp` lives on th
 2026-07-16 — killing pytest, the agent harness's own output capture, and all
 work until it was cleared. `/home` has ~495 GB free; `/` does not.
 
-**Therefore every pytest invocation you make MUST redirect basetemp to /home:**
+**Therefore every pytest invocation you make MUST redirect basetemp to /home,
+using a path UNIQUE TO YOU:**
 
 ```bash
+# <SLUG> = your task slug: paired-fidelity | spatial-residual | downstream-seg
 ~/.conda/envs/vena/bin/python -m pytest -m "not slow and not gpu" -q \
-    --basetemp=/home/mpascual/.pytest-tmp-vena
+    --basetemp=/home/mpascual/.pytest-tmp-<SLUG>
 ```
 
-Use that exact path. If three agents each run the suite without it, `/` refills
-within minutes and every one of you stops. This is not optional hygiene — it is
-the difference between the fan-out working and the machine wedging.
+Two rules, both load-bearing:
+
+1. **Never let basetemp land on `/`.** If three agents run the suite against
+   `/tmp`, `/` refills within minutes and every one of you stops dead.
+2. **Never share a basetemp with another agent.** `--basetemp` **wipes the
+   directory at start-up** — two agents pointing at the same path will delete
+   each other's fixtures mid-run and produce baffling, non-reproducible
+   failures. Use your own slug.
+
+Clean up your own basetemp when you finish if you can; note that
+`rm -rf $HOME*` is blocked by a global deny rule, so if you cannot remove it,
+just say where you left it and move on. Do not fight the guardrail.
+
+(The 31 GB/run is a pre-existing repo problem: `tests/competitors/*/test_multicohort.py`
+writes ~1.4 GB per test across 6 competitor families. **Not yours to fix** —
+just don't aim it at `/`.)
 
 (The 31 GB/run is a pre-existing repo problem — some test writes multi-GB
 volumes into `tmp_path`. **Not yours to fix**; just don't aim it at `/`.)
