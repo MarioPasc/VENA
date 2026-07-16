@@ -7,6 +7,20 @@ Memory contract: ``iter_scans`` keeps at most one prediction volume and one
 reference volume in RAM at a time.  Each array is ~35 MB; peak RSS stays flat
 across a 50-scan file because the arrays are yielded to the caller and freed
 before the next read.
+
+Smoke-shard filtering
+---------------------
+Inference trees may contain **smoke shards** left over from pre-launch test
+runs.  A smoke shard has ``decision.json["smoke"]["enabled"] == true``.
+:func:`discover_shards` skips them at discovery time and logs each skip at
+INFO.  :func:`build_index` calls ``discover_shards`` internally, so smoke
+files never enter the index.  The skipped tags are returned in
+:class:`ShardDiscovery` so that downstream engines can record them in their
+own ``decision.json`` for provenance.
+
+Do **not** hard-code shard directory name prefixes as the filter — BraTS-PED
+backfill shards named ``picasso_ped_*`` are production shards and must be
+included.  ``smoke.enabled`` is the correct discriminator.
 """
 
 from __future__ import annotations
@@ -15,7 +29,7 @@ import json
 import logging
 from collections import OrderedDict
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -30,6 +44,21 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_PRED_SCHEMAS: frozenset[str] = frozenset({"2.0"})
 SUPPORTED_REF_SCHEMAS: frozenset[str] = frozenset({"2.0"})
+
+#: Maximum brain p99.5 for a raw prediction to be scored in its native space.
+#:
+#: Methods trained on percentile-normalised T1c emit raw p99.5 ≤ ~0.97.
+#: Scanner-unit methods (e.g. ``C0-Identity``) sit at 1 424–2 466.
+#: The threshold is safe by three orders of magnitude; do not widen without
+#: evidence — it governs the paper's headline MAE comparison.
+SCORING_P995_MAX: float = 1.05
+
+#: Minimum brain voxel value for a raw prediction to be scored in its native space.
+#:
+#: Methods trained on normalised T1c emit non-negative values.  A minimum
+#: below this floor signals scanner-unit or improperly post-processed data
+#: that must pass through the Phase-1 harmonised field instead.
+SCORING_MIN_FLOOR: float = -0.05
 
 _INDEX_COLUMNS = [
     "method",
@@ -58,11 +87,42 @@ class ShardInfo:
 
 
 @dataclass(frozen=True)
+class ShardDiscovery:
+    """Result of :func:`discover_shards`.
+
+    Parameters
+    ----------
+    accepted :
+        Production shards (``smoke.enabled`` absent or ``false``).
+    skipped_smoke :
+        ``run_id_tag`` values (or directory names when the tag is absent) of
+        smoke shards that were excluded.
+    """
+
+    accepted: list[ShardInfo] = field(default_factory=list)
+    skipped_smoke: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class ScanSample:
     """One scan × one method × one NFE, joined from prediction + reference H5.
 
-    Arrays are ``(H, W, D)``; ``pred`` and ``real`` are ``float32`` in
-    ``[0, 1]`` (inside the brain mask); ``brain`` and ``wt`` are ``bool``.
+    ``pred`` is the **selected scoring volume** — see
+    :func:`select_scoring_volume`.  For methods trained on
+    percentile-normalised T1c (15 of 16 methods), it is
+    ``t1c_synthetic_raw``; for scanner-unit methods such as ``C0-Identity``
+    it is ``t1c_synthetic_harmonised``.  Downstream metrics must use
+    ``pred`` only — never ``pred_harmonised`` for scoring.
+
+    Both raw and harmonised volumes are preserved in ``pred_raw`` /
+    ``pred_harmonised`` so that the §4.1 Table-S1 audit can compare them.
+    ``pred_mode`` records the selection (``"raw"`` or ``"harmonised"``) per
+    row.  ``raw_p995`` is the 99.5th percentile of ``pred_raw`` inside the
+    brain mask — it quantifies under-saturation (e.g. C4-3D-DiT p99.5 ≈
+    0.38 vs reference ~1.0) which is a reportable finding, not a bug.
+
+    All spatial arrays are ``(H, W, D)``; float arrays are ``float32``;
+    mask arrays are ``bool``.
     """
 
     scan_id: str
@@ -71,12 +131,72 @@ class ScanSample:
     ring: str  # "A" or "B"
     method: str
     nfe: int
-    pred: np.ndarray  # (H, W, D) float32  — t1c_synthetic_harmonised
-    real: np.ndarray  # (H, W, D) float32  — t1c_real_harmonised
+    pred: np.ndarray  # (H, W, D) float32 — selected scoring volume
+    pred_raw: np.ndarray  # (H, W, D) float32 — t1c_synthetic_raw (audit only)
+    pred_harmonised: np.ndarray  # (H, W, D) float32 — t1c_synthetic_harmonised (audit only)
+    pred_mode: str  # "raw" | "harmonised"
+    raw_p995: float  # np.percentile(raw[brain], 99.5) — §4.1 audit column
+    real: np.ndarray  # (H, W, D) float32 — t1c_real_harmonised
     brain: np.ndarray  # (H, W, D) bool
     wt: np.ndarray  # (H, W, D) bool
     inference_seconds: float
     peak_vram_mb: float
+
+
+# ---------------------------------------------------------------------------
+# Scoring space selection
+# ---------------------------------------------------------------------------
+
+
+def select_scoring_volume(
+    raw: np.ndarray,
+    harmonised: np.ndarray,
+    brain: np.ndarray,
+) -> tuple[np.ndarray, str]:
+    """Return the correct volume to score and a mode label.
+
+    Decides per-scan whether to use the raw prediction (already in the trained
+    normalised space) or the Phase-1 harmonised version.  The decision is a
+    **property of the volume**, never a hard-coded method list, so it remains
+    correct when new methods are added (e.g. BraTS-PED backfill).
+
+    Parameters
+    ----------
+    raw :
+        ``predictions/t1c_synthetic_raw`` from the prediction H5,
+        shape ``(H, W, D)``, float32.
+    harmonised :
+        ``predictions/t1c_synthetic_harmonised``, same shape.
+    brain :
+        Binary brain mask, shape ``(H, W, D)``, bool.
+
+    Returns
+    -------
+    tuple[np.ndarray, str]
+        ``(volume, mode)`` where ``mode`` is ``"raw"`` when the raw volume
+        is already in the trained normalised space (brain p99.5
+        ≤ :data:`SCORING_P995_MAX` **and** brain min ≥
+        :data:`SCORING_MIN_FLOOR`), or ``"harmonised"`` otherwise.
+
+    Notes
+    -----
+    :data:`SCORING_P995_MAX` = 1.05 is safe by three orders of magnitude:
+    methods trained on normalised T1c have raw p99.5 ≤ 0.97; scanner-unit
+    methods (today: ``C0-Identity``) sit at 1 424–2 466.  Do **not** widen
+    the threshold without evidence — it governs the paper's headline MAE.
+
+    When the brain mask is empty (edge-case: all-background volume), returns
+    ``(harmonised, "harmonised")`` and logs a WARNING rather than crashing on
+    an empty-array percentile call.
+    """
+    b = raw[brain]
+    if b.size == 0:
+        logger.warning("select_scoring_volume: empty brain mask — returning harmonised volume.")
+        return harmonised, "harmonised"
+    p995 = float(np.percentile(b, 99.5))
+    if p995 <= SCORING_P995_MAX and float(b.min()) >= SCORING_MIN_FLOOR:
+        return raw, "raw"
+    return harmonised, "harmonised"
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +284,16 @@ class ReferenceCache:
 # ---------------------------------------------------------------------------
 
 
-def discover_shards(root: Path) -> list[ShardInfo]:
-    """Discover inference shards by globbing ``<root>/*/decision.json``.
+def discover_shards(root: Path) -> ShardDiscovery:
+    """Discover inference shards and filter out smoke shards.
+
+    Enumerates ``<root>/*/decision.json``.  Any shard whose
+    ``decision.json["smoke"]["enabled"]`` is ``true`` is excluded from
+    ``accepted`` and its tag is appended to ``skipped_smoke``.
+
+    A shard with **no** ``smoke`` key in its ``decision.json`` is treated as a
+    production shard (fail-open: older shards and BraTS-PED backfill shards
+    that predate the smoke-flag convention must not be accidentally excluded).
 
     Parameters
     ----------
@@ -174,11 +302,13 @@ def discover_shards(root: Path) -> list[ShardInfo]:
 
     Returns
     -------
-    list[ShardInfo]
-        One entry per shard directory that has a ``decision.json``.
+    ShardDiscovery
+        ``accepted`` production shards + ``skipped_smoke`` tag list.
     """
     root = Path(root)
-    shards: list[ShardInfo] = []
+    accepted: list[ShardInfo] = []
+    skipped_smoke: list[str] = []
+
     for dec_path in sorted(root.glob("*/decision.json")):
         try:
             with dec_path.open() as fh:
@@ -186,8 +316,21 @@ def discover_shards(root: Path) -> list[ShardInfo]:
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("cannot read %s: %s", dec_path, exc)
             continue
-        shards.append(ShardInfo(root=dec_path.parent, decision=decision))
-    return shards
+
+        smoke_block = decision.get("smoke", {})
+        if smoke_block.get("enabled", False):
+            tag = str(decision.get("run_id_tag", dec_path.parent.name))
+            logger.info(
+                "skipping smoke shard %r (dir=%s)",
+                tag,
+                dec_path.parent.name,
+            )
+            skipped_smoke.append(tag)
+            continue
+
+        accepted.append(ShardInfo(root=dec_path.parent, decision=decision))
+
+    return ShardDiscovery(accepted=accepted, skipped_smoke=skipped_smoke)
 
 
 # ---------------------------------------------------------------------------
@@ -196,11 +339,16 @@ def discover_shards(root: Path) -> list[ShardInfo]:
 
 
 def build_index(root: Path) -> pd.DataFrame:
-    """Build a tidy index of every prediction H5 under *root*.
+    """Build a tidy index of every **production** prediction H5 under *root*.
 
-    Discovers by globbing ``<root>/*/predictions/*/*/nfe_*.h5``.
-    Never hard-codes method or cohort names — BraTS-PED or future methods
-    will flow through with no code change.
+    Calls :func:`discover_shards` internally to exclude smoke shards, then
+    globs ``predictions/*/*/nfe_*.h5`` within each accepted shard only.
+
+    After building the index the function asserts that
+    ``(method, cohort, nfe, scan_id)`` is unique across all accepted shards.
+    A duplicate that survived smoke-shard filtering means something unexpected
+    is wrong (e.g. two production runs covering the same cohort in different
+    shard directories) and must be loud rather than silently dropped.
 
     Parameters
     ----------
@@ -212,44 +360,75 @@ def build_index(root: Path) -> pd.DataFrame:
     pd.DataFrame
         One row per file, columns: ``method, cohort, ring, nfe, shard,
         path, references_h5, n_scans, schema_version``.
+
+    Raises
+    ------
+    ValueError
+        If the same ``(method, cohort, nfe, scan_id)`` appears in more than
+        one production shard.
     """
     root = Path(root)
-    rows: list[dict] = []
-    for pred_path in sorted(root.glob("*/predictions/*/*/nfe_*.h5")):
-        try:
-            with h5py.File(pred_path, "r") as f:
-                schema = str(f.attrs.get("schema_version", ""))
-                if schema not in SUPPORTED_PRED_SCHEMAS:
-                    logger.warning("skipping %s: unsupported schema_version=%r", pred_path, schema)
-                    continue
-                method = str(f.attrs.get("method", ""))
-                cohort = str(f.attrs.get("cohort", ""))
-                nfe = int(f.attrs.get("nfe", 0))
-                ring = str(f.attrs.get("ring", ""))
-                ref_rel = f.attrs.get("references_h5")
-                n_scans = int(f["predictions/t1c_synthetic_harmonised"].shape[0])
-        except (OSError, KeyError) as exc:
-            logger.warning("skipping %s: %s", pred_path, exc)
-            continue
+    discovery = discover_shards(root)
 
-        rows.append(
-            {
-                "method": method,
-                "cohort": cohort,
-                "ring": ring,
-                "nfe": nfe,
-                "shard": pred_path.parents[3].name,
-                "path": pred_path,
-                "references_h5": str(ref_rel) if ref_rel else None,
-                "n_scans": n_scans,
-                "schema_version": schema,
-            }
-        )
+    # Tracks (method, cohort, nfe, scan_id) → first-seen shard for the raise.
+    seen: dict[tuple[str, str, int, str], Path] = {}
+    rows: list[dict] = []
+
+    for shard_info in discovery.accepted:
+        for pred_path in sorted(shard_info.root.glob("predictions/*/*/nfe_*.h5")):
+            try:
+                with h5py.File(pred_path, "r") as f:
+                    schema = str(f.attrs.get("schema_version", ""))
+                    if schema not in SUPPORTED_PRED_SCHEMAS:
+                        logger.warning(
+                            "skipping %s: unsupported schema_version=%r", pred_path, schema
+                        )
+                        continue
+                    method = str(f.attrs.get("method", ""))
+                    cohort = str(f.attrs.get("cohort", ""))
+                    nfe = int(f.attrs.get("nfe", 0))
+                    ring = str(f.attrs.get("ring", ""))
+                    ref_rel = f.attrs.get("references_h5")
+                    n_scans = int(f["predictions/t1c_synthetic_harmonised"].shape[0])
+                    scan_ids_in_file = _decode_str_arr(f["metadata/scan_id"][:])
+            except (OSError, KeyError) as exc:
+                logger.warning("skipping %s: %s", pred_path, exc)
+                continue
+
+            # Defence in depth: duplicate scan_ids across production shards must raise.
+            for sid in scan_ids_in_file:
+                key = (method, cohort, nfe, sid)
+                first = seen.get(key)
+                if first is not None:
+                    raise ValueError(
+                        f"Duplicate (method, cohort, nfe, scan_id) found in production shards:\n"
+                        f"  method={method!r}, cohort={cohort!r}, nfe={nfe}, scan_id={sid!r}\n"
+                        f"  first seen in: {first}\n"
+                        f"  also in:       {pred_path}\n"
+                        "These are not smoke shards (those are already filtered). "
+                        "Check for unexpected duplicate shard directories under "
+                        f"{root}."
+                    )
+                seen[key] = pred_path
+
+            rows.append(
+                {
+                    "method": method,
+                    "cohort": cohort,
+                    "ring": ring,
+                    "nfe": nfe,
+                    "shard": pred_path.parents[3].name,
+                    "path": pred_path,
+                    "references_h5": str(ref_rel) if ref_rel else None,
+                    "n_scans": n_scans,
+                    "schema_version": schema,
+                }
+            )
 
     if not rows:
         return pd.DataFrame(columns=_INDEX_COLUMNS)
+
     df = pd.DataFrame(rows)
-    # Ensure correct dtypes
     df["nfe"] = df["nfe"].astype(int)
     df["n_scans"] = df["n_scans"].astype(int)
     return df
@@ -335,6 +514,7 @@ def iter_scans(
             ds_brain = f_ref["masks/brain"]
             ds_wt = f_ref["masks/wt"]
             ds_pred_vol = f_pred["predictions/t1c_synthetic_harmonised"]
+            ds_pred_raw_vol = f_pred["predictions/t1c_synthetic_raw"]
 
             n_missing = 0
             for sid in target_sids:
@@ -353,10 +533,15 @@ def iter_scans(
                     continue
 
                 # Single-chunk reads — each is O(1 × H × W × D)
-                pred_vol = np.asarray(ds_pred_vol[pi], dtype=np.float32)
+                harmonised_vol = np.asarray(ds_pred_vol[pi], dtype=np.float32)
+                raw_vol = np.asarray(ds_pred_raw_vol[pi], dtype=np.float32)
                 real_vol = np.asarray(ds_real[ri], dtype=np.float32)
                 brain_arr = np.asarray(ds_brain[ri], dtype=bool)
                 wt_arr = np.asarray(ds_wt[ri], dtype=bool)
+
+                b = raw_vol[brain_arr]
+                raw_p995 = float(np.percentile(b, 99.5)) if b.size > 0 else float("nan")
+                pred_vol, pred_mode = select_scoring_volume(raw_vol, harmonised_vol, brain_arr)
 
                 yield ScanSample(
                     scan_id=sid,
@@ -366,6 +551,10 @@ def iter_scans(
                     method=method,
                     nfe=nfe,
                     pred=pred_vol,
+                    pred_raw=raw_vol,
+                    pred_harmonised=harmonised_vol,
+                    pred_mode=pred_mode,
+                    raw_p995=raw_p995,
                     real=real_vol,
                     brain=brain_arr,
                     wt=wt_arr,

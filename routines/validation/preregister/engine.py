@@ -29,7 +29,11 @@ from typing import Any
 import h5py
 
 from vena.validation.artifacts import make_run_dir, symlink_latest, write_decision_json
-from vena.validation.io import _decode_str_arr, _resolve_references_h5, build_index
+from vena.validation.io import (
+    _decode_str_arr,
+    _resolve_references_h5,
+    build_index,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,9 +99,24 @@ class PreregisterEngine:
         Path
             The run directory containing ``ring_partitions.json``.
         """
+        # Local import: the module-level import is stripped by the project
+        # formatter because discover_shards is not a private symbol like the
+        # other io imports.  A local import is the pragmatic fix.
+        from vena.validation.io import discover_shards as _discover_shards
+
         root = self.cfg.inference_root
+
+        # Discover shards first — captures skipped smoke shards for provenance.
+        discovery = _discover_shards(root)
+        if discovery.skipped_smoke:
+            logger.info(
+                "Skipped %d smoke shard(s): %s",
+                len(discovery.skipped_smoke),
+                ", ".join(discovery.skipped_smoke),
+            )
+
         logger.info("Building index from %s …", root)
-        index = build_index(root)
+        index = build_index(root)  # smoke shards excluded automatically
 
         if index.empty:
             raise PreregisterError(
@@ -193,6 +212,7 @@ class PreregisterEngine:
             "nfes_by_method": nfes_by_method,
             "selection_nfe": {},  # filled by §4.2 pre-registration
             "shard_shas": shard_shas,
+            "skipped_smoke_shards": discovery.skipped_smoke,
             "cross_check": cross_check_status,
         }
 
