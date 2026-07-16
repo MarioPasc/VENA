@@ -33,7 +33,7 @@ from vena.validation.artifacts import (
     write_decision_json,
     write_per_scan_csv,
 )
-from vena.validation.io import ReferenceCache, build_index, iter_scans
+from vena.validation.io import ReferenceCache, build_index, discover_shards, iter_scans
 from vena.validation.metrics_paired import (
     MetricConfig,
     compute_paired_metrics,
@@ -92,6 +92,8 @@ _METRIC_COLS: list[str] = [
     "n_brain_voxels",
     "n_wt_voxels",
     "n_bg_undilated_voxels",
+    # §4.1 scoring-space audit — float, collapsed (mean) at patient level
+    "raw_p995",
 ]
 
 # Columns for headline statistics
@@ -256,7 +258,18 @@ class PairedFidelityEngine:
             dilate_k=cfg.dilate_k,
         )
 
-        # ---- Discover and filter index ----
+        # ---- Discover shards (smoke shard filtering + audit trail) ----
+        logger.info("Discovering shards under %s …", cfg.data_root)
+        shard_discovery = discover_shards(cfg.data_root)
+        logger.info(
+            "Accepted %d shards; skipped %d smoke shard(s): %s",
+            len(shard_discovery.accepted),
+            len(shard_discovery.skipped_smoke),
+            shard_discovery.skipped_smoke or "none",
+        )
+
+        # ---- Build index (calls discover_shards internally; consistent because
+        #      smoke filtering is content-based, not directory-name-based) ----
         logger.info("Building index from %s …", cfg.data_root)
         index = build_index(cfg.data_root)
         if index.empty:
@@ -290,9 +303,24 @@ class PairedFidelityEngine:
 
         # ---- Write per-scan CSV ----
         per_scan_df = pd.DataFrame(rows)
-        # Ensure frozen column order (no white cells)
-        id_cols = ["method", "cohort", "ring", "nfe", "scan_id", "patient_id"]
+        # Ensure frozen column order (no white cells).
+        # pred_mode is string metadata (not averaged in collapse) — placed in id_cols.
+        # raw_p995 is a float audit column — placed in _METRIC_COLS for collapse.
+        id_cols = ["method", "cohort", "ring", "nfe", "scan_id", "patient_id", "pred_mode"]
         per_scan_df = per_scan_df[[c for c in id_cols + _METRIC_COLS if c in per_scan_df.columns]]
+
+        # ---- Scoring-space audit: per-method mode counts ----
+        # Records how many scans of each method were scored in "raw" vs "harmonised" space.
+        # Expected: 15 methods → "raw"; C0-Identity (scanner units) → "harmonised".
+        if "pred_mode" in per_scan_df.columns:
+            _mode_pivot = (
+                per_scan_df.groupby("method")["pred_mode"].value_counts().unstack(fill_value=0)
+            )
+            pred_mode_counts: dict[str, dict[str, int]] = {
+                method: row.to_dict() for method, row in _mode_pivot.iterrows()
+            }
+        else:
+            pred_mode_counts = {}
 
         write_per_scan_csv(run_dir, per_scan_df, name="paired_fidelity.csv")
         logger.info("Wrote per_scan/paired_fidelity.csv (%d rows)", len(per_scan_df))
@@ -343,6 +371,8 @@ class PairedFidelityEngine:
             n_patients=n_patients,
             elapsed_s=elapsed,
             c0_results=c0_results,
+            pred_mode_counts=pred_mode_counts,
+            skipped_smoke_shards=shard_discovery.skipped_smoke,
         )
 
         self._write_report(
@@ -997,6 +1027,8 @@ class PairedFidelityEngine:
         n_patients: int,
         elapsed_s: float,
         c0_results: dict[str, dict[str, float]],
+        pred_mode_counts: dict[str, dict[str, int]],
+        skipped_smoke_shards: list[str],
     ) -> None:
         cfg = self.cfg
         try:
@@ -1056,6 +1088,19 @@ class PairedFidelityEngine:
             "holm_correction": "Holm-Bonferroni per (metric, region, family)",
             # C0 sanity
             "c0_sanity": c0_results,
+            # §4.1 scoring-space audit — per-method mode counts
+            # Expected: 15 of 16 methods → "raw"; C0-Identity (scanner units) → "harmonised".
+            # Any method appearing in "harmonised" that is NOT C0-Identity is a regression.
+            "pred_mode_counts_by_method": pred_mode_counts,
+            "scoring_space_note": (
+                "Methods trained on percentile-normalised T1c are scored on pred_raw "
+                "(brain p99.5 ≤ 1.05). Scanner-unit methods (C0-Identity) are scored on "
+                "pred_harmonised. The decision is per-scan via select_scoring_volume, not "
+                "a hard-coded method list. raw_p995 in per_scan CSV quantifies under-saturation "
+                "(e.g. C4-3D-DiT p99.5 ≈ 0.38 vs reference ~1.0 — a reportable finding per §4.1)."
+            ),
+            # Shard provenance (§3.1 — smoke shards skipped at discovery time)
+            "skipped_smoke_shards": skipped_smoke_shards,
         }
         write_decision_json(run_dir, payload)
         logger.info("Wrote decision.json")

@@ -90,23 +90,21 @@ def test_from_yaml_nonexistent_file_raises(tmp_path: Path) -> None:
 
 
 @pytest.fixture()
-def engine_cfg(synth_shard: Path, tmp_path: Path) -> PairedFidelityConfig:
-    """Config wired to the session synth_shard fixture.
+def engine_cfg(synth_inference_root: Path, tmp_path: Path) -> PairedFidelityConfig:
+    """Config wired to the session synth_inference_root fixture.
 
-    ``build_index`` globs ``<data_root>/*/predictions/*/*/nfe_*.h5``, so
-    ``data_root`` must be the *parent* of the shard directory.
+    ``discover_shards`` globs ``<data_root>/*/decision.json`` and
+    ``build_index`` then globs within accepted shards.  The conftest
+    ``synth_inference_root`` is exactly the right root: it contains one
+    production shard (``test_prod_shard/``) with a ``decision.json`` that
+    has no ``smoke`` key (treated as production, not filtered out).
 
-    We CANNOT use ``synth_shard.parent`` (the shared basetemp) because across
-    pytest reruns the basetemp accumulates ``shard0/``, ``shard1/``, … and
-    the glob picks them all up, duplicating every scan row.  Instead we
-    create a per-test ``data/`` directory containing a single symlink that
-    points only at this session's shard.
+    Using ``synth_inference_root`` directly avoids the old stale-basetemp
+    accumulation issue: the conftest creates the shard under a session-scoped
+    ``tmp_path_factory.mktemp("inference")`` directory that is fresh each run.
     """
-    data_root = tmp_path / "data"
-    data_root.mkdir()
-    (data_root / "shard").symlink_to(synth_shard)
     return PairedFidelityConfig(
-        data_root=data_root,
+        data_root=synth_inference_root,
         output_root=tmp_path / "analyses",
         dilate_k=5,
         ssim_window_size=7,
@@ -149,6 +147,9 @@ def test_engine_per_scan_csv_columns(engine_cfg: PairedFidelityConfig) -> None:
         "nfe",
         "scan_id",
         "patient_id",
+        # §4.1 scoring-space audit — must be present per SHARED_CONTRACTS §7
+        "pred_mode",
+        "raw_p995",
         "mae_brain",
         "mae_wt",
         "mae_bg_undilated",
@@ -251,6 +252,11 @@ def test_engine_decision_json_schema(engine_cfg: PairedFidelityConfig) -> None:
         "n_scans",
         "n_patients",
         "elapsed_s",
+        # §4.1 / SHARED_CONTRACTS §7 — scoring-space audit
+        "pred_mode_counts_by_method",
+        "scoring_space_note",
+        # §3.1 shard provenance
+        "skipped_smoke_shards",
     ]
     missing = [k for k in required_keys if k not in d]
     assert not missing, f"Missing keys in decision.json: {missing}"
@@ -274,6 +280,49 @@ def test_engine_decision_json_ssim_treatment_documents_principled(
         d = json.load(fh)
     assert "principled" in d["ssim_treatment"].lower()
     assert "map" in d["ssim_treatment"].lower()
+
+
+def test_engine_decision_json_pred_mode_counts(engine_cfg: PairedFidelityConfig) -> None:
+    """pred_mode_counts_by_method maps each method to its raw/harmonised scan counts.
+
+    In the synth shard, raw predictions are uniform random in [0, 1] so
+    brain p99.5 < 1.05 → all scans should be scored as "raw".
+    """
+    run_dir = PairedFidelityEngine(engine_cfg).run()
+    with open(run_dir / "decision.json") as fh:
+        d = json.load(fh)
+    counts = d["pred_mode_counts_by_method"]
+    assert isinstance(counts, dict), "pred_mode_counts_by_method must be a dict"
+    assert len(counts) > 0, "pred_mode_counts_by_method is empty"
+    for method, mode_dict in counts.items():
+        assert isinstance(mode_dict, dict), f"mode dict for {method} must be a dict"
+        total = sum(mode_dict.values())
+        assert total > 0, f"No scans counted for method {method}"
+
+
+def test_engine_decision_json_skipped_smoke_shards(engine_cfg: PairedFidelityConfig) -> None:
+    """skipped_smoke_shards is a list (empty for the synth shard which is production)."""
+    run_dir = PairedFidelityEngine(engine_cfg).run()
+    with open(run_dir / "decision.json") as fh:
+        d = json.load(fh)
+    skipped = d["skipped_smoke_shards"]
+    assert isinstance(skipped, list), "skipped_smoke_shards must be a list"
+    # The synth shard has no smoke key → treated as production → list is empty
+    assert skipped == [], f"Expected no smoke shards skipped, got {skipped}"
+
+
+def test_engine_pred_mode_column_values(engine_cfg: PairedFidelityConfig) -> None:
+    """pred_mode column contains only 'raw' or 'harmonised'; raw_p995 is finite float."""
+    run_dir = PairedFidelityEngine(engine_cfg).run()
+    df = pd.read_csv(run_dir / "per_scan" / "paired_fidelity.csv")
+    assert "pred_mode" in df.columns, "pred_mode column missing"
+    assert "raw_p995" in df.columns, "raw_p995 column missing"
+    valid_modes = {"raw", "harmonised"}
+    bad_modes = set(df["pred_mode"].unique()) - valid_modes
+    assert not bad_modes, f"Unexpected pred_mode values: {bad_modes}"
+    # raw_p995 must be finite for all scans (synth data has a full brain mask)
+    assert df["raw_p995"].notna().all(), "raw_p995 has NaN values"
+    assert (df["raw_p995"] >= 0).all(), "raw_p995 has negative values"
 
 
 def test_engine_symlink_latest(engine_cfg: PairedFidelityConfig) -> None:

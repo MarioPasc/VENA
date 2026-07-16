@@ -422,6 +422,10 @@ class ScanMetrics:
     inference_seconds: float
     peak_vram_mb: float
 
+    # -- §4.1 scoring-space audit (pass-through from ScanSample / select_scoring_volume) --
+    pred_mode: str  # "raw" | "harmonised" — which volume was scored
+    raw_p995: float  # brain p99.5 of the raw prediction (under-saturation audit)
+
     # -- §4.2 MAE × 3 regions --
     mae_brain: float
     mae_wt: float
@@ -571,6 +575,8 @@ def compute_paired_metrics(
         nfe=scan.nfe,
         inference_seconds=scan.inference_seconds,
         peak_vram_mb=scan.peak_vram_mb,
+        pred_mode=scan.pred_mode,
+        raw_p995=scan.raw_p995,
         mae_brain=mae_brain,
         mae_wt=mae_wt,
         mae_bg_undilated=mae_bg,

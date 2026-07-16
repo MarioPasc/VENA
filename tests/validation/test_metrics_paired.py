@@ -63,6 +63,7 @@ def _make_sample(
     scan_id: str = "s0",
 ) -> ScanSample:
     shape = pred.shape
+    pred_f32 = pred.astype(np.float32)
     return ScanSample(
         scan_id=scan_id,
         patient_id="p0",
@@ -70,7 +71,11 @@ def _make_sample(
         ring="A",
         method="TEST",
         nfe=1,
-        pred=pred.astype(np.float32),
+        pred=pred_f32,
+        pred_raw=pred_f32,  # audit-only; irrelevant for metric tests
+        pred_harmonised=pred_f32,  # audit-only; irrelevant for metric tests
+        pred_mode="raw",
+        raw_p995=float(np.percentile(pred_f32, 99.5)),
         real=real.astype(np.float32),
         brain=brain if brain is not None else _ones_brain(shape),
         wt=wt if wt is not None else _small_wt(shape),
@@ -375,6 +380,10 @@ def test_compute_paired_metrics_scan_id_propagated() -> None:
         method="MyMethod",
         nfe=7,
         pred=vol,
+        pred_raw=vol,
+        pred_harmonised=vol,
+        pred_mode="raw",
+        raw_p995=float(np.percentile(vol, 99.5)),
         real=vol,
         brain=_ones_brain(),
         wt=_small_wt(),
@@ -391,6 +400,9 @@ def test_compute_paired_metrics_scan_id_propagated() -> None:
     assert m.nfe == 7
     assert m.inference_seconds == pytest.approx(3.14)
     assert m.peak_vram_mb == pytest.approx(512.0)
+    # §4.1 audit fields must round-trip through ScanMetrics
+    assert m.pred_mode == "raw"
+    assert math.isfinite(m.raw_p995)
 
 
 def test_scan_metrics_is_frozen() -> None:
