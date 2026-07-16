@@ -44,7 +44,6 @@ from scipy import stats as scipy_stats
 from sklearn.feature_selection import mutual_info_regression
 
 from vena.validation.io import ScanSample
-from vena.validation.regions import region_masks
 from vena.validation.stats import (
     SpearmanResult,
     bootstrap_ci,
@@ -503,6 +502,10 @@ def compute_scan_rows(
     list[dict]
         Two rows: one for ``"C-WB"`` and one for ``"C-noT"``.
     """
+    # Lazy import: regions.py imports torch at top level; deferring keeps
+    # spatial_residual.py's module-level footprint torch-free (§2 isolation).
+    from vena.validation.regions import region_masks
+
     brain_bool = sample.brain.astype(bool)
     wt_bool = sample.wt.astype(bool)
 
