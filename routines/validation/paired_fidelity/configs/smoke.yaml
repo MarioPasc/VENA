@@ -2,8 +2,8 @@
 # UCSF-PDGM 50 scans + LUMIERE 72 scans (→ 11 patients) + IvyGAP 5 scans
 # Methods: VENA-S1-v3b-rw, C0-Identity, C5-T1C-RFlow at selection_nfe
 
-data_root: /media/mpascual/MeningD2/GLIOMA/vena_inference
-output_root: /media/mpascual/MeningD2/GLIOMA/vena_inference/analyses
+data_root: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference
+output_root: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference/analyses
 
 dilate_k: 5
 ssim_window_size: 7
