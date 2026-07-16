@@ -192,6 +192,21 @@ Documented in `01_SHARED_CONTRACTS.md` §11. The load-bearing ones:
    §4.4 ≈ 1.18 s/call ⇒ 2.6 GPU-h (4.0 with PED) on one A100.
 7. BraTS-PED backfill lands → Ring B 146 → 406. Re-run the sweep for that cohort only.
 
+## Smokes run on PICASSO, not locally (decided 2026-07-16, user direction)
+
+The local box is a dev workstation (RTX 4060, 8 GB), not a compute node. Evidence
+it was the wrong venue:
+- §4.2 costs **41 CPU-s/volume**; V1's 381-volume smoke pegged ~10 cores for 27+
+  min and made the box unusable.
+- V2's smoke **died twice** with no traceback and no OOM — almost certainly reaped
+  when its parent Bash call hit the 10-minute tool timeout. A long compute is the
+  wrong shape for a foreground tool call; it is the right shape for `sbatch`.
+- The §4.4 corpus H5s are not even reachable locally (MeningD2 unmounted).
+
+**Rule: every smoke and every sweep runs on Picasso via SLURM.** Local is for
+editing, unit tests, and small diagnostics only. The harmonisation audit that
+found the headline-inverting bug took minutes on Picasso.
+
 ## Orchestrator protocol
 
 - **Never edit a delegated agent's code.** Fixing it myself means I mis-scheduled.
