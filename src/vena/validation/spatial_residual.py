@@ -90,6 +90,9 @@ SPATIAL_CSV_COLUMNS: list[str] = [
     "scan_id",
     "patient_id",
     "condition",
+    # --- scoring-space audit (§7.0) ---
+    "pred_mode",  # "raw" | "harmonised" — which volume was scored
+    "raw_p995",  # np.percentile(raw[brain], 99.5) — under-saturation audit
     # --- region size ---
     "n_voxels_brain",
     "n_voxels_region",
@@ -452,6 +455,8 @@ def _nan_row(sample: ScanSample, condition: str) -> dict:
             "scan_id": sample.scan_id,
             "patient_id": sample.patient_id,
             "condition": condition,
+            "pred_mode": sample.pred_mode,
+            "raw_p995": sample.raw_p995,
             "n_voxels_brain": 0,
             "n_voxels_region": 0,
             "mi_n_sampled": 0,
@@ -599,6 +604,8 @@ def compute_scan_rows(
             "scan_id": sample.scan_id,
             "patient_id": sample.patient_id,
             "condition": cond_name,
+            "pred_mode": sample.pred_mode,
+            "raw_p995": sample.raw_p995,
             "n_voxels_brain": n_brain,
             "n_voxels_region": n_region,
             "rho_s": spr.rho,

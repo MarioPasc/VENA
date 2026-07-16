@@ -51,6 +51,9 @@ def _make_sample(*, wt_fraction: float = 0.2, h: int = 12, seed: int = 0):
 
     real = rng.random(shape).astype(np.float32)
     pred = rng.random(shape).astype(np.float32)
+    # raw_p995 from brain voxels; pred is already in [0,1] so pred_mode = "raw".
+    brain_arr = brain.astype(np.int8)
+    raw_p995 = float(np.percentile(pred[brain], 99.5))
 
     return ScanSample(
         scan_id="s0",
@@ -60,8 +63,12 @@ def _make_sample(*, wt_fraction: float = 0.2, h: int = 12, seed: int = 0):
         method="VENA",
         nfe=1,
         pred=pred,
+        pred_raw=pred,
+        pred_harmonised=pred,
+        pred_mode="raw",
+        raw_p995=raw_p995,
         real=real,
-        brain=brain.astype(np.int8),
+        brain=brain_arr,
         wt=wt.astype(np.int8),
         inference_seconds=1.0,
         peak_vram_mb=100.0,
@@ -142,6 +149,7 @@ def test_compute_scan_rows_nan_on_empty_brain() -> None:
 
     shape = (8, 8, 8)
     rng = np.random.default_rng(4)
+    pred_empty = rng.random(shape).astype(np.float32)
     sample = ScanSample(
         scan_id="empty",
         patient_id="p0",
@@ -149,7 +157,11 @@ def test_compute_scan_rows_nan_on_empty_brain() -> None:
         ring="A",
         method="VENA",
         nfe=1,
-        pred=rng.random(shape).astype(np.float32),
+        pred=pred_empty,
+        pred_raw=pred_empty,
+        pred_harmonised=pred_empty,
+        pred_mode="harmonised",  # empty brain → select_scoring_volume falls back
+        raw_p995=float("nan"),  # empty brain → no percentile possible
         real=rng.random(shape).astype(np.float32),
         brain=np.zeros(shape, dtype=np.int8),  # empty brain
         wt=np.zeros(shape, dtype=np.int8),

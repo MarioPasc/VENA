@@ -40,8 +40,8 @@ def test_holm_family_size() -> None:
 
 
 def test_spatial_csv_columns_count() -> None:
-    """Per-scan CSV header must have exactly 40 columns."""
-    assert len(SPATIAL_CSV_COLUMNS) == 40
+    """Per-scan CSV header must have exactly 42 columns (40 + pred_mode + raw_p995)."""
+    assert len(SPATIAL_CSV_COLUMNS) == 42
 
 
 def test_conc_quantiles() -> None:
