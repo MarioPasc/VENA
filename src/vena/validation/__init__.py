@@ -14,12 +14,16 @@ from vena.validation.artifacts import (
 )
 from vena.validation.audit import audit_harmonisation
 from vena.validation.io import (
+    SCORING_MIN_FLOOR,
+    SCORING_P995_MAX,
     ReferenceCache,
     ScanSample,
+    ShardDiscovery,
     ShardInfo,
     build_index,
     discover_shards,
     iter_scans,
+    select_scoring_volume,
 )
 from vena.validation.plotting import (
     annotate_significance,
@@ -67,6 +71,8 @@ __all__ = [
     "METHOD_SPECS",
     "RING_A_COHORTS",
     "RING_B_COHORTS",
+    "SCORING_MIN_FLOOR",
+    "SCORING_P995_MAX",
     "SELECTION_NFE",
     "SUPPLEMENTARY",
     "VENA_HEADLINE",
@@ -75,6 +81,7 @@ __all__ = [
     "MethodSpec",
     "ReferenceCache",
     "ScanSample",
+    "ShardDiscovery",
     "ShardInfo",
     "SpearmanResult",
     "WilcoxonResult",
@@ -95,6 +102,7 @@ __all__ = [
     "paired_wilcoxon",
     "region_masks",
     "ring_of_cohort",
+    "select_scoring_volume",
     "setup_figure_style",
     "spearman_with_bootstrap_ci",
     "symlink_latest",
