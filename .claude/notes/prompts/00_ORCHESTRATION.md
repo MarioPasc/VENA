@@ -207,6 +207,42 @@ it was the wrong venue:
 editing, unit tests, and small diagnostics only. The harmonisation audit that
 found the headline-inverting bug took minutes on Picasso.
 
+## The sweep submission design (measured, 2026-07-16)
+
+**Cost, re-derived from V1's `decision.json` (`elapsed_s: 1872.6`, `n_scans: 635`):**
+`2.95 s/volume` wall @ ~9.8 cores = **28.8 CPU-s/volume** ⇒ 21,015 volumes ≈
+**168 CPU-hours**. *(An earlier "239 CPU-h" was my arithmetic error — I divided by
+381, forgetting C5 and VENA each ran two NFEs. Re-measure post-fix: `iter_scans`
+now reads both `_raw` and `_harmonised`, doubling per-scan I/O.)*
+
+**168 CPU-h is total work, never wall-clock.** Measured cluster limits:
+```
+MaxTRESPU (per user): cpu=9000     MaxArraySize = 4096
+cpu_partition: 335 nodes, 128+ cores, 450 GB+     GrpTRES gres/gpu=32  ← irrelevant, we need no GPU
+```
+
+| Sharding | Tasks | Per task | Cores | Wall |
+|---|---:|---|---:|---|
+| serial | 1 | 17 h | 10 | 17 h |
+| per method (V1's first proposal) | 16 | ~15 h | 128 | ~15 h — unbalanced (C4/C5: 48 files; C0: 8), no failure isolation |
+| per (method, nfe) | 45 | ~23 min | 360 | ~25 min |
+| **per prediction file** ✅ | **360** | 15 s–6 min | 2,880 (32% of cap) | **~10 min** |
+
+**Chosen: one array task per prediction file.** Maps 1:1 to the data layout, best
+wall-clock, and the real win is restart granularity — six bad files means
+`--array=6,42,...`, not a 15-hour redo.
+
+Pipeline (built by V1): `cli_manifest.py` (build_index → manifest.csv with
+task_id) → `cli_shard.py` (one H5 per `SLURM_ARRAY_TASK_ID` → `shard_NNNN.csv`,
+no stats) → `cli_merge.py` (concat → `run_postprocess`). **Patient collapse and
+Holm correction run ONCE, globally, in the merge** — never per shard.
+`launcher_*_sweep.sh` submits `--array=0-N%120` + merge with
+`--dependency=afterok:<array_id>`.
+
+**CPU jobs bypass the `gres/gpu=32` cap** that has P1's PED shards stuck on
+`QOSGrpGRES` — confirmed twice in practice (1599746, 1599757 both scheduled
+immediately). Only §4.4's segmentation sweep (~2.6 GPU-h) queues behind it.
+
 ## Orchestrator protocol
 
 - **Never edit a delegated agent's code.** Fixing it myself means I mis-scheduled.
