@@ -94,8 +94,52 @@ would repoint the shared env and break every other agent.
 ├── picasso_shard_d_lddpm/ picasso_shard_e_syndiff/
 ```
 
-Shards are an operational split only (write-disjoint). Discover everything by
-globbing `<ROOT>/*/predictions/*/*/nfe_*.h5`.
+Shards are an operational split only (write-disjoint).
+
+### 3.1 The stale-smoke-shard trap (ORCHESTRATOR ERROR, corrected 2026-07-16)
+
+**An earlier version of this file said "discover everything by globbing
+`<ROOT>/*/predictions/*/*/nfe_*.h5`". That instruction is WRONG on Picasso and
+was my mistake** — I wrote it from the local tree, where it happens to be right.
+
+Picasso's root also contains **`smoke_loginexa/`**, a leftover smoke run with its
+own `predictions/` tree (12 methods × 8 cohorts × 1 NFE = **96 files**):
+
+| Glob | Local | Picasso |
+|---|---:|---:|
+| `<ROOT>/*/predictions/**/nfe_*.h5` | 360 ✔ | **456 ✘** (360 + 96 stale) |
+
+Consequence if uncorrected: the same `(method, cohort, nfe)` appears twice, the
+same `scan_id` is scored twice, per-cohort means are biased toward whichever
+patients the smoke happened to sample, and the paired Wilcoxon sees a patient
+twice — breaking the independence assumption it rests on. It would not crash. It
+would just be wrong, on the cluster only, where nobody was looking.
+
+**The fix is principled, because the artifact is self-describing:** every shard's
+`decision.json` carries a `smoke` block. The stale one declares:
+
+```json
+"run_id_tag": "smoke_loginexa",
+"smoke": {"enabled": true, "n_patients_per_cohort": 1, "use_selection_nfe_only": true}
+```
+
+**Discovery contract:**
+1. Enumerate `<ROOT>/*/decision.json`.
+2. **Skip any shard whose `decision.json["smoke"]["enabled"] is true.**
+3. Only then glob that shard's `predictions/`.
+4. Record the accepted *and* the skipped shard tags in your `decision.json`.
+5. **Defence in depth:** also assert that `(method, cohort, nfe, scan_id)` is
+   unique across the assembled index, and fail loudly if not. Do not silently
+   `drop_duplicates` — a duplicate that is not a known smoke shard means
+   something else is wrong.
+
+Never hard-code `picasso_shard_*` as the filter: the BraTS-PED backfill writes
+`picasso_ped_*` tags, which are production and must be included.
+
+*Credit: found by the downstream_seg agent when its Picasso smoke produced 6 rows
+for 5 unique scans. It only surfaced because that smoke ran on real cluster data —
+the local tree has no `smoke_loginexa`, so no amount of local testing would have
+caught it.*
 
 **Local disk is 93% full (134 G free). Phase 2 must persist scalars, CSVs and
 PNGs only — NEVER a derived volume** (no residual maps, no probability maps).
@@ -253,8 +297,74 @@ percentile_normalise(lower=0.0, upper=99.5, foreground_only=True)   # then exter
 Verified on disk: inside brain ⊆ [0,1]; outside brain ≡ 0, for both the
 prediction and the reference.
 
-**Rules:**
-1. **DO NOT re-normalise.** No z-scoring, no min-max, no histogram matching.
+### 7.0 ⚠ THE SCORING-SPACE RULE (decided 2026-07-16 — READ BEFORE §7 BELOW)
+
+**Phase 1's `_harmonised` field is CORRUPTED for 15 of the 16 methods. Scoring it
+naively inverts the paper's headline result.**
+
+Measured on Picasso, all 16 methods × 3 cohorts (UCSF-PDGM / BraTS-GLI / IvyGAP):
+
+| method | raw p99.5 | MAE(raw) | MAE(harmonised) |
+|---|---:|---:|---:|
+| `C0-Identity` | **2349.4** | 1716.6 | 0.3806 |
+| `C1-pGAN-t1pre` | 0.5878 | **0.0792** | 0.2722 |
+| `C2-ResViT` | 0.8526 | **0.0714** | 0.1196 |
+| `C3-SynDiff-t1pre` | 0.8337 | **0.1164** | 0.3428 |
+| `C4-3D-DiT` | 0.3821 | **0.1472** | 0.2200 |
+| `C5-T1C-RFlow` | 0.7533 | **0.0867** | 0.1605 |
+| `VENA-S1-v3b-rw` | 0.8068 | **0.0668** | 0.1953 |
+
+**Mechanism.** Every method except C0 was trained to emit the *already
+percentile-normalised* T1c, so its raw output is already in the target space
+(VENA raw mean 0.345 vs target 0.337). But each under-saturates the bright
+enhancement tail, so raw p99.5 < 1. `apply_harmonisation` then stretches
+[p0, p99.5] → [0,1] — a per-scan affine fit to the *prediction's own histogram* —
+inflating bulk tissue (VENA 0.345 → 0.491) and destroying agreement with the
+reference, which was normalised exactly once from scanner units.
+
+This **penalises under-saturated methods twice**: once for the under-saturation,
+then again by rescaling their parenchyma away from the target. C4-3D-DiT
+(p99.5 = 0.38) is punished hardest. Proposal §4.1 explicitly warned against this —
+*"a real failure mode that we report alongside MAE rather than absorb into the
+harmonisation"* — and Phase 1 absorbs it anyway.
+
+**It flips the headline.** VENA vs C5 on raw MAE — UCSF 0.0668 < 0.0867,
+BraTS-GLI 0.0751 < 0.0789, IvyGAP 0.0891 < 0.1200: **VENA wins all three.** On
+harmonised it *loses* two of three. The frozen benchmark, scored naively, would
+report that VENA loses to the SOTA competitor. That is an artefact of the metric.
+
+**THE RULE — normalise only if not already normalised.** State it as a property
+of the volume, NEVER as a hard-coded method list (a list silently breaks when
+BraTS-PED or a new competitor lands):
+
+```python
+# Per (scan, method), inside the brain mask, on predictions/t1c_synthetic_raw:
+p995 = np.percentile(raw[brain], 99.5)
+if p995 <= 1.05 and raw[brain].min() >= -0.05:
+    volume, mode = raw, "raw"                  # already in the trained normalised space
+else:
+    volume, mode = harmonised, "harmonised"    # method-native units (today: C0 only)
+```
+
+Safe by three orders of magnitude: C0 sits at 1424–2466, every other method
+at ≤ 0.97. Record the chosen `mode` **per row** in the `per_scan` CSV and the
+per-method counts in `decision.json` — the choice must be auditable, never invisible.
+
+**Under-saturation is now REPORTED, not absorbed:** raw p99.5 per method belongs
+in the §4.1 Table-S1 audit. It is a real, publishable failure mode — C4-3D-DiT
+reaching only 38% of the reference's dynamic range is a finding, not a bug.
+
+**Follow-up owed:** proposal §4.1 must be reconciled to this contract.
+
+*Found by scoring C0-Identity and disbelieving the number: identity came out at
+MAE 0.339 where ~0.02–0.05 was expected. The canary fired exactly as designed.*
+
+---
+
+**Rules (subordinate to §7.0 above):**
+1. **DO NOT re-normalise** — and note §7.0: for 15/16 methods that means scoring
+   `_raw`, because Phase 1 already re-normalised them once too often.
+   No z-scoring, no min-max, no histogram matching.
    Re-applying `percentile_normalise` silently changes every number.
    (Exception: §4.4's segmenter applies its own bundle preprocessing —
    identically to the real and synthetic arms. That is a fixed instrument, not
