@@ -1,0 +1,72 @@
+# Downstream-seg SMOKE config
+# Three cohorts: UCSF-PDGM (50 / 50), LUMIERE (72 / 11), IvyGAP (5 / 5).
+# Three methods at their selection_nfe: C0-Identity (nfe=1), VENA-S1-v3b-rw (nfe=5), VENA-S1-v3a (nfe=5).
+#
+# LUMIERE is deliberately included: it is the only longitudinal cohort (72 scans / 11 patients)
+# and exercises the scan→patient collapse path.  The engine asserts n_patients==11 after processing.
+# VENA-S1-v3a is the concat-only (no GT WT mask) ablation — the honest §4.4 comparator.
+# VENA-S1-v3b-rw receives the GT WT mask; its ΔDice must always be reported next to v3a.
+#
+# --- C0-Identity semantics (IMPORTANT) ---
+# C0-Identity is the NULL FLOOR: T̂1c ≡ T1pre (pre-contrast copy, no enhancement).
+# It does NOT copy the real T1c.  Sources: Results README line 181,
+# identity_adapter.py:60-67, proposal §2 table.
+#
+# Canaries (stop and investigate if these fail):
+#
+#   1. Channel-order probe (observed 2026-07-16, IvyGAP 5 scans):
+#      Dice_real WT  ≈ 0.77–0.96  (near-zero → INPUT_CHANNELS order wrong)
+#      Dice_real TC  ≈ 0.38–0.96  (outliers expected for infiltrating tumours)
+#      Dice_real ET  ≈ 0.85–0.95  (IvyGAP GBMs strongly enhance; NaN only for
+#                                   non-enhancing cases not present here)
+#
+#   2. Mask join proof:
+#      For each scan_id, Dice(pred masks/wt, ref masks/wt) ≈ 1.0.
+#      Near-zero means the scan_id join is broken.
+#      Observed 2026-07-16: Dice = 1.000 for all 5 IvyGAP scans. ✓
+#
+#   3. C0 delta direction:
+#      delta_et for C0-Identity must be LARGE and POSITIVE (≈ 0.85–0.90).
+#      C0 must have the LARGEST delta among all methods.
+#
+#   4. Oracle-mask check:
+#      v3a delta_et >= v3b-rw delta_et (v3b-rw gets GT mask → inflated Dice_synth).
+#      If v3a delta_et < v3b-rw delta_et, the join or scoring-space fix has regressed.
+#
+#   5. LUMIERE patient collapse:
+#      n_patients(LUMIERE) == 11 and n_scans(LUMIERE) == 72 after processing.
+#
+# Corpus H5 paths: canonical Picasso locations.
+# ring_partitions.json is written by vena-validation-preregister.
+
+inference_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+output_root:    /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference/analyses
+
+bundle_path:    /mnt/home/users/tic_163_uma/mpascual/fscratch/bundles/brats_mri_segmentation
+
+corpus_map:
+  UCSF-PDGM: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSF_PDGM/h5/UCSFPDGM_image.h5
+  LUMIERE:   /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/lumiere/h5/LUMIERE_image.h5
+  IvyGAP:   /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/ivy_gap/h5/IvyGAP_image.h5
+
+ring_partitions_path: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference/analyses/preregister/LATEST/ring_partitions.json
+
+# SELECTION_NFE per method (also governed by registry.SELECTION_NFE):
+#   C0-Identity    → nfe=1
+#   VENA-S1-v3b-rw → nfe=5
+#   VENA-S1-v3a    → nfe=5
+methods:
+  - C0-Identity
+  - VENA-S1-v3b-rw
+  - VENA-S1-v3a
+
+cohorts:
+  - UCSF-PDGM
+  - LUMIERE
+  - IvyGAP
+
+device: cuda:0
+amp:    true
+selection_nfe_only: true
+
+log_level: INFO
