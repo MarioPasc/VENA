@@ -14,9 +14,11 @@ single job to a subset; fan out to Picasso by (method, cohort) pairs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -52,6 +54,10 @@ from vena.validation.io import (
 from vena.validation.registry import SELECTION_NFE
 
 logger = logging.getLogger(__name__)
+
+# LUMIERE is longitudinal: 72 scans / 11 patients.  Assert after processing.
+_LUMIERE_EXPECTED_SCANS = 72
+_LUMIERE_EXPECTED_PATIENTS = 11
 
 
 class DownstreamSegError(Exception):
@@ -130,6 +136,19 @@ class DownstreamSegConfig:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_git_sha(repo_root: Path) -> str:
+    """Return HEAD SHA of the repo at *repo_root*, or ``"unknown"`` on failure."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
 
 
 def _discover_pred_files(
@@ -233,6 +252,11 @@ def _read_pred_row(pred_path: Path, row_idx: int, *, ref_cache: ReferenceCache) 
     trained normalised space and must be scored as-is; only scanner-unit methods
     (``C0-Identity``) sit outside ``[0, 1.05]`` and fall back to harmonised.
 
+    Also computes ``wt_join_dice``: Dice between ``masks/wt`` in the prediction
+    H5 and ``masks/wt`` in the reference H5 (joined by scan_id).  A correct
+    scan_id join produces Dice ≈ 1.0; near-zero indicates a row-index join bug
+    or mismatched build pipelines.
+
     Parameters
     ----------
     pred_path :
@@ -247,9 +271,10 @@ def _read_pred_row(pred_path: Path, row_idx: int, *, ref_cache: ReferenceCache) 
     -------
     dict
         Keys: ``scan_id``, ``patient_id``, ``t1c_synth``, ``pred_mode``,
-        ``t1c_real``, ``t1pre``, ``t2``, ``flair``.
+        ``wt_join_dice``, ``t1c_real``, ``t1pre``, ``t2``, ``flair``.
         All volumes are ``(H, W, D)`` float32.  ``pred_mode`` is ``"raw"``
         or ``"harmonised"`` per :func:`~vena.validation.io.select_scoring_volume`.
+        ``wt_join_dice`` is a float in ``[0, 1]``.
     """
     with h5py.File(pred_path, "r") as pf:
         scan_ids = _decode_str_arr(pf["metadata/scan_id"][:])
@@ -261,6 +286,8 @@ def _read_pred_row(pred_path: Path, row_idx: int, *, ref_cache: ReferenceCache) 
             pf["predictions/t1c_synthetic_harmonised"][row_idx], dtype=np.float32
         )
         raw_vol = np.asarray(pf["predictions/t1c_synthetic_raw"][row_idx], dtype=np.float32)
+        # Pred-side WT mask for scan-id join proof.
+        pred_wt = np.asarray(pf["masks/wt"][row_idx], dtype=bool)
 
         # _resolve_references_h5 must be called while pf is open (reads attrs)
         ref_h5 = _resolve_references_h5(pf, pred_path)
@@ -281,15 +308,23 @@ def _read_pred_row(pred_path: Path, row_idx: int, *, ref_cache: ReferenceCache) 
         t2 = rf["reference/t2_harmonised"][ref_row]
         flair = rf["reference/flair_harmonised"][ref_row]
         brain = np.asarray(rf["masks/brain"][ref_row], dtype=bool)
+        # Ref-side WT mask for scan-id join proof.
+        ref_wt = np.asarray(rf["masks/wt"][ref_row], dtype=bool)
 
     # commit 1c5d2c3: select the correct scoring volume per-scan.
     t1c_synth, pred_mode = select_scoring_volume(raw_vol, harmonised_vol, brain)
+
+    # Join-proof: Dice(pred_wt, ref_wt) ≈ 1.0 iff the scan_id join is correct.
+    # The inference writer copies masks/wt verbatim from the reference H5, so any
+    # mismatch indicates an index-join bug or mismatched build pipelines.
+    wt_join_dice = dice_score(pred_wt, ref_wt)
 
     return {
         "scan_id": scan_id,
         "patient_id": patient_id,
         "t1c_synth": t1c_synth,
         "pred_mode": pred_mode,
+        "wt_join_dice": float(wt_join_dice),
         "t1c_real": t1c_real.astype(np.float32),
         "t1pre": t1pre.astype(np.float32),
         "t2": t2.astype(np.float32),
@@ -313,6 +348,395 @@ def _seg_to_dice(
     d_tc = dice_score(tc_pred, gt_tc)
     d_et = dice_score(et_pred, gt_et)
     return d_wt, d_tc, d_et
+
+
+# ---------------------------------------------------------------------------
+# Artifact writers
+# ---------------------------------------------------------------------------
+
+
+def _write_tables(run_dir: Path, df: pd.DataFrame) -> None:
+    """Write per-method aggregate CSVs to tables/.
+
+    Parameters
+    ----------
+    run_dir :
+        Artifact run directory.
+    df :
+        per_scan tidy DataFrame.
+    """
+    tables_dir = run_dir / "tables"
+    tables_dir.mkdir(exist_ok=True)
+
+    if df.empty:
+        return
+
+    agg_metrics = [
+        "delta_wt",
+        "delta_tc",
+        "delta_et",
+        "dice_wt_real",
+        "dice_tc_real",
+        "dice_et_real",
+        "dice_wt_synth",
+        "dice_tc_synth",
+        "dice_et_synth",
+        "wt_join_dice",
+    ]
+
+    # Per (method, cohort, ring, nfe)
+    agg = (
+        df.groupby(["method", "cohort", "ring", "nfe"])[agg_metrics]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+    )
+    agg.columns = ["_".join(str(c) for c in col).rstrip("_") for col in agg.columns]
+    agg.to_csv(tables_dir / "method_cohort_agg.csv", index=False)
+
+    # Per (method, ring) — Ring A and Ring B separate
+    ring_agg = (
+        df.groupby(["method", "ring"])[agg_metrics].agg(["mean", "std", "count"]).reset_index()
+    )
+    ring_agg.columns = ["_".join(str(c) for c in col).rstrip("_") for col in ring_agg.columns]
+    ring_agg.to_csv(tables_dir / "method_ring_agg.csv", index=False)
+
+    # WT-join Dice per scan (audit trail)
+    df[["method", "cohort", "scan_id", "patient_id", "wt_join_dice"]].to_csv(
+        tables_dir / "wt_join_dice_per_scan.csv", index=False
+    )
+
+
+def _write_figures(run_dir: Path, df: pd.DataFrame) -> None:
+    """Write figures to figures/.
+
+    Produces:
+    - ``delta_et_per_method.png``, ``delta_wt_per_method.png``,
+      ``delta_tc_per_method.png``: bar charts with Holm-corrected
+      significance vs C0-Identity, black background.
+    - ``wt_join_dice_histogram.png``: histogram of per-scan WT-join Dice.
+
+    Parameters
+    ----------
+    run_dir :
+        Artifact run directory.
+    df :
+        per_scan tidy DataFrame.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")  # non-interactive backend; no display required
+    import matplotlib.pyplot as plt
+    from scipy.stats import wilcoxon
+    from statsmodels.stats.multitest import multipletests
+
+    figures_dir = run_dir / "figures"
+    figures_dir.mkdir(exist_ok=True)
+
+    if df.empty:
+        return
+
+    # Collapse to patient level first (§11 — avoids anti-conservative inflation
+    # for LUMIERE where 72 scans map to only 11 patients).
+    patient_agg = (
+        df.groupby(["method", "cohort", "patient_id"])[["delta_wt", "delta_tc", "delta_et"]]
+        .mean()
+        .reset_index()
+    )
+
+    methods = sorted(df["method"].unique().tolist())
+    ref_method = "C0-Identity" if "C0-Identity" in methods else None
+
+    for metric, label in [
+        ("delta_et", "ΔDice ET"),
+        ("delta_wt", "ΔDice WT"),
+        ("delta_tc", "ΔDice TC"),
+    ]:
+        fig, ax = plt.subplots(figsize=(max(6, len(methods) * 1.4), 5))
+        fig.patch.set_facecolor("black")
+        ax.set_facecolor("black")
+
+        method_means: dict[str, float] = {}
+        method_pvals: dict[str, float] = {}
+
+        for m in methods:
+            vals = patient_agg[patient_agg["method"] == m][metric].dropna().values
+            method_means[m] = float(np.mean(vals)) if len(vals) > 0 else float("nan")
+
+            if ref_method and m != ref_method:
+                # Paired Wilcoxon vs reference method, aligned by (cohort, patient_id).
+                paired = pd.merge(
+                    patient_agg[patient_agg["method"] == m][["cohort", "patient_id", metric]],
+                    patient_agg[patient_agg["method"] == ref_method][
+                        ["cohort", "patient_id", metric]
+                    ],
+                    on=["cohort", "patient_id"],
+                    suffixes=("_m", "_ref"),
+                ).dropna()
+                if len(paired) >= 5:
+                    try:
+                        _, p = wilcoxon(
+                            paired[f"{metric}_m"].values, paired[f"{metric}_ref"].values
+                        )
+                        method_pvals[m] = float(p)
+                    except Exception:
+                        pass
+
+        # Sort methods by mean delta descending.
+        sorted_methods = sorted(
+            methods,
+            key=lambda m: method_means.get(m, float("-inf")),
+            reverse=True,
+        )
+
+        # Holm correction across all tested methods (same family).
+        valid_methods = [m for m in sorted_methods if m in method_pvals]
+        holm_sig: dict[str, tuple[bool, float]] = {}
+        if valid_methods:
+            pvals_arr = [method_pvals[m] for m in valid_methods]
+            reject, pvals_corr, _, _ = multipletests(pvals_arr, method="holm")
+            for m, rej, pc in zip(valid_methods, reject, pvals_corr, strict=True):
+                holm_sig[m] = (bool(rej), float(pc))
+
+        xs = list(range(len(sorted_methods)))
+        means = [method_means.get(m, 0.0) for m in sorted_methods]
+        # VENA methods in blue; competitors / C0 in orange.
+        colors = ["#1a9cf0" if m.startswith("VENA") else "#e87d4d" for m in sorted_methods]
+        ax.bar(xs, means, color=colors, alpha=0.85, edgecolor="white", linewidth=0.5)
+
+        for i, m in enumerate(sorted_methods):
+            if m in holm_sig:
+                rej, pc = holm_sig[m]
+                stars = "***" if pc < 0.001 else ("**" if pc < 0.01 else ("*" if rej else "n.s."))
+                offset = 0.01 if means[i] >= 0 else -0.03
+                ax.text(
+                    i, means[i] + offset, stars, ha="center", va="bottom", fontsize=7, color="white"
+                )
+
+        ax.set_xticks(xs)
+        ax.set_xticklabels(sorted_methods, rotation=45, ha="right", fontsize=7, color="white")
+        ax.set_ylabel(label, color="white", fontsize=9)
+        ax.set_title(
+            f"{label} per method (patient-level mean; Holm vs {ref_method or 'none'})",
+            color="white",
+            fontsize=9,
+        )
+        ax.axhline(0, color="white", linewidth=0.5, linestyle="--")
+        ax.tick_params(colors="white", labelsize=7)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("white")
+        caption = (
+            f"Correction: Holm-Bonferroni / test: paired Wilcoxon / "
+            f"family: downstream_seg / reference: {ref_method or 'none'}"
+        )
+        fig.text(0.5, -0.04, caption, ha="center", fontsize=6, color="#aaaaaa")
+        plt.tight_layout()
+        fig.savefig(
+            figures_dir / f"{metric}_per_method.png",
+            dpi=150,
+            bbox_inches="tight",
+            facecolor="black",
+        )
+        plt.close(fig)
+
+    # WT-join Dice histogram.
+    wt_dice_vals = df["wt_join_dice"].dropna().values
+    if len(wt_dice_vals) > 0:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        fig.patch.set_facecolor("black")
+        ax.set_facecolor("black")
+        ax.hist(wt_dice_vals, bins=30, color="#1a9cf0", alpha=0.8, edgecolor="white", linewidth=0.3)
+        ax.axvline(0.99, color="#ff6b6b", linewidth=1.5, linestyle="--", label="0.99 threshold")
+        n_below = int((wt_dice_vals < 0.99).sum())
+        ax.set_title(
+            f"WT-join Dice (scan-ID join proof) — {n_below}/{len(wt_dice_vals)} below 0.99",
+            color="white",
+            fontsize=9,
+        )
+        ax.set_xlabel("Dice(pred masks/wt, ref masks/wt)", color="white", fontsize=8)
+        ax.set_ylabel("Count", color="white", fontsize=8)
+        ax.tick_params(colors="white")
+        ax.legend(facecolor="#222222", labelcolor="white", fontsize=7)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("white")
+        plt.tight_layout()
+        fig.savefig(
+            figures_dir / "wt_join_dice_histogram.png",
+            dpi=150,
+            bbox_inches="tight",
+            facecolor="black",
+        )
+        plt.close(fig)
+
+
+def _write_report_md(
+    run_dir: Path,
+    df: pd.DataFrame,
+    *,
+    skipped_smoke_shards: list[str],
+    skipped_no_corpus: set[str],
+    skipped_no_scan: list[str],
+    real_arm_call_count: int,
+    wall_clock_s: float,
+    git_sha: str,
+    n_scans_lumiere: int,
+    n_patients_lumiere: int,
+) -> None:
+    """Write report.md for the downstream-seg artifact.
+
+    Parameters
+    ----------
+    run_dir :
+        Artifact run directory.
+    df :
+        per_scan tidy DataFrame.
+    skipped_smoke_shards :
+        Shard names excluded because ``smoke.enabled=True``.
+    skipped_no_corpus :
+        Cohort names skipped because they had no corpus H5.
+    skipped_no_scan :
+        Per-scan skip messages.
+    real_arm_call_count :
+        Number of unique real-arm segmenter calls.
+    wall_clock_s :
+        Total wall-clock time in seconds.
+    git_sha :
+        Git HEAD SHA of the producing repo.
+    n_scans_lumiere :
+        Unique LUMIERE scan IDs processed.
+    n_patients_lumiere :
+        Unique LUMIERE patient IDs processed.
+    """
+    lines: list[str] = []
+    lines.append("# Downstream-seg §4.4 — report\n")
+    lines.append(f"**produced_at**: {datetime.now(tz=UTC).isoformat()}  ")
+    lines.append(f"**git_sha**: `{git_sha}`  ")
+    lines.append(f"**wall_clock**: {wall_clock_s:.1f} s\n")
+
+    if df.empty:
+        lines.append("**WARNING**: no rows produced — check corpus_map and inference_root.\n")
+        (run_dir / "report.md").write_text("\n".join(lines))
+        return
+
+    # Summary counts
+    n_methods = df["method"].nunique()
+    n_cohorts = df["cohort"].nunique()
+    n_scans = df.groupby(["cohort", "scan_id"]).ngroups
+    n_patients = df.groupby(["cohort", "patient_id"]).ngroups
+    lines.append(
+        f"**Summary**: {len(df)} rows · {n_methods} methods · {n_cohorts} cohorts · "
+        f"{n_scans} scans · {n_patients} patients\n"
+    )
+
+    # Oracle-mask confound documentation (mandatory per correction item 1)
+    lines.append("## Oracle-mask confound\n")
+    lines.append(
+        "**`VENA-S1-v3b-rw`** receives the ground-truth WT mask as ControlNet conditioning. "
+        "When Dice is computed against the same GT, the segmenter can partially recover the "
+        "mask that was fed to the generator, inflating synthetic Dice and artificially reducing "
+        "ΔDice.  **`VENA-S1-v3a`** (concat-only, no mask conditioning) is the honest comparator "
+        "and must appear next to every v3b-rw number.\n"
+    )
+
+    # Negative delta count per method
+    lines.append("## ΔDice summary per method\n")
+    lines.append(
+        "delta = Dice_real − Dice_synth. "
+        "Negative delta means synthetic Dice > real Dice (oracle-confound indicator).\n"
+    )
+
+    if "delta_et" in df.columns:
+        # Collapse to patient level before reporting (§11 anti-conservative guard)
+        pat = (
+            df.groupby(["method", "cohort", "patient_id"])[["delta_wt", "delta_tc", "delta_et"]]
+            .mean()
+            .reset_index()
+        )
+        by_method = pat.groupby("method")[["delta_wt", "delta_tc", "delta_et"]].mean()
+        neg_et = (
+            pat[pat["delta_et"] < 0].groupby("method")["delta_et"].count().rename("n_neg_delta_et")
+        )
+        by_method = by_method.join(neg_et, how="left").fillna(0)
+        by_method["n_neg_delta_et"] = by_method["n_neg_delta_et"].astype(int)
+        lines.append(by_method.to_markdown())
+        lines.append("\n")
+        total_neg_et = int((pat["delta_et"] < 0).sum())
+        lines.append(
+            f"**Total negative delta_et (patient-level)**: {total_neg_et} / {len(pat)} "
+            f"({100 * total_neg_et / max(len(pat), 1):.1f}%).\n"
+        )
+
+    # WT-join Dice proof
+    lines.append("## WT-join Dice (scan-ID join proof)\n")
+    wt_vals = df["wt_join_dice"].dropna()
+    if len(wt_vals) > 0:
+        lines.append(
+            f"Dice(pred masks/wt, ref masks/wt) — "
+            f"min={wt_vals.min():.4f} mean={wt_vals.mean():.4f} "
+            f"below_0.99={int((wt_vals < 0.99).sum())} / {len(wt_vals)}\n"
+        )
+    else:
+        lines.append("**WARNING**: no wt_join_dice values computed.\n")
+
+    # LUMIERE patient-collapse verification
+    lines.append("## LUMIERE longitudinal collapse\n")
+    if n_scans_lumiere > 0:
+        lines.append(
+            f"LUMIERE: {n_scans_lumiere} scans / {n_patients_lumiere} patients processed "
+            f"(expected {_LUMIERE_EXPECTED_SCANS} / {_LUMIERE_EXPECTED_PATIENTS}).\n"
+        )
+        if n_scans_lumiere != _LUMIERE_EXPECTED_SCANS:
+            lines.append(
+                f"**WARNING**: expected {_LUMIERE_EXPECTED_SCANS} LUMIERE scans, "
+                f"got {n_scans_lumiere}.\n"
+            )
+        if n_patients_lumiere != _LUMIERE_EXPECTED_PATIENTS:
+            lines.append(
+                f"**WARNING**: expected {_LUMIERE_EXPECTED_PATIENTS} LUMIERE patients, "
+                f"got {n_patients_lumiere}.\n"
+            )
+    else:
+        lines.append("LUMIERE not processed in this run.\n")
+
+    # Known limitations (§10 open issues — state, not fix)
+    lines.append("## Known limitations (inherited from Phase 1)\n")
+    lines.append(
+        "- **VENA `_sample` unseeded**: predictions are not bit-reproducible; "
+        "cross-NFE draws differ. Cannot be fixed without re-running inference.\n"
+    )
+    lines.append(
+        "- **Input conditioning imbalance**: C4–C7 condition on {t1pre, flair}; "
+        "VENA/ResViT on {t1pre, t2, flair}; pGAN/SynDiff on {t1pre}. "
+        "Disclosed in every cross-method comparison.\n"
+    )
+    lines.append(
+        "- **Oracle mask**: VENA-S1-v3b/v3b-rw receive GT WT mask as conditioning. "
+        "VENA-S1-v3a (concat-only) is the no-oracle comparator.\n"
+    )
+    lines.append(
+        "- **Appendix A deviation**: used a fixed pretrained BraTS segmenter instead of "
+        "per-cohort nnU-Net from scratch. The level confounder cancels in paired ΔDice; "
+        "absolute Dice values are not directly comparable to proposal Table A1.\n"
+    )
+
+    # Skipped items
+    lines.append("## Skipped items\n")
+    lines.append(f"- Smoke shards excluded: {skipped_smoke_shards or 'none'}\n")
+    lines.append(f"- Cohorts without corpus H5: {sorted(skipped_no_corpus) or 'none'}\n")
+    lines.append(f"- Per-scan skips: {len(skipped_no_scan)}\n")
+    if skipped_no_scan:
+        for msg in skipped_no_scan[:10]:
+            lines.append(f"  - {msg}\n")
+        if len(skipped_no_scan) > 10:
+            lines.append(f"  - ... and {len(skipped_no_scan) - 10} more\n")
+
+    # Figures
+    lines.append("## Figures\n")
+    lines.append("- `figures/delta_et_per_method.png` — ΔDice ET per method, Holm-corrected\n")
+    lines.append("- `figures/delta_wt_per_method.png` — ΔDice WT per method, Holm-corrected\n")
+    lines.append("- `figures/delta_tc_per_method.png` — ΔDice TC per method, Holm-corrected\n")
+    lines.append("- `figures/wt_join_dice_histogram.png` — WT-join Dice scan-ID join proof\n")
+
+    (run_dir / "report.md").write_text("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +891,7 @@ class DownstreamSegEngine:
                 )
 
                 pred_mode = data["pred_mode"]  # "raw" | "harmonised" — audit trail
+                wt_join_dice = data["wt_join_dice"]
 
                 result = SegResult(
                     method=method,
@@ -491,6 +916,7 @@ class DownstreamSegEngine:
                         "scan_id": result.scan_id,
                         "patient_id": result.patient_id,
                         "pred_mode": pred_mode,
+                        "wt_join_dice": wt_join_dice,
                         "dice_wt_real": result.dice_wt_real,
                         "dice_tc_real": result.dice_tc_real,
                         "dice_et_real": result.dice_et_real,
@@ -516,6 +942,32 @@ class DownstreamSegEngine:
         if not rows:
             logger.warning("no rows produced — check corpus_map and inference_root")
 
+        # LUMIERE longitudinal-collapse check (§13 — assert 72 scans / 11 patients).
+        lumiere_scan_ids = {r["scan_id"] for r in rows if r["cohort"] == "LUMIERE"}
+        lumiere_patient_ids = {r["patient_id"] for r in rows if r["cohort"] == "LUMIERE"}
+        n_scans_lumiere = len(lumiere_scan_ids)
+        n_patients_lumiere = len(lumiere_patient_ids)
+        if n_scans_lumiere > 0:
+            if n_scans_lumiere != _LUMIERE_EXPECTED_SCANS:
+                logger.warning(
+                    "LUMIERE scan count: expected %d, got %d — check shard coverage",
+                    _LUMIERE_EXPECTED_SCANS,
+                    n_scans_lumiere,
+                )
+            if n_patients_lumiere != _LUMIERE_EXPECTED_PATIENTS:
+                logger.warning(
+                    "LUMIERE patient count: expected %d, got %d — check patient_id join",
+                    _LUMIERE_EXPECTED_PATIENTS,
+                    n_patients_lumiere,
+                )
+            logger.info(
+                "LUMIERE: %d scans / %d patients (expected %d / %d)",
+                n_scans_lumiere,
+                n_patients_lumiere,
+                _LUMIERE_EXPECTED_SCANS,
+                _LUMIERE_EXPECTED_PATIENTS,
+            )
+
         df = pd.DataFrame(
             rows,
             columns=[
@@ -526,6 +978,7 @@ class DownstreamSegEngine:
                 "scan_id",
                 "patient_id",
                 "pred_mode",
+                "wt_join_dice",
                 "dice_wt_real",
                 "dice_tc_real",
                 "dice_et_real",
@@ -541,20 +994,35 @@ class DownstreamSegEngine:
         csv_path = write_per_scan_csv(run_dir, df, name="downstream_seg.csv")
         logger.info("wrote %s (%d rows)", csv_path, len(df))
 
-        # Build summary stats for decision.json
-        n_scans_processed = len(set((r["cohort"], r["scan_id"]) for r in rows))
-        n_real_arm_unique = real_arm_call_count
+        # Write tables, figures, and report.
+        _write_tables(run_dir, df)
+        _write_figures(run_dir, df)
 
-        import hashlib
+        # Build summary stats for decision.json
+        n_scans_processed = len({(r["cohort"], r["scan_id"]) for r in rows})
+        n_real_arm_unique = real_arm_call_count
 
         bundle_sha = hashlib.sha256(
             (self.cfg.bundle_path / "models" / "model.pt").read_bytes()
         ).hexdigest()
 
+        # WT-join Dice aggregates for the audit trail.
+        wt_dice_vals = [
+            r["wt_join_dice"] for r in rows if not (r["wt_join_dice"] != r["wt_join_dice"])
+        ]
+        wt_join_dice_min = float(np.min(wt_dice_vals)) if wt_dice_vals else float("nan")
+        wt_join_dice_mean = float(np.mean(wt_dice_vals)) if wt_dice_vals else float("nan")
+        wt_join_dice_below_0_99_n = sum(1 for v in wt_dice_vals if v < 0.99)
+
+        # Resolve git SHA from the repo containing this engine file.
+        _repo_root = Path(__file__).resolve().parents[3]
+        git_sha = _get_git_sha(_repo_root)
+
         payload: dict[str, Any] = {
             "schema_version": "1.0",
             "produced_at": datetime.now(tz=UTC).isoformat(),
             "producer": "routines.validation.downstream_seg:1.0",
+            "git_sha": git_sha,
             "inference_root": str(self.cfg.inference_root),
             "output_root": str(self.cfg.output_root),
             "bundle_path": str(self.cfg.bundle_path),
@@ -577,6 +1045,11 @@ class DownstreamSegEngine:
             "skipped_cohorts_no_corpus": sorted(skipped_no_corpus),
             "skipped_scans_n": len(skipped_no_scan),
             "wall_clock_s": round(wall_clock_s, 1),
+            "wt_join_dice_min": wt_join_dice_min,
+            "wt_join_dice_mean": wt_join_dice_mean,
+            "wt_join_dice_below_0_99_n": wt_join_dice_below_0_99_n,
+            "lumiere_n_scans": n_scans_lumiere,
+            "lumiere_n_patients": n_patients_lumiere,
             "empty_et_convention": "NaN when both pred and GT are empty (not 0)",
             "scoring_space_fix": (
                 "commit 1c5d2c3 — select_scoring_volume picks raw for 15/16 methods, "
@@ -588,10 +1061,28 @@ class DownstreamSegEngine:
                 "nnU-Net from scratch. Level confounder cancels in paired Δ; "
                 "see 05_downstream_seg.md §2 and report.md."
             ),
+            "oracle_mask_confound": (
+                "VENA-S1-v3b-rw receives GT WT mask as conditioning — report "
+                "VENA-S1-v3a (concat-only) alongside every v3b-rw number."
+            ),
             "corpus_map": {k: str(v) for k, v in self.cfg.corpus_map.items()},
         }
 
         write_decision_json(run_dir, payload)
+
+        _write_report_md(
+            run_dir,
+            df,
+            skipped_smoke_shards=skipped_smoke_shards,
+            skipped_no_corpus=skipped_no_corpus,
+            skipped_no_scan=skipped_no_scan,
+            real_arm_call_count=real_arm_call_count,
+            wall_clock_s=wall_clock_s,
+            git_sha=git_sha,
+            n_scans_lumiere=n_scans_lumiere,
+            n_patients_lumiere=n_patients_lumiere,
+        )
+
         symlink_latest(run_dir)
 
         # Copy config for reproducibility

@@ -157,6 +157,7 @@ class TestReadPredRow:
             "patient_id",
             "t1c_synth",
             "pred_mode",
+            "wt_join_dice",
             "t1c_real",
             "t1pre",
             "t2",
@@ -166,6 +167,17 @@ class TestReadPredRow:
         for vol_key in ("t1c_synth", "t1c_real", "t1pre", "t2", "flair"):
             assert data[vol_key].shape == (_H, _W, _D)
             assert data[vol_key].dtype == np.float32
+
+    def test_wt_join_dice_is_one_for_identical_masks(self, synth_shard: Path) -> None:
+        """Fixture writes all-ones masks/wt in both pred and ref H5 → Dice ≈ 1.0."""
+        pred_path = synth_shard / "predictions" / "VENA-S1-v3b-rw" / "TestCohortA" / "nfe_005.h5"
+        cache = ReferenceCache()
+        data = _read_pred_row(pred_path, 0, ref_cache=cache)
+        assert "wt_join_dice" in data
+        assert data["wt_join_dice"] == pytest.approx(1.0, abs=1e-6), (
+            f"Expected wt_join_dice ≈ 1.0 for all-ones fixture masks, "
+            f"got {data['wt_join_dice']!r}. Check conftest fixture or dice_score."
+        )
 
     def test_pred_mode_is_raw_for_normalised_fixture(self, synth_shard: Path) -> None:
         """Fixture data is rng.random() ∈ [0, 1) → select_scoring_volume returns 'raw'."""
@@ -325,6 +337,7 @@ class TestDownstreamSegEngine:
             "scan_id",
             "patient_id",
             "pred_mode",
+            "wt_join_dice",
             "dice_wt_real",
             "dice_tc_real",
             "dice_et_real",
@@ -369,6 +382,16 @@ class TestDownstreamSegEngine:
         assert "scoring_space_fix" in dec
         assert "skipped_smoke_shards" in dec
         assert "appendix_a_deviation" in dec
+        assert "oracle_mask_confound" in dec
+        assert "git_sha" in dec
+        # WT-join Dice aggregates must be present in the artifact.
+        assert "wt_join_dice_min" in dec
+        assert "wt_join_dice_mean" in dec
+        assert "wt_join_dice_below_0_99_n" in dec
+        # For all-ones fixture masks, min/mean must be 1.0 and none below 0.99.
+        assert dec["wt_join_dice_min"] == pytest.approx(1.0, abs=1e-6)
+        assert dec["wt_join_dice_mean"] == pytest.approx(1.0, abs=1e-6)
+        assert dec["wt_join_dice_below_0_99_n"] == 0
 
     def test_cohort_without_corpus_map_skipped(
         self,
