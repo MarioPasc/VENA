@@ -1,0 +1,25 @@
+# Spatial residual routine — smoke config.
+# Complete in < 5 min on a single CPU core.
+
+inference_root: /tmp/spatial_residual_smoke/inference   # set at test time
+output_root: /tmp/spatial_residual_smoke/artifacts
+
+methods:
+  - VENA-S1-v3b-rw
+  - C0-Identity
+cohorts: null
+nfes: [5]
+
+dilate_k: 5
+n_shuffles: 10
+n_boot: 10
+rng_seed: 42
+mi_n_voxels: 5000
+n_deciles: 10
+
+vena_method: VENA-S1-v3b-rw
+
+scan_limit: 5
+run_convergence_check: false
+
+log_level: DEBUG

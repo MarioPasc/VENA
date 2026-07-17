@@ -1,0 +1,41 @@
+# Spatial residual — Picasso CPU smoke (§13 corrected-scoring re-run).
+#
+# Scored on select_scoring_volume (§7.0 fix merged 1c5d2c3):
+#   - C0-Identity:   "harmonised"  (scanner-unit T1pre needs affine mapping)
+#   - VENA / C5:     "raw"         (already in trained-normalised space)
+#
+# n_shuffles=0: shuffle-null validity proven in local 2026-07-16T19-18-05Z run.
+# n_boot=0:     per-scan CIs not needed for the C0-ceiling check.
+# run_convergence_check=false: already done; result in 19-18-05Z/tables/shuffle_convergence.json.
+#
+# Methods × cohorts × nfes → ~635 scans, n_shuffles=0 → ~14 min on 4 CPUs.
+
+inference_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference/analyses
+
+methods:
+  - VENA-S1-v3b-rw
+  - C0-Identity
+  - C5-T1C-RFlow
+
+cohorts:
+  - UCSF-PDGM
+  - LUMIERE
+  - IvyGAP
+
+# C0 only has nfe_001; VENA/C5 selection_nfe=5.
+# nfes [1,5] captures C0@1 + FM methods@1+5 (635 scans total).
+nfes: [1, 5]
+
+dilate_k: 5
+n_shuffles: 0
+n_boot: 0
+rng_seed: 42
+mi_n_voxels: 30000
+n_deciles: 10
+
+vena_method: VENA-S1-v3b-rw
+scan_limit: null
+run_convergence_check: false
+
+log_level: INFO

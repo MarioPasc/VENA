@@ -1,0 +1,34 @@
+# Spatial residual routine — default config.
+#
+# Prediction files are discovered by build_index() which globs:
+#   <inference_root>/<shard>/predictions/<method>/<cohort>/nfe_*.h5
+#
+# References are resolved automatically from the ``references_h5`` attr baked
+# into each prediction H5 (relative to the shard root); no separate path needed.
+
+inference_root: /path/to/inference_root    # override at run time
+output_root: artifacts/validation/spatial_residual
+
+# Scope filters — null means "all found in inference_root"
+methods: null
+cohorts: null
+nfes: null
+
+# Region parameters
+dilate_k: 5        # WT dilation for C-noT (radius 2, ~8 mm at 1 mm iso)
+
+# Computation parameters
+n_shuffles: 100    # shuffle-null draws per domain per condition
+n_boot: 100        # per-scan Spearman bootstrap draws
+rng_seed: 42
+mi_n_voxels: 30000  # KSG MI subsample cap
+n_deciles: 10
+
+# Aggregate test parameters
+vena_method: VENA-S1-v3b-rw
+
+# Debug / smoke
+scan_limit: null
+run_convergence_check: true
+
+log_level: INFO

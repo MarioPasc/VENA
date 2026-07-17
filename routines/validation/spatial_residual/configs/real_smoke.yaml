@@ -1,0 +1,39 @@
+# Spatial residual — real-data smoke (§13 subset).
+# Covers UCSF-PDGM (50/50), LUMIERE (72 scans/11 patients), IvyGAP (5/5).
+# Methods: VENA-S1-v3b-rw (selection_nfe=5), C0-Identity (selection_nfe=1),
+#          C5-T1C-RFlow (selection_nfe=5).
+# nfes: [1, 5] captures C0's only file (nfe_001) + FM selection NFE (nfe_005).
+# No scan_limit — full LUMIERE needed for 72-scan→11-patient collapse check.
+
+inference_root: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference
+output_root: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference/analyses
+
+methods:
+  - VENA-S1-v3b-rw
+  - C0-Identity
+  - C5-T1C-RFlow
+
+cohorts:
+  - UCSF-PDGM
+  - LUMIERE
+  - IvyGAP
+
+# C0 only has nfe_001; VENA/RFlow selection_nfe=5.
+# nfes [1,5] picks up C0@1 and both FM methods@1+5 (635 total scans, ~30 min).
+# Production run uses nfes: null.
+nfes: [1, 5]
+
+dilate_k: 5
+# Smoke: 5 shuffles enough to verify statistics fire; production uses 200.
+n_shuffles: 5
+n_boot: 10
+rng_seed: 42
+mi_n_voxels: 30000
+n_deciles: 10
+
+vena_method: VENA-S1-v3b-rw
+
+scan_limit: null
+run_convergence_check: true
+
+log_level: INFO
