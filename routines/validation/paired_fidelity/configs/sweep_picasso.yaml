@@ -1,0 +1,62 @@
+# Paired-fidelity FULL SWEEP on Picasso — §4.2 fidelity + §4.5 cost + §4.7 ZGD.
+#
+# This is the config for the real benchmark run.  Do NOT point the sweep
+# launcher at smoke_picasso.yaml: that filters to 3 methods x 3 cohorts and
+# would silently produce a smoke-sized "full" result.
+#
+# Grid as frozen by the pre-registration at
+#   execs/vena/inference/analyses/preregister/2026-07-17T09-33-09Z
+#   (git_sha 7e60709, ring_partitions.json sha256 0d888e9d...a60f72)
+#
+#   405 prediction files = 45 (method, NFE) pairs x 9 cohorts
+#   Ring A  321 scans / 247 patients   (UCSF-PDGM, BraTS-GLI, UPENN-GBM,
+#                                       IvyGAP, LUMIERE, REMBRANDT)
+#   Ring B  406 scans / 406 patients   (BraTS-Africa-Glioma, BraTS-Africa-Other,
+#                                       BraTS-PED)
+#   TOTAL   727 scans / 653 patients
+#
+# Cost, measured from the 2026-07-16 smoke (job 1599757: 8 cores, TotalCPU
+# 03:47:50 for 635 volumes = 21.5 CPU-s/volume):
+#   45 pairs x 727 scans = 32,715 volumes ~= 195 CPU-hours of total work.
+#   Sharded one array task per prediction file (405 tasks x 8 cores), the
+#   largest single task is BraTS-PED at 260 scans ~= 21 min — well inside the
+#   worker's 1 h --time.
+#
+# CPU-only by design: §4.2/§4.5/§4.7 need no GPU, so this bypasses the
+# gres/gpu=32 group cap that stalls GPU work.  Do not add --gres.
+#
+# The stale smoke_loginexa shard on Picasso is skipped by contract: discovery
+# reads each shard's decision.json and drops smoke.enabled==true.  Never filter
+# shards by name — the BraTS-PED backfill writes picasso_ped_* tags and is
+# production.
+
+data_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/paired_fidelity_sweep/analyses
+
+# --- Sharding filters: EMPTY = the whole grid.  This is what makes it a sweep.
+filter_methods: []
+filter_cohorts: []
+filter_nfe: []
+filter_rings: [A, B]
+
+# --- Region parameters
+dilate_k: 5              # WT dilation kernel for the bg_undilated complement
+
+# --- SSIM parameters (must match across all runs — a change = rerun everything)
+ssim_window_size: 7
+ssim_window_sigma: 1.5
+
+# --- MS-SSIM parameters
+# 4-weight Wang (2003) schedule, matched to monai.metrics.regression.compute_ms_ssim.
+# SHARED_CONTRACTS §8: pass weights explicitly; MONAI's default is the 5-weight set.
+ms_ssim_weights: [0.0448, 0.2856, 0.3001, 0.3633]
+ms_ssim_bbox_margin: 8   # extra voxels added to the WT bbox before the MS-SSIM crop
+
+# --- Statistics (applied ONCE, globally, in the merge step — never per shard,
+#     which would break the LUMIERE scan->patient collapse and the family-of-8
+#     Holm correction).
+n_bootstrap: 10000
+bootstrap_seed: 1337
+
+# --- Compute device for the SSIM convolutions
+device: cpu
