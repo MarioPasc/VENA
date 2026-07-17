@@ -6,24 +6,34 @@ divergence and keeps individual test files short.
 
 Fixture overview
 ----------------
-``synth_shard`` (session-scoped, ``tmp_path_factory``)
-    A minimal schema-2.0 shard on disk with:
+``synth_shard`` (session-scoped)
+    The shard root directory — one production shard with three cohorts:
 
-    - One prediction file per method × cohort pair.
-    - One reference file per cohort.
-    - A longitudinal cohort (``"LUMIERE-like"``) with 3 patients / 5 scans
-      to exercise :func:`~vena.validation.stats.collapse_to_patient`.
-    - Reference rows in **reversed** scan order so tests cannot pass an
-      index-join by accident (SHARED_CONTRACTS §11 join-trap).
-    - ``references_h5`` attr on every prediction file pointing at the correct
-      reference (relative to shard root).
+    - ``TestCohortA`` (Ring A, 3 scans / 3 patients).
+    - ``LUMIERE-like`` (Ring A, 5 scans / 3 patients — longitudinal, more
+      scans than patients to exercise :func:`~vena.validation.stats.collapse_to_patient`).
+    - ``TestCohortB`` (Ring B, 2 scans / 2 patients).
+
+    Two methods (``VENA-S1-v3b-rw``, ``C0-Identity``), one NFE (5).
+
+    Reference rows are written in **reversed** scan order so no test can pass
+    by row-index join accidentally (SHARED_CONTRACTS §11).
+
+    The shard lives inside ``synth_shard.parent`` (= ``synth_inference_root``),
+    which contains a ``decision.json`` with no ``smoke`` key (production).
+
+``synth_inference_root``
+    Parent of ``synth_shard`` — the root to pass to
+    :func:`~vena.validation.io.discover_shards` and
+    :func:`~vena.validation.io.build_index`.
 
 ``pred_path`` / ``ref_path`` (function-scoped)
-    Convenience paths derived from ``synth_shard`` for single-file tests.
+    Convenience paths into ``synth_shard`` for single-file tests.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import h5py
@@ -129,15 +139,10 @@ def _write_ref_h5(
 
 
 # ---------------------------------------------------------------------------
-# Shard layout
+# Cohort definitions
 # ---------------------------------------------------------------------------
 
-#: Methods written into the synthetic shard.
-_METHODS = ["VENA-S1-v3b-rw", "C0-Identity"]
-
-#: (cohort, ring, scan_ids, patient_ids) tuples.
-#: LUMIERE-like has 3 patients × repeated scans (longitudinal); deliberately
-#: more scans than patients to exercise collapse_to_patient.
+#: (cohort, ring, scan_ids, patient_ids)
 _COHORTS: list[tuple[str, str, list[str], list[str]]] = [
     (
         "TestCohortA",
@@ -146,9 +151,10 @@ _COHORTS: list[tuple[str, str, list[str], list[str]]] = [
         ["ptA1", "ptA2", "ptA3"],
     ),
     (
+        # 3 patients, 5 scans: pt1 → 2, pt2 → 2, pt3 → 1.
+        # Exercises collapse_to_patient (more scans than patients).
         "LUMIERE-like",
         "A",
-        # 3 patients, 5 scans: pt1 has 2 scans, pt2 has 2, pt3 has 1.
         ["lum_s1", "lum_s2", "lum_s3", "lum_s4", "lum_s5"],
         ["lum_pt1", "lum_pt1", "lum_pt2", "lum_pt2", "lum_pt3"],
     ),
@@ -160,58 +166,89 @@ _COHORTS: list[tuple[str, str, list[str], list[str]]] = [
     ),
 ]
 
+_METHODS = ["VENA-S1-v3b-rw", "C0-Identity"]
+_NFE = 5
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped shard fixture
+# ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="session")
 def synth_shard(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Session-scoped synthetic shard on disk.
+    """Session-scoped production shard on disk.
 
-    Returns the shard root path.  Every test that reads predictions or
-    references should derive paths from here rather than building their own
-    fixtures.
+    Returns the **shard root**.  The **inference root** is
+    ``synth_shard.parent`` — use the ``synth_inference_root`` fixture or
+    ``synth_shard.parent`` directly when calling ``discover_shards`` /
+    ``build_index``.
 
     Layout::
 
-        <shard>/
-        ├── predictions/<METHOD>/<COHORT>/nfe_5.h5
-        └── references/<COHORT>.h5
+        <inference_root>/           ← synth_shard.parent
+          test_prod_shard/          ← synth_shard (returned value)
+            decision.json           ← production (no smoke key)
+            predictions/<M>/<C>/nfe_005.h5
+            references/<C>.h5
 
-    Reference rows are written in **reversed** scan order to catch index-join
-    bugs (SHARED_CONTRACTS §11).
+    Reference rows are in reversed scan order (join-trap guard).
     """
-    root = tmp_path_factory.mktemp("shard")
+    inference_root = tmp_path_factory.mktemp("inference")
+    shard_root = inference_root / "test_prod_shard"
+    shard_root.mkdir()
+
+    # No "smoke" key → treated as production by discover_shards.
+    (shard_root / "decision.json").write_text(
+        json.dumps({"schema_version": "1.0", "run_id_tag": "test_prod_shard"})
+    )
 
     for cohort, ring, scan_ids, patient_ids in _COHORTS:
-        ref_dir = root / "references"
+        ref_dir = shard_root / "references"
         ref_dir.mkdir(parents=True, exist_ok=True)
-        # Deliberately reversed reference order.
+        # Deliberately reversed reference order to catch index-join bugs.
         _write_ref_h5(
             ref_dir / f"{cohort}.h5",
             list(reversed(scan_ids)),
             list(reversed(patient_ids)),
             cohort=cohort,
         )
-
         for method in _METHODS:
-            pred_dir = root / "predictions" / method / cohort
+            pred_dir = shard_root / "predictions" / method / cohort
             pred_dir.mkdir(parents=True, exist_ok=True)
             _write_pred_h5(
-                pred_dir / "nfe_005.h5",
+                pred_dir / f"nfe_00{_NFE}.h5",
                 scan_ids,
                 patient_ids,
                 method=method,
                 cohort=cohort,
-                nfe=5,
+                nfe=_NFE,
                 ring=ring,
                 references_h5=f"references/{cohort}.h5",
             )
 
-    return root
+    return shard_root
+
+
+@pytest.fixture(scope="session")
+def synth_inference_root(synth_shard: Path) -> Path:
+    """Inference root containing the synthetic shard.
+
+    Pass to :func:`~vena.validation.io.discover_shards` and
+    :func:`~vena.validation.io.build_index`.
+    """
+    return synth_shard.parent
+
+
+# ---------------------------------------------------------------------------
+# Convenience single-file fixtures (function-scoped)
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture()
 def pred_path(synth_shard: Path) -> Path:
-    """Path to a single prediction file (VENA-S1-v3b-rw / TestCohortA / nfe_005)."""
-    return synth_shard / "predictions" / "VENA-S1-v3b-rw" / "TestCohortA" / "nfe_005.h5"
+    """Path to VENA-S1-v3b-rw / TestCohortA / nfe_005 prediction file."""
+    return synth_shard / "predictions" / "VENA-S1-v3b-rw" / "TestCohortA" / f"nfe_00{_NFE}.h5"
 
 
 @pytest.fixture()

@@ -256,17 +256,23 @@ def test_iter_scans_missing_reference_warns_not_crash(
 
 
 def test_build_index_discovers_files(tmp_path: Path) -> None:
-    """build_index returns one row per nfe_*.h5 file discovered."""
+    """build_index returns one row per nfe_*.h5 file in production shards."""
+    import json
+
     from vena.validation.io import build_index
 
+    # tmp_path = inference root; shard = one production shard inside it.
     shard = tmp_path / "shard"
+    shard.mkdir()
+    # decision.json without "smoke" key → production shard.
+    (shard / "decision.json").write_text(json.dumps({"schema_version": "1.0"}))
+
     for method in ("VENA-test", "C0-Identity"):
         for cohort in ("CohortA", "CohortB"):
             d = shard / "predictions" / method / cohort
             d.mkdir(parents=True)
             ref_dir = shard / "references"
             ref_dir.mkdir(parents=True, exist_ok=True)
-            # Write a tiny valid H5.
             _make_pred_h5(
                 d / "nfe_1.h5",
                 ["scan1"],
@@ -303,3 +309,209 @@ def test_iter_scans_scan_ids_filter(tmp_path: Path) -> None:
     samples = list(iter_scans(pred_path, reference_cache=cache, scan_ids=["B"]))
     assert len(samples) == 1
     assert samples[0].scan_id == "B"
+
+
+# ---------------------------------------------------------------------------
+# Smoke-shard filtering tests
+# ---------------------------------------------------------------------------
+
+
+def test_discover_shards_excludes_smoke(tmp_path: Path) -> None:
+    """discover_shards skips shards where smoke.enabled is true.
+
+    Reproduces the Picasso smoke_loginexa scenario: an inference root with
+    one production shard and one smoke shard.  Only the production shard
+    must appear in ShardDiscovery.accepted.
+    """
+    import json
+
+    from vena.validation.io import discover_shards
+
+    # Production shard — no smoke key.
+    prod = tmp_path / "picasso_shard_a_cheap"
+    prod.mkdir()
+    (prod / "decision.json").write_text(
+        json.dumps({"schema_version": "1.0", "run_id_tag": "picasso_shard_a_cheap"})
+    )
+
+    # Smoke shard — smoke.enabled: true.
+    smoke = tmp_path / "smoke_loginexa"
+    smoke.mkdir()
+    (smoke / "decision.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "run_id_tag": "smoke_loginexa",
+                "smoke": {"enabled": True, "n_patients_per_cohort": 1},
+            }
+        )
+    )
+
+    discovery = discover_shards(tmp_path)
+
+    assert len(discovery.accepted) == 1
+    assert discovery.accepted[0].root == prod
+    assert len(discovery.skipped_smoke) == 1
+    assert "smoke_loginexa" in discovery.skipped_smoke
+
+
+def test_discover_shards_missing_smoke_key_is_production(tmp_path: Path) -> None:
+    """A shard with no 'smoke' key in decision.json is treated as production.
+
+    Fail-open: older shards and BraTS-PED backfill shards without the
+    smoke-flag convention must not be accidentally excluded.
+    """
+    import json
+
+    from vena.validation.io import discover_shards
+
+    shard = tmp_path / "picasso_ped_a"
+    shard.mkdir()
+    # decision.json has no "smoke" key at all.
+    (shard / "decision.json").write_text(
+        json.dumps({"schema_version": "1.0", "run_id_tag": "picasso_ped_a"})
+    )
+
+    discovery = discover_shards(tmp_path)
+
+    assert len(discovery.accepted) == 1
+    assert discovery.accepted[0].root == shard
+    assert len(discovery.skipped_smoke) == 0
+
+
+def test_build_index_raises_on_duplicate_scan_id_across_shards(tmp_path: Path) -> None:
+    """build_index raises ValueError when the same (method, cohort, nfe, scan_id)
+    appears in two production shards.
+
+    This catches the Picasso bug where a smoke shard that survived filtering
+    (or an unexpected duplicate production shard) would silently score the
+    same patient twice.
+    """
+    import json
+
+    from vena.validation.io import build_index
+
+    for shard_name in ("shard_alpha", "shard_beta"):
+        shard = tmp_path / shard_name
+        shard.mkdir()
+        (shard / "decision.json").write_text(
+            json.dumps({"schema_version": "1.0", "run_id_tag": shard_name})
+        )
+        pred_dir = shard / "predictions" / "VENA-test" / "TestCohort"
+        pred_dir.mkdir(parents=True)
+        ref_dir = shard / "references"
+        ref_dir.mkdir()
+        # Both shards contain the SAME scan_id ("dup_scan").
+        _make_pred_h5(
+            pred_dir / "nfe_5.h5",
+            ["dup_scan"],
+            ["pt1"],
+            method="VENA-test",
+            cohort="TestCohort",
+            nfe=5,
+            references_h5="references/TestCohort.h5",
+        )
+        _make_ref_h5(ref_dir / "TestCohort.h5", ["dup_scan"], ["pt1"], cohort="TestCohort")
+
+    with pytest.raises(ValueError, match=r"Duplicate.*method.*cohort.*nfe.*scan_id"):
+        build_index(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# select_scoring_volume tests
+# ---------------------------------------------------------------------------
+
+
+def test_select_scoring_volume_already_normalised() -> None:
+    """Volume with p99.5 ≈ 0.8 (inside [0,1]) returns mode='raw'."""
+    from vena.validation.io import select_scoring_volume
+
+    rng = np.random.default_rng(0)
+    brain = np.ones((10, 10, 10), dtype=bool)
+    raw = rng.uniform(0.0, 0.8, (10, 10, 10)).astype(np.float32)
+    harmonised = rng.uniform(0.0, 1.0, (10, 10, 10)).astype(np.float32)
+
+    vol, mode = select_scoring_volume(raw, harmonised, brain)
+
+    assert mode == "raw"
+    assert vol is raw
+
+
+def test_select_scoring_volume_scanner_units() -> None:
+    """Volume with p99.5 ≈ 2000 (scanner units, e.g. C0-Identity) returns mode='harmonised'."""
+    from vena.validation.io import select_scoring_volume
+
+    brain = np.ones((10, 10, 10), dtype=bool)
+    raw = np.full((10, 10, 10), 2000.0, dtype=np.float32)
+    harmonised = np.random.default_rng(1).uniform(0.0, 1.0, (10, 10, 10)).astype(np.float32)
+
+    vol, mode = select_scoring_volume(raw, harmonised, brain)
+
+    assert mode == "harmonised"
+    assert vol is harmonised
+
+
+def test_select_scoring_volume_boundary_at_threshold() -> None:
+    """Values on both sides of SCORING_P995_MAX verify the ≤ boundary.
+
+    The threshold is inclusive (≤, not <).  p99.5 = 1.04 passes; 1.06 fails.
+    """
+    from vena.validation.io import SCORING_P995_MAX, select_scoring_volume
+
+    brain = np.ones((10, 10, 10), dtype=bool)
+    harmonised = np.zeros((10, 10, 10), dtype=np.float32)
+
+    # Below threshold (1.04 < 1.05) → "raw"
+    raw_below = np.full((10, 10, 10), 1.04, dtype=np.float32)
+    _, mode_below = select_scoring_volume(raw_below, harmonised, brain)
+    assert mode_below == "raw", f"p99.5 ≈ 1.04 should be 'raw' (threshold={SCORING_P995_MAX})"
+
+    # Above threshold (1.06 > 1.05) → "harmonised"
+    raw_above = np.full((10, 10, 10), 1.06, dtype=np.float32)
+    _, mode_above = select_scoring_volume(raw_above, harmonised, brain)
+    assert mode_above == "harmonised", (
+        f"p99.5 ≈ 1.06 should be 'harmonised' (threshold={SCORING_P995_MAX})"
+    )
+
+
+def test_select_scoring_volume_negative_valued() -> None:
+    """Volume with min < SCORING_MIN_FLOOR returns mode='harmonised'.
+
+    Even if p99.5 is fine, a negative minimum means the raw volume is not
+    in the normalised [0, 1] space and must be harmonised.
+    """
+    from vena.validation.io import SCORING_MIN_FLOOR, select_scoring_volume
+
+    brain = np.ones((10, 10, 10), dtype=bool)
+    raw = np.full((10, 10, 10), -0.1, dtype=np.float32)  # min = -0.1 < -0.05
+    harmonised = np.zeros((10, 10, 10), dtype=np.float32)
+
+    _, mode = select_scoring_volume(raw, harmonised, brain)
+
+    assert mode == "harmonised", (
+        f"min = -0.1 is below SCORING_MIN_FLOOR={SCORING_MIN_FLOOR}; must return 'harmonised'"
+    )
+
+
+def test_iter_scans_surfaces_pred_mode_and_raw_p995(pred_path: Path) -> None:
+    """iter_scans yields ScanSample with pred_mode and raw_p995 populated.
+
+    Synthetic data is in [0, 1] so pred_mode must be 'raw' and raw_p995
+    must be in (0, 1].  Both pred_raw and pred_harmonised must be present.
+    """
+    from vena.validation.io import ReferenceCache, iter_scans
+
+    cache = ReferenceCache()
+    samples = list(iter_scans(pred_path, reference_cache=cache))
+
+    assert len(samples) > 0
+    for s in samples:
+        assert s.pred_mode in ("raw", "harmonised"), f"Unexpected pred_mode={s.pred_mode!r}"
+        assert np.isfinite(s.raw_p995), f"raw_p995 should be finite; got {s.raw_p995}"
+        assert s.raw_p995 >= 0.0, f"raw_p995 should be non-negative; got {s.raw_p995}"
+        assert s.pred is not None
+        assert s.pred_raw is not None
+        assert s.pred_harmonised is not None
+        # Synthetic fixtures are in [0, 1] → pred should alias pred_raw.
+        assert s.pred_mode == "raw", "Synthetic volumes in [0,1] should select 'raw' mode"
+        assert np.array_equal(s.pred, s.pred_raw)

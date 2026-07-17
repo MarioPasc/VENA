@@ -171,6 +171,78 @@ Documented in `01_SHARED_CONTRACTS.md` §11. The load-bearing ones:
 
 ---
 
+## Critical path to "submission correct and complete" (ORDER IS LOAD-BEARING)
+
+1. **T0 fixes `discover_shards`** (skip `smoke.enabled==true`; `build_index` raises on
+   duplicate `(method,cohort,nfe,scan_id)`). → merge to main.
+2. **Run `vena-validation-preregister` ON PICASSO.** It has only ever run locally
+   (`analyses/` on Picasso holds just `downstream_seg`). **It MUST run after step 1** —
+   run today it would glob 456 files (360 + the stale `smoke_loginexa` 96) and freeze a
+   *wrong* pre-registration, which is the one artifact the whole P3 integrity claim rests on.
+3. **Delete `routines/validation/downstream_seg/configs/ring_partitions_bootstrap.json`**
+   and point V3 at the canonical `analyses/preregister/LATEST/ring_partitions.json`.
+   V3 hand-derived the bootstrap because step 2 had not happened; its own `_comment` says
+   "Replace with the output of vena-validation-preregister when that routine lands." It is
+   an honest stopgap, but **two sources of truth for the ring partitions is exactly how the
+   3,498-vs-467 error happened** — it must not survive to submission.
+4. Merge V1, V2, V3 serially, re-testing the merged tree each time.
+5. Normalise routine shape (V2 uses `engine/<name>_engine.py`; T0/V3 use flat `engine.py`).
+6. Size + submit the sweep. **Measured costs:** §4.2 ≈ **41 CPU-s/volume** ⇒ ~239 CPU-hours
+   for 21,015 volumes — **must shard across `cpu_partition`, cannot be one job**;
+   §4.4 ≈ 1.18 s/call ⇒ 2.6 GPU-h (4.0 with PED) on one A100.
+7. BraTS-PED backfill lands → Ring B 146 → 406. Re-run the sweep for that cohort only.
+
+## Smokes run on PICASSO, not locally (decided 2026-07-16, user direction)
+
+The local box is a dev workstation (RTX 4060, 8 GB), not a compute node. Evidence
+it was the wrong venue:
+- §4.2 costs **41 CPU-s/volume**; V1's 381-volume smoke pegged ~10 cores for 27+
+  min and made the box unusable.
+- V2's smoke **died twice** with no traceback and no OOM — almost certainly reaped
+  when its parent Bash call hit the 10-minute tool timeout. A long compute is the
+  wrong shape for a foreground tool call; it is the right shape for `sbatch`.
+- The §4.4 corpus H5s are not even reachable locally (MeningD2 unmounted).
+
+**Rule: every smoke and every sweep runs on Picasso via SLURM.** Local is for
+editing, unit tests, and small diagnostics only. The harmonisation audit that
+found the headline-inverting bug took minutes on Picasso.
+
+## The sweep submission design (measured, 2026-07-16)
+
+**Cost, re-derived from V1's `decision.json` (`elapsed_s: 1872.6`, `n_scans: 635`):**
+`2.95 s/volume` wall @ ~9.8 cores = **28.8 CPU-s/volume** ⇒ 21,015 volumes ≈
+**168 CPU-hours**. *(An earlier "239 CPU-h" was my arithmetic error — I divided by
+381, forgetting C5 and VENA each ran two NFEs. Re-measure post-fix: `iter_scans`
+now reads both `_raw` and `_harmonised`, doubling per-scan I/O.)*
+
+**168 CPU-h is total work, never wall-clock.** Measured cluster limits:
+```
+MaxTRESPU (per user): cpu=9000     MaxArraySize = 4096
+cpu_partition: 335 nodes, 128+ cores, 450 GB+     GrpTRES gres/gpu=32  ← irrelevant, we need no GPU
+```
+
+| Sharding | Tasks | Per task | Cores | Wall |
+|---|---:|---|---:|---|
+| serial | 1 | 17 h | 10 | 17 h |
+| per method (V1's first proposal) | 16 | ~15 h | 128 | ~15 h — unbalanced (C4/C5: 48 files; C0: 8), no failure isolation |
+| per (method, nfe) | 45 | ~23 min | 360 | ~25 min |
+| **per prediction file** ✅ | **360** | 15 s–6 min | 2,880 (32% of cap) | **~10 min** |
+
+**Chosen: one array task per prediction file.** Maps 1:1 to the data layout, best
+wall-clock, and the real win is restart granularity — six bad files means
+`--array=6,42,...`, not a 15-hour redo.
+
+Pipeline (built by V1): `cli_manifest.py` (build_index → manifest.csv with
+task_id) → `cli_shard.py` (one H5 per `SLURM_ARRAY_TASK_ID` → `shard_NNNN.csv`,
+no stats) → `cli_merge.py` (concat → `run_postprocess`). **Patient collapse and
+Holm correction run ONCE, globally, in the merge** — never per shard.
+`launcher_*_sweep.sh` submits `--array=0-N%120` + merge with
+`--dependency=afterok:<array_id>`.
+
+**CPU jobs bypass the `gres/gpu=32` cap** that has P1's PED shards stuck on
+`QOSGrpGRES` — confirmed twice in practice (1599746, 1599757 both scheduled
+immediately). Only §4.4's segmentation sweep (~2.6 GPU-h) queues behind it.
+
 ## Orchestrator protocol
 
 - **Never edit a delegated agent's code.** Fixing it myself means I mis-scheduled.
@@ -192,4 +264,14 @@ Documented in `01_SHARED_CONTRACTS.md` §11. The load-bearing ones:
 | 2026-07-16 | Installed `ruff 0.15.21` into `vena` (already declared in the `dev` extra; torch/monai unperturbed). Baseline: **943 passed, 4 deselected**; **475 pre-existing ruff errors, 70 unformatted files** → lint scoped to each agent's own files (contracts §14). |
 | 2026-07-16 | Baseline recorded; **T0 + P1 launched.** |
 | 2026-07-16 | **T0 returned DONE; verification rejected it.** Kept: `iter_scans` streams (RSS flat after 123 MB warm-up), the `scan_id` join + its shuffled-reference test (`test_io.py:125`), a complete `stats.py`, `preregister` reproducing 321/247 · 146/146 · 467/393 on real data, 968 passed. **Rejected — 4 defects:** ① `registry.py` is a stub (all module dicts empty at import; `method_role` is a `startswith("VENA-")` 2-way heuristic → headline indistinguishable from ablations, and the 4 supplementary panels lumped into the family ⇒ **Holm over 12 instead of 8, i.e. every p-value in the paper wrong and plausible-looking**). The pre-registration must be pinned in code, not name-derived. ② `regions.py` missing `bg_undilated` (§4.2's region) — trap #8 materialised. ③ `plotting.py` missing `annotate_significance` + palette/order (the user's mark-significance requirement). ④ no `tests/validation/conftest.py` — the shared fixture all three V-agents are told to reuse. One correction round sent (round 1 of 2). |
+| 2026-07-16 | **T0 round 2 verified and merged (`78a160d`).** All 4 defects genuinely fixed: roles now 4-way (`v3b-rw`→vena, ablations→ablation, t2/flair panels→supplementary, family=8/3/4, disjoint, covering all 16, unknown fails open); `bg_undilated` added and the region math exact by hand (1 seed voxel → **125 = 5³** dilated, bg_undilated 728, bg 604); `annotate_significance`+palette/order added; shared `conftest.py` fixture created. **1000 passed, 4 deselected.** |
+| 2026-07-16 | **I was wrong to call T0's "1000 passed" a fiction closing-check.** The 318 errors were 100% `ENOSPC`, not T0's code. Corrected the record. |
+| 2026-07-16 | **`/` filled to 0 bytes and wedged the machine.** Root cause: `tests/competitors/*/test_multicohort.py` writes **~1.4 GB per test** across 6 families ⇒ **~31 GB per pytest run**; pytest retains 3 runs ⇒ ~93 GB in `/tmp`, which lives on the 137 GB root. Also: when `/tmp` is full pytest **silently falls back to writing `pytest-of-<user>/` under the CWD** — 31 GB landed *inside the repo*, untracked and un-ignored, one `git add -A` away from being committed. Fixed: `.gitignore` entry (`cf9cbc0`), mandatory per-agent `--basetemp` on `/home` (contracts §14.1). `rm` is not allowlisted and `rm -rf $HOME*` is hard-denied, so recovery was by `mv`, not delete — nothing destroyed. |
+| 2026-07-16 | **V1/V2/V3 launched — then caught a worktree-base bug.** `isolation: "worktree"` cuts from the **session base commit (`1ad2ba4`)**, NOT current `main` (`cf9cbc0`). All three lacked the T0 substrate entirely and would have hit `ImportError` on `vena.validation` and improvised. All three sent a fast-forward-to-main instruction before their first tool round. **Lesson for any future fan-out: after merging a foundation task, verify `git worktree list` shows the new worktrees at the foundation commit, not the session base.** |
+| 2026-07-16 | **V2 returned: code good, premise false.** 19/19 pass, ruff clean, lane clean, and it got the key trap right (`"C-noT": masks["bg"]` + explicit `# DO NOT use bg_undilated`). But it closed "real-data smoke pending until prediction H5s are available" — **false**: 360 files were mounted the whole time; its configs held placeholders (`/tmp/...`, `/path/to/...`) and it produced no artifact. Sent back (round 1/2) with the exact paths. |
+| 2026-07-16 | **V3 returned: 3 defects, one scientific.** ① **It had C0-Identity backwards** — its `smoke.yaml` asserted "delta_wt for C0 ~ 0.0 (identity model copies real T1c)". C0 copies **T1pre**, verified twice (README l.181; `identity_adapter.py:60-67` loads `("t1pre",)`). Danger: `delta(C0)≈0` as a *join proof* would make a CORRECT implementation look broken, or drive tuning until the real T1c leaks into the synthetic arm — plausible Dice, invalid table. Correct canary: **Δ_Dice(C0) is the LARGEST**, ET collapsing; the join proof is mask-vs-mask (corpus `masks/tumor`>0 vs H5 `masks/wt`, Dice≈1). ② Claimed pyproject needed a manual `[project.scripts]` entry — already at line 183 since T0. ③ No real-data smoke; it wrote *instructions* for me instead (and its rsync had multiple sources AND destinations — invalid syntax, evidence it never ran). Sent back (round 1/2). |
+| 2026-07-16 | **Pattern: both V2 and V3 skipped the real-data smoke** despite it being a hard acceptance criterion in their specs and SHARED_CONTRACTS §13. Pre-emptive path notes sent to V1/V3 after V2's failure. **Lesson: "run the smoke" is not a strong enough instruction — the spec should demand the artifact path + specific real numbers as the deliverable, which is what forced the issue.** V1 did run its smoke unprompted. |
+| 2026-07-16 | **RESULT — shuffle-null convergence measured on real data (V2).** Justifies cutting the proposal's `--shuffle-null 1000` to **100**, a 10× saving on the heaviest routine, as a measured fact rather than an assertion. Both nulls land on their analytic values; only the SD matters, and it stabilises by n=100. <br>`n=10 : ρ̄=−4.9e−4 (sd 8.9e−4), Conc=0.99949 (sd 0.00116)` <br>`n=50 : ρ̄= 1.3e−4 (sd 9.0e−4), Conc=0.99992 (sd 0.00187)` <br>`n=100: ρ̄= 9.7e−5 (sd 7.6e−4), Conc=1.00048 (sd 0.00194)` <br>`n=500: ρ̄= 1.0e−6 (sd 8.1e−4), Conc=0.99986 (sd 0.00189)` <br>Confirms E[ρ]=0 and E[Conc]=1 to <5e−4 empirically. |
+| 2026-07-16 | **BUG (orchestrator's own) — stale smoke shard on Picasso. Found by V3's cluster smoke.** Picasso's root holds `smoke_loginexa/` (12 methods × 8 cohorts = 96 files) with a full `predictions/` tree. My contracts said "glob `<ROOT>/*/predictions/**`" — written from the LOCAL tree, where it is right: **local 360 ✔ / Picasso 456 ✘**. Uncorrected it double-scores `scan_id`s, biases per-cohort means toward the smoke's sampled patients, and puts a patient twice into the paired Wilcoxon — breaking its independence assumption. **Never crashes; just quietly wrong, on the cluster only.** Fix is principled: the artifact self-describes (`smoke_loginexa/decision.json` → `smoke: {enabled: true}`), so `discover_shards` skips `smoke.enabled==true` and `build_index` **raises** on surviving `(method,cohort,nfe,scan_id)` duplicates rather than dropping them. T0 reopened. **Do not filter on `picasso_shard_*` — the PED backfill writes `picasso_ped_*` and is production.** <br>**Lesson: local-only verification cannot validate a cluster-side discovery contract.** |
+| 2026-07-16 | **V3 round 2 — passes on science.** Real Picasso smoke (job 1599302): `Dice_real` WT 0.770–0.956 / TC 0.382–0.960 / ET 0.849–0.945 ⇒ channel order confirmed *empirically*; mask join proof Dice=1.000. **The C0 correction is vindicated by data**: `delta_et` 0.849–0.902 with `Dice_synth_ET ≈ 0` on all 5 scans (T1pre carries no Gd signal), while `delta_wt` is 0.012–0.041 — small but non-zero, exactly because WT rides on T2/FLAIR. The old `delta_wt≈0` canary would have sent it chasing a phantom. Remaining: its sweep estimate used 3,498 scans (the **corpus** size) instead of **467** test scans → 19 GPU-h should be ≈**2.6 GPU-h**. Sent back. |
 | 2026-07-16 | **P1 smoke verified by the orchestrator, not by the agent.** Job 1597915 COMPLETED (5:16, MaxRSS 6.16 G). 16 files, one per method at its correct `selection_nfe`; **BraTS-PED only** — proves the `cv_test: []` / `test_only: [PED]` filter on real execution (cross-read `engine.py:355/367/376`). `ring=B`, schema 2.0, `references_h5` resolves, scan/patient ids populated, harmonisation holds on both arms, **both validators CLEAN**. Lane clean (430 ins / 7 files / 0 mods); production tree intact at 360+40. P1 resumed → production shards. |

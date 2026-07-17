@@ -1,0 +1,35 @@
+# Paired-fidelity routine — full benchmark sweep
+# §4.2 voxel-wise fidelity + §4.5 inference cost + §4.7 ZGD
+#
+# Point data_root at the inference tree root (contains
+# <shard>/predictions/<METHOD>/<COHORT>/nfe_*.h5).
+# Point output_root at the analysis output directory.
+
+data_root: /media/mpascual/MeningD2/GLIOMA/vena_inference
+output_root: /media/mpascual/MeningD2/GLIOMA/vena_inference/analyses
+
+# Region parameters
+dilate_k: 5              # WT dilation kernel for bg_undilated complement
+
+# SSIM parameters (must match across all runs — change = rerun everything)
+ssim_window_size: 7
+ssim_window_sigma: 1.5
+
+# MS-SSIM parameters
+# 4-weight Wang (2003) schedule — matched to monai.metrics.regression.compute_ms_ssim
+# SHARED_CONTRACTS §11: pass weights explicitly; MONAI default is 5-weight
+ms_ssim_weights: [0.0448, 0.2856, 0.3001, 0.3633]
+ms_ssim_bbox_margin: 8   # extra voxels added to WT bbox before MS-SSIM crop
+
+# Statistics
+n_bootstrap: 10000
+bootstrap_seed: 1337
+
+# Compute device for SSIM convolutions (cpu is fine for 3D volumes ≤ 240^3)
+device: cpu
+
+# Sharding filters — leave empty to process all methods/cohorts/NFEs
+filter_methods: []
+filter_cohorts: []
+filter_nfe: []
+filter_rings: [A, B]

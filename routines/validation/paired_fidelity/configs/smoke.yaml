@@ -1,0 +1,34 @@
+# Paired-fidelity smoke run — §13 SHARED_CONTRACTS subset
+# UCSF-PDGM 50 scans + LUMIERE 72 scans (→ 11 patients) + IvyGAP 5 scans
+# Methods: VENA-S1-v3b-rw, C0-Identity, C5-T1C-RFlow at selection_nfe
+
+data_root: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference
+output_root: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference/analyses
+
+dilate_k: 5
+ssim_window_size: 7
+ssim_window_sigma: 1.5
+ms_ssim_weights: [0.0448, 0.2856, 0.3001, 0.3633]
+ms_ssim_bbox_margin: 8
+
+# Fewer bootstrap replicates for speed — acceptable in smoke
+n_bootstrap: 1000
+bootstrap_seed: 1337
+
+device: cpu
+
+# Smoke subset: 3 methods × selection NFE × 3 cohorts
+filter_methods:
+  - VENA-S1-v3b-rw
+  - C0-Identity
+  - C5-T1C-RFlow
+
+filter_cohorts:
+  - UCSF-PDGM
+  - LUMIERE
+  - IvyGAP
+
+# Selection NFEs: VENA=5, C0=1, C5=5
+filter_nfe: [1, 5]
+
+filter_rings: [A, B]

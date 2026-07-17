@@ -1,0 +1,36 @@
+# Smoke config for paired_fidelity on Picasso (cpu_partition).
+#
+# Subset: 3 methods × 3 cohorts at selection NFE only.
+#   VENA-S1-v3b-rw (nfe=5): UCSF-PDGM ~50 scans + LUMIERE ~72 scans + IvyGAP ~5 scans
+#   C0-Identity    (nfe=1): same cohorts
+#   C5-T1C-RFlow   (nfe=5): same cohorts
+# Total: ~381 scan pairs.  Wall-clock ≈ 41 CPU-s/scan → ~4.3 CPU-h → ~33 min on 8 cores.
+#
+# LUMIERE must collapse to exactly 11 patients (72 longitudinal scans, 11 patients).
+
+data_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/paired_fidelity_smoke
+
+filter_methods:
+  - VENA-S1-v3b-rw
+  - C0-Identity
+  - C5-T1C-RFlow
+
+filter_cohorts:
+  - UCSF-PDGM
+  - LUMIERE
+  - IvyGAP
+
+filter_nfe: [1, 5]
+filter_rings: [A, B]
+
+# Metric parameters (defaults — override only if calibration changes)
+dilate_k: 5
+ssim_window_size: 7
+ssim_window_sigma: 1.5
+ms_ssim_weights: [0.0448, 0.2856, 0.3001, 0.3633]
+ms_ssim_bbox_margin: 8
+
+n_bootstrap: 1000
+bootstrap_seed: 1337
+device: cpu
