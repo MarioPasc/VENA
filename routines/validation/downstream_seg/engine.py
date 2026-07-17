@@ -46,6 +46,7 @@ from vena.validation.io import (
     ReferenceCache,  # runtime use: instantiated in Engine.run()
     _decode_str_arr,
     _resolve_references_h5,
+    select_scoring_volume,
 )
 from vena.validation.registry import SELECTION_NFE
 
@@ -179,10 +180,12 @@ def _discover_pred_files(
 def _read_pred_row(pred_path: Path, row_idx: int, *, ref_cache: ReferenceCache) -> dict[str, Any]:
     """Read one row from a prediction H5 at *row_idx*.
 
-    Returns dict with keys: scan_id, patient_id, t1c_synth, t1c_real.
-    T1pre / T2 / FLAIR are read separately from the corpus H5 via
-    :class:`vena.validation.downstream_seg.CorpusLabelCache`
-    (they are identical between real and synthetic arms).
+    Applies the commit-1c5d2c3 scoring-space fix: reads both
+    ``t1c_synthetic_raw`` and ``t1c_synthetic_harmonised`` from the prediction
+    H5, then calls :func:`~vena.validation.io.select_scoring_volume` to pick
+    the correct volume.  For 15 of 16 methods the raw volume is already in the
+    trained normalised space and must be scored as-is; only scanner-unit methods
+    (``C0-Identity``) sit outside ``[0, 1.05]`` and fall back to harmonised.
 
     Parameters
     ----------
@@ -197,15 +200,21 @@ def _read_pred_row(pred_path: Path, row_idx: int, *, ref_cache: ReferenceCache) 
     Returns
     -------
     dict
-        Keys: ``scan_id``, ``patient_id``, ``t1c_synth``, ``t1c_real``.
-        All volumes are ``(H, W, D)`` float32.
+        Keys: ``scan_id``, ``patient_id``, ``t1c_synth``, ``pred_mode``,
+        ``t1c_real``, ``t1pre``, ``t2``, ``flair``.
+        All volumes are ``(H, W, D)`` float32.  ``pred_mode`` is ``"raw"``
+        or ``"harmonised"`` per :func:`~vena.validation.io.select_scoring_volume`.
     """
     with h5py.File(pred_path, "r") as pf:
         scan_ids = _decode_str_arr(pf["metadata/scan_id"][:])
         patient_ids = _decode_str_arr(pf["metadata/patient_id"][:])
         scan_id = scan_ids[row_idx]
         patient_id = patient_ids[row_idx]
-        t1c_synth = pf["predictions/t1c_synthetic_harmonised"][row_idx]  # (H,W,D)
+        # Read both volumes; select_scoring_volume picks the correct one below.
+        harmonised_vol = np.asarray(
+            pf["predictions/t1c_synthetic_harmonised"][row_idx], dtype=np.float32
+        )
+        raw_vol = np.asarray(pf["predictions/t1c_synthetic_raw"][row_idx], dtype=np.float32)
 
         # _resolve_references_h5 must be called while pf is open (reads attrs)
         ref_h5 = _resolve_references_h5(pf, pred_path)
@@ -225,11 +234,16 @@ def _read_pred_row(pred_path: Path, row_idx: int, *, ref_cache: ReferenceCache) 
         t1pre = rf["reference/t1pre_harmonised"][ref_row]
         t2 = rf["reference/t2_harmonised"][ref_row]
         flair = rf["reference/flair_harmonised"][ref_row]
+        brain = np.asarray(rf["masks/brain"][ref_row], dtype=bool)
+
+    # commit 1c5d2c3: select the correct scoring volume per-scan.
+    t1c_synth, pred_mode = select_scoring_volume(raw_vol, harmonised_vol, brain)
 
     return {
         "scan_id": scan_id,
         "patient_id": patient_id,
-        "t1c_synth": t1c_synth.astype(np.float32),
+        "t1c_synth": t1c_synth,
+        "pred_mode": pred_mode,
         "t1c_real": t1c_real.astype(np.float32),
         "t1pre": t1pre.astype(np.float32),
         "t2": t2.astype(np.float32),
@@ -406,6 +420,8 @@ class DownstreamSegEngine:
                     gt_et,
                 )
 
+                pred_mode = data["pred_mode"]  # "raw" | "harmonised" — audit trail
+
                 result = SegResult(
                     method=method,
                     cohort=cohort,
@@ -428,6 +444,7 @@ class DownstreamSegEngine:
                         "nfe": result.nfe,
                         "scan_id": result.scan_id,
                         "patient_id": result.patient_id,
+                        "pred_mode": pred_mode,
                         "dice_wt_real": result.dice_wt_real,
                         "dice_tc_real": result.dice_tc_real,
                         "dice_et_real": result.dice_et_real,
@@ -462,6 +479,7 @@ class DownstreamSegEngine:
                 "nfe",
                 "scan_id",
                 "patient_id",
+                "pred_mode",
                 "dice_wt_real",
                 "dice_tc_real",
                 "dice_et_real",
@@ -513,6 +531,11 @@ class DownstreamSegEngine:
             "skipped_scans_n": len(skipped_no_scan),
             "wall_clock_s": round(wall_clock_s, 1),
             "empty_et_convention": "NaN when both pred and GT are empty (not 0)",
+            "scoring_space_fix": (
+                "commit 1c5d2c3 — select_scoring_volume picks raw for 15/16 methods, "
+                "harmonised only for scanner-unit methods (e.g. C0-Identity). "
+                "pred_mode column records the selection per row."
+            ),
             "appendix_a_deviation": (
                 "Used fixed pretrained BraTS segmenter instead of per-cohort "
                 "nnU-Net from scratch. Level confounder cancels in paired Δ; "

@@ -1,4 +1,4 @@
-# Downstream-seg SMOKE config — IvyGAP 34 scans x C0-Identity NFE=1.
+# Downstream-seg SMOKE config — IvyGAP 5 scans × {C0-Identity NFE=1, VENA-S1-v3b-rw NFE=5}.
 # Target: < 15 min on one A100.
 #
 # --- C0-Identity semantics (IMPORTANT) ---
@@ -43,8 +43,9 @@
 #   is the authoritative source; IvyGAP=5 was confirmed by the smoke itself.
 #
 # Paths from corpus_picasso.json (source of truth — dir names are lowercase).
-# ring_partitions_bootstrap.json is used until vena-validation-preregister lands;
-# it carries test-split n_scans per cohort (NOT full-corpus sizes).
+# ring_partitions.json is written by vena-validation-preregister
+# (routines/validation/preregister/configs/picasso.yaml).
+# Run that routine first; it freezes the authoritative scan/patient inventory.
 
 inference_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
 output_root:    /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference/analyses
@@ -54,11 +55,14 @@ bundle_path:    /mnt/home/users/tic_163_uma/mpascual/fscratch/bundles/brats_mri_
 corpus_map:
   IvyGAP: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/ivy_gap/h5/IvyGAP_image.h5
 
-ring_partitions_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA/routines/validation/downstream_seg/configs/ring_partitions_bootstrap.json
+ring_partitions_path: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference/analyses/preregister/LATEST/ring_partitions.json
 
 # C0-Identity SELECTION_NFE = 1 → engine discovers nfe_001.h5
+# VENA-S1-v3b-rw SELECTION_NFE = 5 → engine discovers nfe_005.h5
+# Both must run: C0 is the null floor; VENA-S1-v3b-rw proves pred_mode="raw" for non-C0.
 methods:
   - C0-Identity
+  - VENA-S1-v3b-rw
 
 cohorts:
   - IvyGAP

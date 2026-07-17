@@ -152,11 +152,30 @@ class TestReadPredRow:
         pred_path = synth_shard / "predictions" / "VENA-S1-v3b-rw" / "TestCohortA" / "nfe_005.h5"
         cache = ReferenceCache()
         data = _read_pred_row(pred_path, 1, ref_cache=cache)
-        for key in ("scan_id", "patient_id", "t1c_synth", "t1c_real", "t1pre", "t2", "flair"):
+        for key in (
+            "scan_id",
+            "patient_id",
+            "t1c_synth",
+            "pred_mode",
+            "t1c_real",
+            "t1pre",
+            "t2",
+            "flair",
+        ):
             assert key in data, f"missing key: {key}"
         for vol_key in ("t1c_synth", "t1c_real", "t1pre", "t2", "flair"):
             assert data[vol_key].shape == (_H, _W, _D)
             assert data[vol_key].dtype == np.float32
+
+    def test_pred_mode_is_raw_for_normalised_fixture(self, synth_shard: Path) -> None:
+        """Fixture data is rng.random() ∈ [0, 1) → select_scoring_volume returns 'raw'."""
+        pred_path = synth_shard / "predictions" / "VENA-S1-v3b-rw" / "TestCohortA" / "nfe_005.h5"
+        cache = ReferenceCache()
+        data = _read_pred_row(pred_path, 0, ref_cache=cache)
+        assert data["pred_mode"] == "raw", (
+            f"Expected pred_mode='raw' for [0,1) fixture data, got {data['pred_mode']!r}. "
+            "Check select_scoring_volume thresholds or conftest fixture."
+        )
 
     def test_missing_scan_id_raises_key_error(self, synth_shard: Path) -> None:
         """Accessing a row index beyond the file raises KeyError (not silent NaN)."""
@@ -305,6 +324,7 @@ class TestDownstreamSegEngine:
             "nfe",
             "scan_id",
             "patient_id",
+            "pred_mode",
             "dice_wt_real",
             "dice_tc_real",
             "dice_et_real",
@@ -346,6 +366,7 @@ class TestDownstreamSegEngine:
         assert "bundle_input_channel_order" in dec
         assert dec["bundle_input_channel_order"] == ["t1c", "t1", "t2", "flair"]
         assert "empty_et_convention" in dec
+        assert "scoring_space_fix" in dec
         assert "appendix_a_deviation" in dec
 
     def test_cohort_without_corpus_map_skipped(
