@@ -3,7 +3,10 @@
 Reads the prediction and reference H5 files already on disk to record:
   - which cohorts belong to Ring A (cv_test) and Ring B (test_only / OOD),
   - scan-level and patient-level counts per cohort and per ring,
-  - the set of methods inferred, and their available NFE levels.
+  - the set of methods inferred, and their available NFE levels,
+  - the pre-registered ``selection_nfe`` each method is scored at in the
+    headline table, mirrored from ``vena.validation.registry.SELECTION_NFE``
+    so the choice is legible in the frozen artifact itself.
 
 Cross-checks the scan lists against
 ``vena.inference.image_dataset.resolve_test_scan_patient_pairs`` when a
@@ -34,6 +37,7 @@ from vena.validation.io import (
     _resolve_references_h5,
     build_index,
 )
+from vena.validation.registry import SELECTION_NFE
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +196,35 @@ class PreregisterEngine:
             nfes = sorted(index[index["method"] == method]["nfe"].unique().tolist())
             nfes_by_method[method] = [int(n) for n in nfes]
 
+        # --- selection NFE (the pre-registered headline-table choice) ---
+        # Freeze the NFE each method is scored at INTO the artifact rather than
+        # leaving it implicit in registry.SELECTION_NFE.  The values are
+        # identical -- registry.load_partitions keeps code-side entries
+        # authoritative and only fills gaps from here -- so this is a no-op for
+        # behaviour.  It matters for audit: choosing NFE after seeing test data
+        # would be oracle selection, so the choice must be legible in the
+        # frozen artifact without checking out code at this git_sha.
+        selection_nfe: dict[str, int] = {}
+        unregistered: list[str] = []
+        for method in methods:
+            nfe = SELECTION_NFE.get(method)
+            if nfe is None:
+                unregistered.append(method)
+                continue
+            if nfe not in nfes_by_method[method]:
+                raise PreregisterError(
+                    f"method {method!r} has pre-registered selection_nfe={nfe} "
+                    f"but only NFEs {nfes_by_method[method]} exist on disk"
+                )
+            selection_nfe[method] = int(nfe)
+        if unregistered:
+            raise PreregisterError(
+                "discovered methods with no pre-registered selection_nfe: "
+                f"{unregistered}. Add them to vena.validation.registry.METHOD_SPECS "
+                "before freezing the pre-registration -- picking their NFE later, "
+                "after seeing test scores, is oracle selection."
+            )
+
         # --- shard SHA-256 digests (provenance) ---
         shard_shas: dict[str, str] = {}
         for shard in index["shard"].unique():
@@ -210,7 +243,7 @@ class PreregisterEngine:
             "rings": rings,
             "methods": methods,
             "nfes_by_method": nfes_by_method,
-            "selection_nfe": {},  # filled by §4.2 pre-registration
+            "selection_nfe": selection_nfe,
             "shard_shas": shard_shas,
             "skipped_smoke_shards": discovery.skipped_smoke,
             "cross_check": cross_check_status,

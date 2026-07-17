@@ -1,0 +1,35 @@
+# Preregister on Picasso — freeze the authoritative ring partitions.
+#
+# Run: vena-validation-preregister routines/validation/preregister/configs/picasso.yaml
+#
+# WHY PICASSO AND NOT LOCAL (load-bearing):
+#   1. The corpus image H5s live only on Picasso (MeningD2 is unmounted on the
+#      dev workstation), so the cross-check against
+#      resolve_test_scan_patient_pairs only actually RUNS here.  Locally it
+#      short-circuits to a WARNING and proves nothing.
+#   2. Picasso's inference root carries the stale smoke_loginexa/ shard, which
+#      the local tree does not.  Freezing the pre-registration from the local
+#      tree cannot exercise the smoke-skip contract at all.
+#
+# ORDER IS LOAD-BEARING: this must run only with the smoke-skip fix present
+# (main >= 1c5d2c3).  Run it without the fix and discovery globs 456 files
+# instead of 405, double-counting every scan the smoke shard touched, and
+# freezes a wrong pre-registration — the artifact the whole P3 pre-registration
+# integrity claim rests on.
+#
+# Expected on 2026-07-17, with BraTS-PED backfilled (9 cohorts, 405 pred files):
+#   Ring A  321 scans / 247 patients  (UCSF-PDGM, BraTS-GLI, UPENN-GBM,
+#                                      IvyGAP, LUMIERE, REMBRANDT)
+#   Ring B  406 scans / 406 patients  (BraTS-Africa-Glioma, BraTS-Africa-Other,
+#                                      BraTS-PED)
+#   TOTAL   727 scans / 653 patients
+# LUMIERE is the collapse canary: 72 scans -> 11 patients.
+
+inference_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference/analyses
+
+# Cross-check the on-disk scan lists against the expected test splits.
+# On Picasso the image H5s ARE mounted, so this check runs for real and a
+# disagreement is a stop-the-line PreregisterError.
+corpus_registry: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA-validation/routines/fm/train/configs/corpus/corpus_picasso.json
