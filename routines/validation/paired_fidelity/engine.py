@@ -421,6 +421,7 @@ class PairedFidelityEngine:
             n_patients=n_patients,
             elapsed_s=elapsed_s,
             c0_results=c0_results,
+            ring_a_pt=ring_a_pt,
         )
         symlink_latest(run_dir)
         logger.info("Done in %.1f s — artifact: %s", elapsed_s, run_dir)
@@ -1149,6 +1150,81 @@ class PairedFidelityEngine:
     # report.md
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _primary_ranking_md(ring_a_pt: pd.DataFrame) -> str:
+        """Render the primary-endpoint ranking of every method, best first.
+
+        Derived from the data, never hard-coded: a stated finding that drifts
+        out of agreement with the tables it sits next to is worse than no
+        finding at all.
+
+        Parameters
+        ----------
+        ring_a_pt :
+            Ring-A, patient-collapsed rows (one per method x patient).
+
+        Returns
+        -------
+        str
+            Markdown table, or a note when the metric is unavailable.
+        """
+        if ring_a_pt.empty or "mae_brain" not in ring_a_pt.columns:
+            return "_Primary ranking unavailable — no Ring-A rows._\n"
+
+        means = ring_a_pt.groupby("method")["mae_brain"].mean().sort_values()
+        lines = [
+            "| rank | method | MAE brain (Ring A) | |",
+            "|---:|---|---:|---|",
+        ]
+        for rank, (method, value) in enumerate(means.items(), start=1):
+            note = ""
+            if method == VENA_HEADLINE:
+                note = "**← the pre-registered VENA arm**"
+            elif method == "C0-Identity":
+                note = "_null floor_"
+            lines.append(f"| {rank} | `{method}` | {value:.4f} | {note} |")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _oracle_caveat_md(ring_a_pt: pd.DataFrame) -> str:
+        """Render the GT-mask (oracle) caveat, quantified from this run's data.
+
+        ``VENA-S1-v3b``/``-rw`` receive the ground-truth whole-tumour mask as
+        ControlNet conditioning; no competitor does (SHARED_CONTRACTS §10,
+        fairness concern 2).  ``VENA-S1-v3a`` is the no-mask comparator, so the
+        v3b-rw minus v3a gap is the value of the oracle.
+
+        Parameters
+        ----------
+        ring_a_pt :
+            Ring-A, patient-collapsed rows.
+
+        Returns
+        -------
+        str
+            Markdown block, or a note when v3a is absent from the run.
+        """
+        no_oracle = "VENA-S1-v3a"
+        methods = set(ring_a_pt["method"].unique()) if not ring_a_pt.empty else set()
+        if no_oracle not in methods or VENA_HEADLINE not in methods:
+            return (
+                f"_`{no_oracle}` was not part of this run, so the oracle gap cannot be "
+                f"quantified here. It MUST be reported beside every `{VENA_HEADLINE}` "
+                "number — see SHARED_CONTRACTS §10, fairness concern 2._\n"
+            )
+
+        rows = [
+            "| metric | `" + VENA_HEADLINE + "` (GT mask) | `" + no_oracle + "` (no mask) | gap |",
+            "|---|---:|---:|---:|",
+        ]
+        for metric in ("mae_brain", "mae_wt", "ssim_wt"):
+            if metric not in ring_a_pt.columns:
+                continue
+            means = ring_a_pt.groupby("method")[metric].mean()
+            a, b = means.get(VENA_HEADLINE, float("nan")), means.get(no_oracle, float("nan"))
+            rows.append(f"| `{metric}` | {a:.4f} | {b:.4f} | {a - b:+.4f} |")
+        return "\n".join(rows) + "\n"
+
     def _write_report(
         self,
         run_dir: Path,
@@ -1156,11 +1232,14 @@ class PairedFidelityEngine:
         n_patients: int,
         elapsed_s: float,
         c0_results: dict[str, dict[str, float]],
+        ring_a_pt: pd.DataFrame,
     ) -> None:
         cfg = self.cfg
         c0_brain = c0_results.get("C0-Identity", {}).get("mae_brain", float("nan"))
         vena_brain = c0_results.get(VENA_HEADLINE, {}).get("mae_brain", float("nan"))
         vena_wt = c0_results.get(VENA_HEADLINE, {}).get("mae_wt", float("nan"))
+        primary_ranking = self._primary_ranking_md(ring_a_pt)
+        oracle_caveat = self._oracle_caveat_md(ring_a_pt)
 
         md = f"""# Paired Fidelity Analysis — Report
 
@@ -1168,6 +1247,47 @@ class PairedFidelityEngine:
 **Data root**: `{cfg.data_root}`
 **Scans processed**: {n_scans} scans → {n_patients} unique patients
 **Wall clock**: {elapsed_s:.1f} s
+
+## ⚠ Read this before quoting any number
+
+Two facts govern how every table below may honestly be described. Both are
+computed from this run, not asserted.
+
+### 1. `{VENA_HEADLINE}` receives an oracle that no competitor receives
+
+`VENA-S1-v3b` and `{VENA_HEADLINE}` take the **ground-truth whole-tumour mask**
+as ControlNet conditioning. No competitor does (SHARED_CONTRACTS §10, fairness
+concern ②). Every tumour-region number for `{VENA_HEADLINE}` is therefore an
+**upper bound** — "what this model achieves *given a perfect tumour mask*" — and
+is **not** an apples-to-apples comparison against the competitor family.
+
+`VENA-S1-v3a` is the same model **without** mask conditioning, and is the honest
+comparator. The gap between them is the value of the oracle:
+
+{oracle_caveat}
+The mask is worth little or nothing on `mae_brain` and a great deal inside the
+tumour — which is what an oracle localising the tumour would predict. §4.4
+(`downstream_seg`) shows the same effect more starkly, including patients where
+the *synthetic* image segments the tumour **better than the real T1c**, which is
+leakage rather than capability.
+
+**Report `VENA-S1-v3a` beside every `{VENA_HEADLINE}` number.** The deployable
+figure lies between the two: a mask from a segmenter run on *pre-contrast*
+modalities, which is neither perfect nor absent. Do not "fix" this by changing
+the model or the metric — it is a property of the frozen Phase-1 predictions.
+Report it.
+
+### 2. The pre-registered primary endpoint ranking
+
+Primary endpoint = **MAE on brain, Ring A**, patient-collapsed. Every method,
+best first:
+
+{primary_ranking}
+Where `{VENA_HEADLINE}` does not rank first, it does not rank first. The
+pre-registration is frozen (`analyses/preregister/LATEST`), so the primary
+endpoint **cannot** be swapped for a metric or an arm that flatters the result
+after seeing these numbers — that is the oracle selection §4.1 forbids. State
+the ranking as it stands and let the ablations carry the argument.
 
 ## SSIM treatment (§3 decision)
 
