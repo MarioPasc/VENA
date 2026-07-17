@@ -482,6 +482,59 @@ class PairedFidelityEngine:
     # Statistical pass — Ring A, per family
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _series_at_selection_nfe(pt: pd.DataFrame, method: str, metric: str) -> pd.Series:
+        """Patient-indexed *metric* for *method* at its pre-registered NFE.
+
+        The single place any arm of any comparison is reduced to one value per
+        patient.  Every caller — VENA, competitors, ablations, the report's
+        ranking — must route through here: comparing two methods at different
+        NFEs is the exact defect the pre-registration exists to prevent, and it
+        arises whenever two arms get two code paths.
+
+        Falls back to every available NFE with a WARNING when the pre-registered
+        one is absent (a smoke may not carry it), because a silently empty arm
+        drops the comparison altogether.
+
+        Parameters
+        ----------
+        pt :
+            Patient-collapsed rows carrying ``method``, ``nfe``, ``patient_id``.
+        method :
+            Method key as it appears on disk.
+        metric :
+            Column to reduce.
+
+        Returns
+        -------
+        pd.Series
+            Indexed by ``patient_id``; empty when *method* is absent.
+        """
+        rows = pt[pt["method"] == method]
+        if rows.empty or metric not in rows.columns:
+            return pd.Series(dtype=float)
+
+        sel_nfe = SELECTION_NFE.get(method)
+        if sel_nfe is None:
+            logger.warning(
+                "%r has no pre-registered selection_nfe; averaging over all NFEs %s.",
+                method,
+                sorted(rows["nfe"].unique()),
+            )
+            return rows.groupby("patient_id")[metric].mean()
+
+        at_nfe = rows[rows["nfe"] == sel_nfe]
+        if at_nfe.empty:
+            logger.warning(
+                "%r has no rows at pre-registered nfe=%s (present: %s); "
+                "falling back to all NFEs — this run is NOT the pre-registered comparison.",
+                method,
+                sel_nfe,
+                sorted(rows["nfe"].unique()),
+            )
+            at_nfe = rows
+        return at_nfe.groupby("patient_id")[metric].mean()
+
     def _statistical_pass(
         self,
         ring_a_pt: pd.DataFrame,
@@ -514,23 +567,19 @@ class PairedFidelityEngine:
             for metric in _STAT_METRICS:
                 if metric not in ring_a_pt.columns:
                     continue
-                vena_series = (
-                    vena_pt.groupby("patient_id")[metric].mean()
-                    if "patient_id" in vena_pt.columns
-                    else vena_pt.set_index("patient_id")[metric]
-                )
+                # BOTH arms go through the same helper.  They used to not:
+                # the competitor was filtered to its selection NFE while VENA
+                # was averaged over every NFE it has (1/2/5/10/20), so each
+                # p-value compared VENA-averaged-over-NFE against a competitor
+                # at a single NFE.  That is not the pre-registered comparison,
+                # and the asymmetry existed only because the two sides were
+                # written as two code paths.  Keep them as one.
+                vena_series = self._series_at_selection_nfe(ring_a_pt, VENA_HEADLINE, metric)
                 wilcoxon_by_comp: dict[str, object] = {}
                 for comp in family_members:
-                    comp_pt = ring_a_pt[ring_a_pt["method"] == comp]
-                    if comp_pt.empty:
+                    comp_series = self._series_at_selection_nfe(ring_a_pt, comp, metric)
+                    if comp_series.empty:
                         continue
-                    # Use selection NFE for the competitor
-                    sel_nfe = SELECTION_NFE.get(comp, 1)
-                    comp_at_nfe = comp_pt[comp_pt["nfe"] == sel_nfe]
-                    if comp_at_nfe.empty:
-                        # Fall back to any available NFE
-                        comp_at_nfe = comp_pt
-                    comp_series = comp_at_nfe.groupby("patient_id")[metric].mean()
                     try:
                         wilcoxon_by_comp[comp] = paired_wilcoxon(vena_series, comp_series)
                     except Exception as exc:
@@ -1150,9 +1199,15 @@ class PairedFidelityEngine:
     # report.md
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _primary_ranking_md(ring_a_pt: pd.DataFrame) -> str:
+    @classmethod
+    def _primary_ranking_md(cls, ring_a_pt: pd.DataFrame) -> str:
         """Render the primary-endpoint ranking of every method, best first.
+
+        Every method is taken at its own pre-registered selection NFE, via the
+        same helper the statistical pass uses.  A plain groupby over method
+        would silently average the multi-NFE methods (C4/C5/C6 and the VENA
+        arms) over every NFE while leaving the single-NFE methods untouched —
+        ranking them against each other at different NFEs.
 
         Derived from the data, never hard-coded: a stated finding that drifts
         out of agreement with the tables it sits next to is worse than no
@@ -1161,7 +1216,7 @@ class PairedFidelityEngine:
         Parameters
         ----------
         ring_a_pt :
-            Ring-A, patient-collapsed rows (one per method x patient).
+            Ring-A, patient-collapsed rows (one per method x nfe x patient).
 
         Returns
         -------
@@ -1171,7 +1226,12 @@ class PairedFidelityEngine:
         if ring_a_pt.empty or "mae_brain" not in ring_a_pt.columns:
             return "_Primary ranking unavailable — no Ring-A rows._\n"
 
-        means = ring_a_pt.groupby("method")["mae_brain"].mean().sort_values()
+        means = pd.Series(
+            {
+                m: cls._series_at_selection_nfe(ring_a_pt, m, "mae_brain").mean()
+                for m in ring_a_pt["method"].unique()
+            }
+        ).sort_values()
         lines = [
             "| rank | method | MAE brain (Ring A) | |",
             "|---:|---|---:|---|",
@@ -1185,8 +1245,8 @@ class PairedFidelityEngine:
             lines.append(f"| {rank} | `{method}` | {value:.4f} | {note} |")
         return "\n".join(lines) + "\n"
 
-    @staticmethod
-    def _oracle_caveat_md(ring_a_pt: pd.DataFrame) -> str:
+    @classmethod
+    def _oracle_caveat_md(cls, ring_a_pt: pd.DataFrame) -> str:
         """Render the GT-mask (oracle) caveat, quantified from this run's data.
 
         ``VENA-S1-v3b``/``-rw`` receive the ground-truth whole-tumour mask as
@@ -1220,8 +1280,9 @@ class PairedFidelityEngine:
         for metric in ("mae_brain", "mae_wt", "ssim_wt"):
             if metric not in ring_a_pt.columns:
                 continue
-            means = ring_a_pt.groupby("method")[metric].mean()
-            a, b = means.get(VENA_HEADLINE, float("nan")), means.get(no_oracle, float("nan"))
+            # Both arms at their own pre-registered NFE — see _series_at_selection_nfe.
+            a = cls._series_at_selection_nfe(ring_a_pt, VENA_HEADLINE, metric).mean()
+            b = cls._series_at_selection_nfe(ring_a_pt, no_oracle, metric).mean()
             rows.append(f"| `{metric}` | {a:.4f} | {b:.4f} | {a - b:+.4f} |")
         return "\n".join(rows) + "\n"
 

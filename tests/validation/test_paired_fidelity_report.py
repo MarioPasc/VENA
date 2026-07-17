@@ -22,8 +22,16 @@ _VENA = "VENA-S1-v3b-rw"
 _V3A = "VENA-S1-v3a"
 
 
+#: Pre-registered selection NFE for the methods used here (SHARED_CONTRACTS §4).
+#: Rows must carry it: every arm is reduced at its own selection NFE, so a
+#: fixture with no `nfe` column is not a realistic stand-in for real rows.
+_SEL = {_VENA: 5, _V3A: 5, "C2-ResViT": 1, "C0-Identity": 1}
+
+
 def _pt(rows: list[tuple[str, str, float, float, float]]) -> pd.DataFrame:
-    return pd.DataFrame(rows, columns=["method", "patient_id", "mae_brain", "mae_wt", "ssim_wt"])
+    df = pd.DataFrame(rows, columns=["method", "patient_id", "mae_brain", "mae_wt", "ssim_wt"])
+    df["nfe"] = df["method"].map(_SEL)
+    return df
 
 
 def test_primary_ranking_is_ordered_by_the_data_not_by_vena() -> None:
