@@ -124,14 +124,43 @@ if ${DRY_RUN}; then
     exit 0
 fi
 
-ARRAY_JOB_ID=$("${ARRAY_CMD[@]}")
+# Picasso wraps sbatch and colours its output, so even --parsable emits ANSI
+# escape codes around the job ID.  Interpolated raw into --dependency, that
+# yields "afterok:<ESC>[31m<ESC>[0m1604488", which sbatch ACCEPTS and silently
+# records as Dependency=(null) — the merge then runs immediately against a
+# partial shard set.  That is exactly what happened on 2026-07-17 (job 1604489
+# merged 54 of 405 files and published the result as LATEST).  Strip the escape
+# codes and assert the ID is bare digits before trusting it.
+_clean_job_id() {
+    # shellcheck disable=SC2001
+    sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/[^0-9]//g' <<<"$1"
+}
+
+ARRAY_JOB_ID_RAW=$("${ARRAY_CMD[@]}")
+ARRAY_JOB_ID=$(_clean_job_id "${ARRAY_JOB_ID_RAW}")
+if [[ ! "${ARRAY_JOB_ID}" =~ ^[0-9]+$ ]]; then
+    echo "[FATAL] could not parse array job ID from sbatch output: ${ARRAY_JOB_ID_RAW@Q}" >&2
+    exit 1
+fi
 echo ""
 echo "[launcher] Array job:  ${ARRAY_JOB_ID} (tasks 0–${LAST_TASK}, concurrency ${MAX_CONCURRENT})"
 
 # Wire the merge dependency after confirming the array job was accepted.
 MERGE_CMD+=(--dependency="afterok:${ARRAY_JOB_ID}")
-MERGE_JOB_ID=$("${MERGE_CMD[@]}")
+MERGE_JOB_ID_RAW=$("${MERGE_CMD[@]}")
+MERGE_JOB_ID=$(_clean_job_id "${MERGE_JOB_ID_RAW}")
 echo "[launcher] Merge job:  ${MERGE_JOB_ID} (depends on afterok:${ARRAY_JOB_ID})"
+
+# A dependency sbatch failed to record is worse than no merge job at all: it
+# runs unguarded.  Verify SLURM actually stored it.
+DEP_RECORDED=$(scontrol show job "${MERGE_JOB_ID}" 2>/dev/null | grep -o 'Dependency=[^ ]*' | head -1)
+echo "[launcher] SLURM recorded: ${DEP_RECORDED:-<unreadable>}"
+if [[ "${DEP_RECORDED}" == "Dependency=(null)" ]]; then
+    echo "[FATAL] merge job ${MERGE_JOB_ID} has NO dependency — it will run against" >&2
+    echo "        an incomplete shard set. Cancelling it; fix the ID parsing." >&2
+    scancel "${MERGE_JOB_ID}" 2>/dev/null || true
+    exit 1
+fi
 echo ""
 echo "Monitor:  squeue -j ${ARRAY_JOB_ID}"
 echo "Merge:    squeue -j ${MERGE_JOB_ID}"

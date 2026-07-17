@@ -43,6 +43,7 @@ from numpy.typing import NDArray
 from scipy import stats as scipy_stats
 from sklearn.feature_selection import mutual_info_regression
 
+from vena.validation import registry
 from vena.validation.io import ScanSample
 from vena.validation.stats import (
     SpearmanResult,
@@ -79,28 +80,15 @@ CONC_QUANTILES: tuple[float, ...] = (0.01, 0.05, 0.10)
 #: Number of intensity deciles for the Bland-Altman stratified plot.
 N_DECILES: int = 10
 
-#: Selection NFE per method — the single NFE used for headline-table comparisons.
-#: Pre-registered in SHARED_CONTRACTS.md §4 (2026-07-16, do not re-litigate).
-#: Used by :func:`_filter_to_selection_nfe` to avoid duplicate patient_id indices
-#: in the Wilcoxon pairing join when a sweep covers multiple NFE values.
-_SELECTION_NFE: dict[str, int] = {
-    "C0-Identity": 1,
-    "C1-pGAN-t1pre": 1,
-    "C1-pGAN-t2": 1,
-    "C1-pGAN-flair": 1,
-    "C2-ResViT": 1,
-    "C3-SynDiff-t1pre": 4,
-    "C3-SynDiff-t2": 4,
-    "C3-SynDiff-flair": 4,
-    "C4-3D-DiT": 5,
-    "C5-T1C-RFlow": 5,
-    "C6-3D-LDDPM": 1000,
-    "C7-3D-Latent-Pix2Pix": 1,
-    "VENA-S1-v3a": 5,
-    "VENA-S1-v3b": 5,
-    "VENA-S1-v3b-rw": 5,
-    "VENA-S3-LPL-b2c": 5,
-}
+# Selection NFE per method (the single NFE used for headline-table comparisons,
+# pre-registered in SHARED_CONTRACTS §4) is owned by vena.validation.registry
+# and frozen into the preregister artifact.  Do NOT keep a private copy here:
+# a second dict silently disagrees the moment a method is added to
+# METHOD_SPECS, and _filter_to_selection_nfe would then fall back to the
+# highest NFE present -- scoring this routine at a different NFE than the
+# headline table and the pre-registration.  Reference the module attribute
+# rather than importing the name, because registry.load_partitions REBINDS
+# SELECTION_NFE and a from-import would capture a stale binding.
 
 #: Frozen CSV column order.  Any new column must be appended, never inserted,
 #: to keep existing CSVs readable by old analysis scripts.
@@ -708,7 +696,7 @@ def _filter_to_selection_nfe(df: pd.DataFrame, method: str) -> pd.DataFrame:
         method when the canonical nfe is absent from the data.
     """
     method_rows = df[df["method"] == method]
-    nfe_target = _SELECTION_NFE.get(method)
+    nfe_target = registry.SELECTION_NFE.get(method)
     if nfe_target is None:
         # Unknown method — take rows with the highest nfe present (conservative).
         nfe_target = int(method_rows["nfe"].max()) if not method_rows.empty else None
