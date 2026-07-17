@@ -12,6 +12,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import numpy as np
@@ -410,5 +411,7 @@ def test_scan_metrics_is_frozen() -> None:
     vol = _RNG.random((_H, _W, _D)).astype(np.float32)
     scan = _make_sample(vol, vol)
     m = compute_paired_metrics(scan, MetricConfig())
-    with pytest.raises(Exception):  # FrozenInstanceError or AttributeError
+    # Name the type: a blind Exception would also pass if the attribute simply
+    # did not exist, so it would not actually prove frozenness.
+    with pytest.raises(dataclasses.FrozenInstanceError):
         m.mae_brain = 999.0  # type: ignore[misc]

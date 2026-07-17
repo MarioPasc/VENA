@@ -211,7 +211,10 @@ def ssim_in_region(
         active (tiny region entirely within the trim margin).
     """
     trim = window_size // 2
-    H, W, D = mask.shape
+    # Uppercase H/W/D is this codebase's shape convention (coding-standards
+    # rule 11 writes shapes as Float["B C H W D"]); lowercasing would read as
+    # scalars rather than volume extents.
+    H, W, D = mask.shape  # noqa: N806
     # Center-crop: remove ``trim`` voxels from each side.
     mask_cropped: np.ndarray = mask[trim : H - trim, trim : W - trim, trim : D - trim]
     in_region = ssim_map[mask_cropped]
@@ -302,7 +305,7 @@ def ms_ssim_wt_bbox(
     coords = np.argwhere(wt)
     lo = coords.min(axis=0) - bbox_margin
     hi = coords.max(axis=0) + bbox_margin + 1  # exclusive
-    H, W, D = wt.shape
+    H, W, D = wt.shape  # noqa: N806  — shape convention, see above
     lo = np.clip(lo, 0, [H, W, D])
     hi = np.clip(hi, 0, [H, W, D])
     shape = hi - lo
