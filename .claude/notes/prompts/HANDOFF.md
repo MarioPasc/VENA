@@ -13,8 +13,15 @@ met**. Read this top to bottom before touching anything.*
 
 ## 0. TL;DR — the five things that matter now
 
+0. **Read `.claude/skills/orchestrate/SKILL.md` before spawning any agent.** It
+   encodes this session's traps: the worktree-isolation rule that silently
+   discards an agent's work, split-brain imports, the sbatch ANSI dependency
+   trap, the verification order, and the measured sizing numbers.
 1. **Phase 2 is built, merged, and the primary sweep is DONE.** All three
-   routines on `main`, suite **1123 passed**, ruff clean on validation files.
+   routines on `main`, suite **1132 passed**, ruff clean on validation files.
+   Results copied to
+   `/media/mpascual/Sandisk2TB/research/vena/results/fm/inference/analyses/`
+   (hash-verified; see its `README.md`).
 2. **The paper's headline claim did not survive the full sweep.** VENA's
    tumour win is entirely attributable to an **oracle GT mask** no competitor
    receives. **§4 — read it, it is the most important thing in this file.**
@@ -31,7 +38,7 @@ met**. Read this top to bottom before touching anything.*
 
 | | Status |
 |---|---|
-| `main` | `8ac259f`; suite **1123 passed**, 1 skipped, 4 deselected; ruff clean on `src/vena/validation/`, `routines/validation/`, `tests/validation/` |
+| `main` | suite **1132 passed**, 1 skipped, 4 deselected; ruff clean on `src/vena/validation/`, `routines/validation/`, `tests/validation/` |
 | `paired_fidelity` (§4.2/§4.5/§4.7) | merged, smoked, **full sweep COMPLETE** |
 | `spatial_residual` (§4.3) | merged, smoked; **sweep not run** |
 | `downstream_seg` (§4.4) | merged, smoked; **sweep not run** |
@@ -275,49 +282,99 @@ Both then produced good work when sent back with specifics.
 
 | What | Path |
 |---|---|
+| **How to run a session like this one** | **`.claude/skills/orchestrate/SKILL.md`** — read it before spawning any agent. Encodes the worktree/split-brain traps, the sbatch ANSI trap, the verification order, and the sizing numbers. |
 | Picasso repo to run from | `fscratch/repos/VENA-validation` — **a real git repo; `git rev-parse` resolves.** Keep it synced with `rsync -az --delete` from `main`. |
 | Picasso shared repo | `fscratch/repos/VENA` @ `1ad2ba4` — **do not run validation from it**; `git_sha` would report `1ad2ba4`. It carries untracked `routines/validation/` + `src/vena/validation/` copies an agent left; **ask the user to delete them** (two sources of truth). |
 | Predictions | `picasso:~/execs/vena/inference` (405+45 files, 9 cohorts) |
 | Sweep output | `picasso:~/execs/vena/paired_fidelity_sweep/` |
-| Analyses | `picasso:~/execs/vena/inference/analyses/{preregister,spatial_residual,downstream_seg}/` |
+| Analyses (Picasso) | `picasso:~/execs/vena/inference/analyses/{preregister,spatial_residual,downstream_seg}/` |
+| **Results archive (local)** | `/media/mpascual/Sandisk2TB/research/vena/results/fm/inference/analyses/` — the four authoritative artifacts, copied 2026-07-17 and **verified byte-identical by content hash**. `README.md` there names what is authoritative, retains the VOID partial as marked evidence, and lists the six superseded runs deliberately left on Picasso (with why). Layout is flattened: the sweep's `paired_fidelity/` sits beside the other three. |
 
 ---
 
-## 8. NEXT — do this, in order
+## 8. NEXT — the task list
 
-1. **Run the `spatial_residual` sweep.** CPU-only, single-threaded
-   (TotalCPU≈Elapsed): ~3.45 CPU-s/volume → **~20 CPU-h**. Shard it like
-   `paired_fidelity` (405 tasks) or it will take ~9 h serially. Run from
-   `VENA-validation` so `git_sha` resolves (its D4 is still unfixed: its own
-   smoke says `git_sha: "unknown"`).
-2. **Run the `downstream_seg` sweep.** Needs a **GPU** → queues behind
-   `gres/gpu=32`. ~4 GPU-h with PED. **Must include `VENA-S1-v3a`** — it is the
-   honest §4.4 comparator (§4b).
-3. **Wire `load_partitions`** (task #7). It is exported but **never called**, so
-   `COHORT_RING` stays `{}` and the ring-drift check in `ring_of_cohort`
-   ("Raises on disagreement so silent drift is caught immediately") can never
-   fire. Not a correctness bug today — rings come from Phase-1's authoritative
-   H5 attrs and preregister cross-checked 9/9 — but the net is inert and the
-   frozen `ring_partitions.json` is currently write-only.
-4. **Reconcile the proposal** (task #8) — §4.1 to the scoring-space rule, and
-   §4.3.3/§4.3.5 to "ρ_S, not Conc". **Do not edit the proposal without the
-   user.**
-5. **Decide the paper's framing with the user** (§4). The pre-registered primary
-   endpoint (MAE brain, Ring A) says VENA is *not* the best method — C2-ResViT
-   is. The contribution has to rest on the ablation-quantified mask effect, the
-   ρ_S vessel-fidelity result, and "best latent-space method", not on a SOTA win.
+Read `.claude/skills/orchestrate/SKILL.md` before spawning agents for any of it.
 
-**Housekeeping** (`rm` is denied to the agent):
+### P0 — blocks the paper's remaining results
+
+1. **Run the `spatial_residual` sweep (§4.3).** CPU-only. Its smoke is
+   single-threaded (TotalCPU≈Elapsed, ~3.45 CPU-s/volume → **~20 CPU-h**), so
+   shard it one array task per prediction file (405) as `paired_fidelity` does,
+   or it runs ~9 h serially. **Run from `VENA-validation`** — its own D4 is
+   still unfixed and its smoke `decision.json` says `git_sha: "unknown"`.
+   Reuse `launcher_paired_fidelity_sweep.sh`'s ID-sanitising + `scontrol`
+   dependency check (§6) — do not re-introduce the ANSI bug.
+2. **Run the `downstream_seg` sweep (§4.4).** Needs a **GPU** → queues behind
+   `gres/gpu=32` (`--gres=gpu:1 --constraint=a100`). ~4 GPU-h with PED.
+   **MUST include `VENA-S1-v3a`** — it is the honest §4.4 comparator (§4b).
+   Its `report.md` must state the oracle confound and count negative deltas.
+3. **Verify both sweeps** against the §11-style criteria: `pred_mode` (C0 →
+   harmonised, rest → raw), `skipped_smoke_shards` contains `smoke_loginexa`,
+   LUMIERE 72→11, real `git_sha`, counts reconciling to 405/32,715/653.
+   **Check elapsed time against the work claimed** before believing any of it.
+4. **Copy both to the local archive** and update its `README.md` index
+   (`/media/mpascual/Sandisk2TB/research/vena/results/fm/inference/analyses/`).
+   Verify by content hash.
+
+### P1 — integrity gaps that are not wrong today but could become wrong
+
+5. **Wire `load_partitions`.** Exported but **never called**, so `COHORT_RING`
+   stays `{}` and the drift check in `ring_of_cohort` ("Raises on disagreement
+   so silent drift is caught immediately") can never fire — the H5 attr always
+   wins by default rather than by verification, and the frozen
+   `ring_partitions.json` is write-only. Needs a `preregistration_path` config
+   param across the three validation engines. Not a correctness bug today:
+   rings come from Phase-1's authoritative H5 attrs and preregister
+   cross-checked 9/9.
+6. **`spatial_residual`'s `git_sha: "unknown"`** — fixed for free by running
+   from `VENA-validation` (item 1), but confirm it in the sweep artifact.
+7. **Audit the other two routines for the NFE asymmetry** (§6). `paired_fidelity`
+   is fixed and guarded. `spatial_residual` has its own `_filter_to_selection_nfe`
+   (correct, and now sourcing `registry.SELECTION_NFE`); `downstream_seg` sets
+   `selection_nfe_only: true`. **Verify both actually reduce every arm at its own
+   selection NFE** — the bug is an asymmetry between arms, so check both sides.
+
+### P2 — writing, and decisions that are the user's
+
+8. **Reconcile the proposal** — §4.1 to the scoring-space rule (Phase-1
+   double-harmonisation; under-saturation is reported, not absorbed; C4-3D-DiT
+   reaches 38% of the reference's dynamic range → Table S1), and §4.3.3/§4.3.5
+   to "**ρ_S is the discriminator, not Conc**". **Do not edit
+   `/media/mpascual/Sandisk2TB/research/vena/docs/proposal.md` without the user.**
+9. **Frame the contribution** (§4). The pre-registered primary endpoint says
+   VENA is *not* best — it ranks 7th of 16, behind ResViT, three pGAN panels,
+   and its own ablations. What survives: the ablation-quantified mask effect,
+   the ρ_S vessel-fidelity result, and "best latent-space method".
+10. **Test the VAE-ceiling hypothesis, or drop it.** "Latent methods pay a
+    compression tax" is NOT established — C3-SynDiff is image-domain and loses to
+    three latent methods (§4d). The clean experiment: **the MAISI VAE's own
+    reconstruction MAE on real T1c**, which is the floor no latent method can
+    beat. If VENA ≈ that floor, the claim is made; if not, drop it.
+11. **Ring B / OOD analysis.** All the §4 numbers above are **Ring A**. Ring B is
+    now 406 patients (incl. BraTS-PED 260, pediatric) and is a separate endpoint
+    family (§6.4). Nobody has looked at it yet — the sweep computed it.
+12. **Matched-NFE sub-table and the cost-quality Pareto** (SHARED_CONTRACTS
+    §4.2): NFE=5 across the few-step latent tier is the only apples-to-apples
+    generative-formulation comparison; `cost_table.csv` + `figures/cost_quality_pareto.png`
+    exist but nobody has read them.
+13. **Limitations to state, not fix** (SHARED_CONTRACTS §10): VENA's `_sample`
+    used unseeded `torch.randn_like` → predictions are not bit-reproducible;
+    C4–C7 condition on 2 modalities, VENA/ResViT on 3, pGAN/SynDiff on 1.
+
+### Housekeeping (`rm` is denied to the agent — ask the user)
 ```
 rm -rf /home/mpascual/.pytest-tmp-*            # per-agent pytest temp (local)
 ssh picasso 'rm -rf fscratch/repos/VENA/routines/validation fscratch/repos/VENA/src/vena/validation'
+# The four merged agent worktrees can be pruned; check `git worktree list` first:
+git worktree remove .claude/worktrees/agent-<hash>
 ```
 
 ---
 
 ## 9. The one-paragraph version
 
-Phase 2 is built and merged (suite 1123, ruff clean), the pre-registration is
+Phase 2 is built and merged (suite 1132, ruff clean), the pre-registration is
 frozen on Picasso with a passing 9/9 cross-check, BraTS-PED landed so Ring B is
 406, and the `paired_fidelity` sweep is complete over 405 files / 32,715 scans
 / 653 patients. The science did not go the way the last handoff predicted: the
