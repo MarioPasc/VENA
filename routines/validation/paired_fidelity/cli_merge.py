@@ -31,6 +31,7 @@ import pandas as pd
 
 from routines.validation.paired_fidelity.engine import PairedFidelityConfig, PairedFidelityEngine
 from vena.validation.artifacts import make_run_dir
+from vena.validation.io import discover_shards
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,23 @@ def main() -> None:
     run_dir = make_run_dir(cfg.output_root, "paired_fidelity")
     logger.info("Run directory: %s", run_dir)
 
+    # Re-derive the skipped smoke shards from the data root.  The exclusion
+    # itself happened at manifest-generation time, but the merged decision.json
+    # is the artifact an auditor reads, and reporting [] there would assert that
+    # nothing was excluded -- i.e. that the stale smoke_loginexa shard was NOT
+    # filtered, which is the exact contamination the discovery contract exists
+    # to prevent (SHARED_CONTRACTS §3.1).  Recording an unlogged exclusion as
+    # "none" reads as "we covered everything".  discover_shards only reads each
+    # shard's decision.json, so this is cheap and cannot disagree with the
+    # manifest: both call the same function on the same root.
+    discovery = discover_shards(cfg.data_root)
+    if discovery.skipped_smoke:
+        logger.info(
+            "Recording %d skipped smoke shard(s) in decision.json: %s",
+            len(discovery.skipped_smoke),
+            discovery.skipped_smoke,
+        )
+
     engine = PairedFidelityEngine(cfg)
     engine.run_postprocess(
         run_dir,
@@ -148,8 +166,7 @@ def main() -> None:
         n_scans=n_scans,
         # elapsed_s covers concat + analysis; shard wall-times are in shard logs.
         elapsed_s=time.perf_counter() - t_start,
-        # Smoke shards were excluded at manifest-generation time; none excluded here.
-        skipped_smoke_shards=[],
+        skipped_smoke_shards=discovery.skipped_smoke,
     )
 
     logger.info(
