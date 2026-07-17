@@ -21,7 +21,7 @@ from routines.validation.downstream_seg.engine import (
 
 from vena.validation.io import ReferenceCache
 
-pytestmark = pytest.mark.unit
+pytestmark = pytest.mark.validation
 
 _H, _W, _D = 16, 16, 16  # must match conftest dimensions
 
