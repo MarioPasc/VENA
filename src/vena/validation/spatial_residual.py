@@ -79,6 +79,29 @@ CONC_QUANTILES: tuple[float, ...] = (0.01, 0.05, 0.10)
 #: Number of intensity deciles for the Bland-Altman stratified plot.
 N_DECILES: int = 10
 
+#: Selection NFE per method — the single NFE used for headline-table comparisons.
+#: Pre-registered in SHARED_CONTRACTS.md §4 (2026-07-16, do not re-litigate).
+#: Used by :func:`_filter_to_selection_nfe` to avoid duplicate patient_id indices
+#: in the Wilcoxon pairing join when a sweep covers multiple NFE values.
+_SELECTION_NFE: dict[str, int] = {
+    "C0-Identity": 1,
+    "C1-pGAN-t1pre": 1,
+    "C1-pGAN-t2": 1,
+    "C1-pGAN-flair": 1,
+    "C2-ResViT": 1,
+    "C3-SynDiff-t1pre": 4,
+    "C3-SynDiff-t2": 4,
+    "C3-SynDiff-flair": 4,
+    "C4-3D-DiT": 5,
+    "C5-T1C-RFlow": 5,
+    "C6-3D-LDDPM": 1000,
+    "C7-3D-Latent-Pix2Pix": 1,
+    "VENA-S1-v3a": 5,
+    "VENA-S1-v3b": 5,
+    "VENA-S1-v3b-rw": 5,
+    "VENA-S3-LPL-b2c": 5,
+}
+
 #: Frozen CSV column order.  Any new column must be appended, never inserted,
 #: to keep existing CSVs readable by old analysis scripts.
 SPATIAL_CSV_COLUMNS: list[str] = [
@@ -659,6 +682,60 @@ def compute_scan_rows(
 # ---------------------------------------------------------------------------
 
 
+def _filter_to_selection_nfe(df: pd.DataFrame, method: str) -> pd.DataFrame:
+    """Return only the rows for *method* at its headline selection_nfe.
+
+    After :func:`collapse_to_patient`, a sweep that covers multiple NFE values
+    produces duplicate ``patient_id`` index entries (one per NFE).  Selecting
+    only the selection_nfe rows guarantees unique patient_ids and makes the
+    :func:`paired_wilcoxon` inner-join well-defined.
+
+    Falls back to all NFEs for that method when the selection_nfe is not found
+    in the data (e.g. a sweep that ran only nfe=1 for a method whose canonical
+    nfe is 5).  Logs a warning in the fallback branch.
+
+    Parameters
+    ----------
+    df :
+        Patient-level DataFrame with ``method`` and ``nfe`` columns.
+    method :
+        Method key (e.g. ``"C0-Identity"``).
+
+    Returns
+    -------
+    pd.DataFrame
+        Rows for *method* filtered to its selection_nfe, or all rows for the
+        method when the canonical nfe is absent from the data.
+    """
+    method_rows = df[df["method"] == method]
+    nfe_target = _SELECTION_NFE.get(method)
+    if nfe_target is None:
+        # Unknown method — take rows with the highest nfe present (conservative).
+        nfe_target = int(method_rows["nfe"].max()) if not method_rows.empty else None
+        logger.warning(
+            "_filter_to_selection_nfe: unknown method %r; falling back to nfe=%s",
+            method,
+            nfe_target,
+        )
+        return method_rows if nfe_target is None else method_rows[method_rows["nfe"] == nfe_target]
+
+    filtered = method_rows[method_rows["nfe"] == nfe_target]
+    if filtered.empty and not method_rows.empty:
+        # Smoke or partial sweep: selection_nfe not present; take what we have.
+        available = sorted(method_rows["nfe"].unique())
+        # Pick the value closest to selection_nfe (avoids nfe=1 when nfe=5 intended).
+        closest = min(available, key=lambda x: abs(x - nfe_target))
+        logger.warning(
+            "_filter_to_selection_nfe: %r selection_nfe=%d not found; "
+            "falling back to closest available nfe=%d",
+            method,
+            nfe_target,
+            closest,
+        )
+        return method_rows[method_rows["nfe"] == closest]
+    return filtered
+
+
 @dataclass(frozen=True)
 class WilcoxonTestResult:
     """Result of one paired Wilcoxon test with Holm correction."""
@@ -731,10 +808,16 @@ def aggregate_patient_tests(
     pvalue_dict: dict[str, float] = {}
     raw_results: list[tuple[str, str, float, int, float]] = []
 
-    vena_pat = patient_df[patient_df["method"] == vena_method].set_index("patient_id")
+    # D1 fix: filter VENA and each competitor to their selection_nfe BEFORE
+    # indexing by patient_id.  Without this, methods with multiple NFE values
+    # produce duplicate patient_id index entries; vena.loc[common] then returns
+    # more rows than competitor.loc[common], making (v - c) a shape-mismatch
+    # that raises ValueError → silently caught → n_pairs=0.
+    # Fix: each arm contributes exactly one row per patient at its headline NFE.
+    vena_pat = _filter_to_selection_nfe(patient_df, vena_method).set_index("patient_id")
 
     for comp in competitors:
-        comp_pat = patient_df[patient_df["method"] == comp].set_index("patient_id")
+        comp_pat = _filter_to_selection_nfe(patient_df, comp).set_index("patient_id")
         for stat in stats_to_test:
             key = f"{comp}::{stat}"
             try:

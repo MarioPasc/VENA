@@ -7,12 +7,14 @@ All tests are pure NumPy — no H5, no disk, no GPU.  They verify:
 - HOLM_FAMILY_SIZE constant.
 - Shuffle convergence structure.
 - Decile means output shape.
+- D1 regression: n_pairs > 0 for all competitors even when VENA has multiple NFEs.
 """
 
 # ruff: noqa: N806  — `_R` suffix mirrors the library API (R = region, §4.3).
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from vena.validation.spatial_residual import (
@@ -21,6 +23,7 @@ from vena.validation.spatial_residual import (
     SPATIAL_CSV_COLUMNS,
     _intensity_decile_means,
     _shuffle_null,
+    aggregate_patient_tests,
     concentration_q,
     shuffle_convergence_check,
 )
@@ -242,3 +245,127 @@ def test_concentration_q_uses_realised_denominator() -> None:
     # Realised denominator: ceil(0.05 * 7) = 1; fraction = 1/7.
     expected = 1.0 / (1 / n)
     assert conc == pytest.approx(expected, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# D1 regression: n_pairs > 0 even when VENA covers multiple NFEs
+# ---------------------------------------------------------------------------
+
+
+def _make_per_scan_df(
+    vena_method: str,
+    competitor: str,
+    n_patients: int,
+    vena_nfes: list[int],
+    comp_nfes: list[int],
+) -> pd.DataFrame:
+    """Build a minimal per_scan_df for D1 regression testing.
+
+    Creates one row per (patient, method, nfe) combination under ring="A"
+    and condition="C-noT", with random but finite metric values.
+    """
+    rng = np.random.default_rng(0)
+    patient_ids = [f"P{i:03d}" for i in range(n_patients)]
+
+    rows = []
+    for pid in patient_ids:
+        for nfe in vena_nfes:
+            rows.append(
+                {
+                    "scan_id": f"{pid}_UCSF_{vena_method}_nfe{nfe}",
+                    "patient_id": pid,
+                    "cohort": "UCSF-PDGM",
+                    "ring": "A",
+                    "condition": "C-noT",
+                    "method": vena_method,
+                    "nfe": nfe,
+                    "rho_s": float(rng.uniform(0.0, 0.4)),
+                    "conc_01": float(rng.uniform(1.0, 5.0)),
+                    "conc_05": float(rng.uniform(1.0, 3.5)),
+                    "conc_10": float(rng.uniform(1.0, 2.5)),
+                    "delta_brain_rho": float(rng.uniform(-0.1, 0.1)),
+                    "delta_brain_conc05": float(rng.uniform(-0.2, 0.2)),
+                    "delta_R_rho": float(rng.uniform(-0.1, 0.1)),
+                    "delta_R_conc05": float(rng.uniform(-0.2, 0.2)),
+                }
+            )
+        for nfe in comp_nfes:
+            rows.append(
+                {
+                    "scan_id": f"{pid}_UCSF_{competitor}_nfe{nfe}",
+                    "patient_id": pid,
+                    "cohort": "UCSF-PDGM",
+                    "ring": "A",
+                    "condition": "C-noT",
+                    "method": competitor,
+                    "nfe": nfe,
+                    "rho_s": float(rng.uniform(0.1, 0.5)),
+                    "conc_01": float(rng.uniform(1.0, 4.0)),
+                    "conc_05": float(rng.uniform(1.0, 3.0)),
+                    "conc_10": float(rng.uniform(1.0, 2.0)),
+                    "delta_brain_rho": float(rng.uniform(-0.1, 0.1)),
+                    "delta_brain_conc05": float(rng.uniform(-0.2, 0.2)),
+                    "delta_R_rho": float(rng.uniform(-0.1, 0.1)),
+                    "delta_R_conc05": float(rng.uniform(-0.2, 0.2)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_n_pairs_positive_for_c0_identity() -> None:
+    """D1 regression: n_pairs > 0 for C0-Identity when VENA has nfes=[1,5].
+
+    Root cause of the original bug: smoke config has ``nfes=[1,5]``, so after
+    ``collapse_to_patient`` VENA has 2 rows per patient (one per NFE) while
+    C0-Identity has 1 row per patient.  ``paired_wilcoxon`` receives a VENA
+    Series of length 2×n and a C0 Series of length n → shape mismatch →
+    ValueError → caught → n_pairs=0.
+
+    The fix is ``_filter_to_selection_nfe``: VENA is sliced to nfe=5 (its
+    selection NFE), C0 is sliced to nfe=1 (its selection NFE), so both Series
+    have exactly n rows before ``.loc[common]``.
+    """
+    vena_method = "VENA-S1-v3b-rw"
+    competitor = "C0-Identity"
+    n_patients = 10  # small for unit speed; real run uses 66
+
+    # Reproduce the smoke scenario: VENA gets nfe=[1,5], C0 only nfe=[1].
+    df = _make_per_scan_df(vena_method, competitor, n_patients, vena_nfes=[1, 5], comp_nfes=[1])
+
+    _, test_results = aggregate_patient_tests(df, vena_method=vena_method)
+
+    # Sanity: we got at least one result for this competitor.
+    c0_results = [r for r in test_results if r.competitor == competitor]
+    assert len(c0_results) > 0, "No WilcoxonTestResult produced for C0-Identity"
+
+    for r in c0_results:
+        assert r.n_pairs > 0, (
+            f"D1 regression: n_pairs=0 for C0-Identity / {r.stat_name}. "
+            "The _filter_to_selection_nfe fix has regressed."
+        )
+
+
+def test_n_pairs_positive_for_c5_rflow() -> None:
+    """D1 regression: n_pairs > 0 for C5-T1C-RFlow (both methods at nfe=[1,5]).
+
+    Both VENA and C5 have selection_nfe=5, so after filtering both arms are
+    reduced to nfe=5 only → exactly n unique patient_id rows each → no shape
+    mismatch.  This test guards against regressions where the filter returns
+    an empty DataFrame for C5.
+    """
+    vena_method = "VENA-S1-v3b-rw"
+    competitor = "C5-T1C-RFlow"
+    n_patients = 10
+
+    df = _make_per_scan_df(vena_method, competitor, n_patients, vena_nfes=[1, 5], comp_nfes=[1, 5])
+
+    _, test_results = aggregate_patient_tests(df, vena_method=vena_method)
+
+    c5_results = [r for r in test_results if r.competitor == competitor]
+    assert len(c5_results) > 0, "No WilcoxonTestResult produced for C5-T1C-RFlow"
+
+    for r in c5_results:
+        assert r.n_pairs > 0, (
+            f"D1 regression: n_pairs=0 for C5-T1C-RFlow / {r.stat_name}. "
+            "The _filter_to_selection_nfe fix has regressed."
+        )

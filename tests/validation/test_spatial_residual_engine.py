@@ -2,10 +2,10 @@
 
 Uses the ``synth_shard`` session fixture from conftest.py.  Key invariants:
 
-- Engine runs end-to-end and writes per_scan.csv with the frozen 40-column header.
+- Engine runs end-to-end and writes per_scan/spatial_residual.csv with the frozen 40-column header.
 - LUMIERE-like cohort (5 scans / 3 patients) collapses correctly.
 - C-noT uses the ``bg`` (dilated) mask key, not ``bg_undilated``.
-- per_scan.csv has exactly 2 rows per scan (one per condition).
+- per_scan/spatial_residual.csv has exactly 2 rows per scan (one per condition).
 """
 
 from __future__ import annotations
@@ -213,8 +213,8 @@ def test_engine_end_to_end(synth_shard: Path, tmp_path: Path) -> None:
     engine = SpatialResidualEngine(cfg)
     run_dir = engine.run()
 
-    per_scan_csv = run_dir / "tables" / "per_scan.csv"
-    assert per_scan_csv.exists(), "per_scan.csv must be written"
+    per_scan_csv = run_dir / "per_scan" / "spatial_residual.csv"
+    assert per_scan_csv.exists(), "per_scan/spatial_residual.csv must be written"
 
     df = pd.read_csv(per_scan_csv)
 
@@ -270,7 +270,7 @@ def test_engine_lumiere_collapse(synth_shard: Path, tmp_path: Path) -> None:
     engine = SpatialResidualEngine(cfg)
     run_dir = engine.run()
 
-    df = pd.read_csv(run_dir / "tables" / "per_scan.csv")
+    df = pd.read_csv(run_dir / "per_scan" / "spatial_residual.csv")
 
     # LUMIERE-like: 5 scan_ids, 3 patient_ids.
     lumiere_df = df[df["cohort"] == "LUMIERE-like"]
