@@ -88,15 +88,15 @@ concern ②). The full sweep quantifies exactly what that is worth.
 
 | method | MAE_wt |
 |---|---|
-| VENA-S1-v3b-rw (**with GT mask**) | **0.0959** ← beats all 8 competitors, all Holm-significant |
+| VENA-S1-v3b-rw (**with GT mask**) | **0.0948** ← beats all 8 competitors, all Holm-significant |
 | C2-ResViT | 0.1129 |
 | C1-pGAN-t1pre | 0.1158 |
 | C5-T1C-RFlow | 0.1234 |
 | **VENA-S1-v3a (NO mask)** | **0.1283** ← **loses to all three** |
 
-Mask conditioning buys **−0.032 MAE_wt** and **+0.167 SSIM_wt**
-(δ=+0.73, p=1.5e-39). Strip it and VENA beats neither ResViT, pGAN, nor
-T1C-RFlow in the tumour.
+Mask conditioning buys **−0.0335 MAE_wt** and **+0.166 SSIM_wt**
+(δ=+0.73), and **+0.0001 MAE_brain** — i.e. nothing whole-brain. Strip it and
+VENA beats neither ResViT, pGAN, nor T1C-RFlow in the tumour.
 
 ### 4b. §4.4 confirms it independently — with a smoking gun
 
@@ -125,16 +125,20 @@ predictions. Report it.
 
 ### 4c. Region weighting is a net negative
 
-| | MAE_brain | SSIM_brain | MAE_wt |
-|---|---|---|---|
-| VENA-S1-v3b (no rw) | **0.0915** | **0.589** | 0.0965 |
-| VENA-S1-v3b-rw (**the pre-registered headline**) | 0.0950 | 0.553 | 0.0959 |
-| | v3b wins p=0.0013 | v3b wins p=1.8e-27 | **n.s. p=0.50** |
+| | MAE_brain | SSIM_brain | MAE_wt | SSIM_wt |
+|---|---|---|---|---|
+| VENA-S1-v3b (no rw) | **0.0915** | **0.589** | 0.0965 | 0.570 |
+| VENA-S1-v3b-rw (**the pre-registered headline**) | 0.0955 | 0.554 | 0.0948 | 0.574 |
+| | v3b wins p=0.0022 | v3b wins p<1e-5 | **n.s. p=0.997** | **n.s. p=0.281** |
 
-`-rw` costs whole-brain MAE and SSIM and buys **nothing** in the tumour.
-An honest negative ablation. **The headline cannot be swapped to v3b** — the
-pre-registration is frozen and picking the winner post hoc is the oracle
-selection §4.1 forbids.
+`-rw` costs whole-brain MAE and SSIM and buys **nothing measurable** in the
+tumour — neither MAE_wt nor SSIM_wt separates. An honest negative ablation.
+**The headline cannot be swapped to v3b** — the pre-registration is frozen and
+picking the winner post hoc is the oracle selection §4.1 forbids.
+
+On the primary endpoint the pre-registered arm ranks **7th of 16**, behind
+ResViT, all three pGAN panels, and **its own ablations v3b (0.0915) and v3a
+(0.0953)**.
 
 ### 4d. The whole-brain deficit is a VAE tax, not a conditioning failure
 
@@ -151,9 +155,15 @@ from **one** modality against VENA's three.
 
 ### 4e. LPL is inert — confirmed on 247 patients
 
-`VENA-S3-LPL-b2c` ≈ v3b-rw everywhere (mae_brain p=0.97, ssim_brain p=0.92;
-mae_wt δ=0.034, negligible). Independently confirms the stored decision to stop
-the LPL programme. **Do not reopen it.**
+`VENA-S3-LPL-b2c` ≈ v3b-rw everywhere: mae_brain **p=1.00**, mae_wt **p=0.997**,
+ssim_wt **p=0.794**, all non-significant. The only survivor is ssim_brain
+(p=0.023) at δ=0.02 — negligible. Independently confirms the stored decision to
+stop the LPL programme. **Do not reopen it.**
+
+*(The buggy NFE pass — see §6 — had manufactured significant LPL differences on
+mae_wt (p=0.0125) and ssim_wt (p=3.4e-4). Both were artefacts. Correcting the
+bug removed four spurious significances, every one involving a multi-NFE arm,
+and made this conclusion cleaner.)*
 
 ### 4f. §4.3 — the C0-ceiling framing is dead; ρ_S is the statistic
 
@@ -178,12 +188,21 @@ the routine. It does not reproduce. Delete that number from your mental model.)*
 ## 5. The completed sweep
 
 ```
-picasso:~/execs/vena/paired_fidelity_sweep/analyses/paired_fidelity/2026-07-17T10-27-27Z  (LATEST)
-  git_sha 7e60709 · 405 shards · 32,715 scans · 653 patients · n_bootstrap 10,000
+picasso:~/execs/vena/paired_fidelity_sweep/analyses/paired_fidelity/2026-07-17T11-54-55Z  (LATEST)
+  git_sha 285f203 · 405 shards · 32,715 scans · 653 patients · n_bootstrap 10,000
   skipped_smoke_shards: ["smoke_loginexa"]
   pred_mode: C0-Identity → harmonised 727/727; all 15 others → raw. Zero exceptions.
-  Array 1604488: 405/405 COMPLETED, 0 failed.  Merge 1606380.
+  Array 1604488: 405/405 COMPLETED, 0 failed.  Merge re-run 1607921 (NFE fix).
 ```
+`report.md` now carries its own caveats **above** the methodology: the oracle
+gap (computed, not asserted) and the full primary-endpoint ranking with the
+VENA arm marked wherever it lands. Both derive from the run's own rows, so they
+cannot drift out of agreement with the tables beside them. If a future run omits
+`VENA-S1-v3a`, the section says so loudly rather than falling silent.
+
+Earlier merges of the same shards are superseded: `10-27-27Z` (pre-NFE-fix
+statistics) and `11-47-42Z` (pre-NFE-fix ranking). `VOID_2026-07-17T09-51-07Z`
+is the 54-of-405 partial (§6). **Only `11-54-55Z` is valid.**
 Counts reconcile exactly: C4/C5 727×6=4362, C6 727×4=2908, VENA 727×5=3635.
 
 Cost, measured: **21.5 CPU-s/volume** (8 cores, TotalCPU 03:47:50 / 635 vols)
@@ -214,6 +233,23 @@ total in the previous handoff. Nothing invited suspicion. It was caught only by
 checking **elapsed time** (19 s, TotalCPU 00:00:00) against the array state.
 All three are now fixed and pinned by `tests/validation/test_sweep_launcher_guards.py`.
 Evidence kept at `analyses/paired_fidelity/VOID_2026-07-17T09-51-07Z/`.
+
+**The NFE asymmetry — every p-value in the primary result was wrong.**
+`_statistical_pass` filtered each **competitor** to its pre-registered selection
+NFE but averaged **VENA** over all five of its NFEs (1/2/5/10/20). So every
+Holm-corrected p-value compared VENA-averaged-over-NFE against a competitor at a
+single NFE — not the pre-registered comparison, and biased toward VENA on the
+primary endpoint (0.0950 averaged vs 0.0955 at its own nfe=5; low-NFE samples
+are smoother and score better on MAE). It removed four spurious significances
+once fixed. **The only visible symptom was that `c0_sanity.csv` (which filtered
+correctly) and `headline_table.csv` disagreed by 0.0005 about VENA's own
+mae_brain** — two tables in one artifact disagreeing about the same quantity.
+Nothing crashed. The lesson: *the asymmetry existed only because the two arms
+were written as two code paths.* Both now route through
+`_series_at_selection_nfe`, and the orchestrator reproduced the identical bug in
+the report's ranking helper within the same hour by reaching for a plain
+`groupby("method")`. **Any reduction of an arm to one value per patient goes
+through that helper.** Guarded by `tests/validation/test_selection_nfe_symmetry.py`.
 
 **Other traps closed:**
 - **`git_sha: "unknown"`** was not a code bug: the Picasso checkouts were
