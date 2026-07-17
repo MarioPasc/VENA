@@ -367,6 +367,7 @@ class TestDownstreamSegEngine:
         assert dec["bundle_input_channel_order"] == ["t1c", "t1", "t2", "flair"]
         assert "empty_et_convention" in dec
         assert "scoring_space_fix" in dec
+        assert "skipped_smoke_shards" in dec
         assert "appendix_a_deviation" in dec
 
     def test_cohort_without_corpus_map_skipped(
@@ -472,3 +473,71 @@ class TestDownstreamSegEngine:
                 # NaN propagates correctly in subtraction
                 if not (np.isnan(real) or np.isnan(synth)):
                     assert delta == pytest.approx(real - synth, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# _discover_pred_files — smoke-shard exclusion
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverPredFiles:
+    """Verify that _discover_pred_files skips smoke shards."""
+
+    def _write_pred_stub(
+        self, root: Path, *, shard: str, method: str, cohort: str, nfe: int
+    ) -> Path:
+        """Write an empty stub nfe_NNN.h5 (glob bait; contents not read)."""
+        p = root / shard / "predictions" / method / cohort / f"nfe_{nfe:03d}.h5"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"")
+        return p
+
+    def test_smoke_shard_is_excluded(self, tmp_path: Path) -> None:
+        """Shards with smoke.enabled=True must be absent from results.
+
+        Mirrors the live Picasso topology where smoke_loginexa (smoke.enabled=True)
+        and picasso_shard_a (smoke.enabled=False) both contain overlapping
+        IvyGAP predictions.  Only the production shard must be included.
+        """
+        from routines.validation.downstream_seg.engine import _discover_pred_files
+
+        root = tmp_path / "inference"
+        root.mkdir()
+
+        # Production shard
+        prod = root / "picasso_shard_a"
+        prod.mkdir()
+        (prod / "decision.json").write_text(
+            json.dumps({"schema_version": "1.0", "smoke": {"enabled": False}})
+        )
+        self._write_pred_stub(
+            root, shard="picasso_shard_a", method="C0-Identity", cohort="IvyGAP", nfe=1
+        )
+
+        # Smoke shard — must be excluded
+        smoke_root = root / "smoke_loginexa"
+        smoke_root.mkdir()
+        (smoke_root / "decision.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "smoke": {"enabled": True, "n_patients_per_cohort": 1},
+                }
+            )
+        )
+        self._write_pred_stub(
+            root, shard="smoke_loginexa", method="C0-Identity", cohort="IvyGAP", nfe=1
+        )
+
+        results, skipped = _discover_pred_files(
+            root,
+            method_filter=[],
+            cohort_filter=[],
+            selection_nfe={},
+            selection_nfe_only=False,
+        )
+
+        assert "smoke_loginexa" in skipped, f"smoke_loginexa missing from skipped: {skipped}"
+        assert "picasso_shard_a" not in skipped, "production shard wrongly flagged as smoke"
+        assert len(results) == 1, f"Expected 1 result (prod shard only), got {len(results)}"
+        assert results[0][3].parents[3].name == "picasso_shard_a"

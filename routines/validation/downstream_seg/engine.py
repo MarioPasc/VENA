@@ -14,6 +14,7 @@ single job to a subset; fan out to Picasso by (method, cohort) pairs.
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import time
@@ -138,22 +139,61 @@ def _discover_pred_files(
     cohort_filter: list[str],
     selection_nfe: dict[str, int],
     selection_nfe_only: bool,
-) -> list[tuple[str, str, int, Path]]:
+) -> tuple[list[tuple[str, str, int, Path]], list[str]]:
     """Glob inference_root for prediction H5 files, filtered per config.
 
-    Returns list of (method, cohort, nfe, path) tuples.
+    Smoke shards (``decision.json`` with ``smoke.enabled == True``) are
+    excluded automatically so that pilot inference runs do not contaminate
+    the validation analysis.
+
+    Returns
+    -------
+    tuple
+        ``(results, skipped_smoke_shards)`` where *results* is a list of
+        ``(method, cohort, nfe, path)`` tuples and *skipped_smoke_shards*
+        is a sorted list of shard names that were excluded because they
+        carried ``smoke.enabled=True``.
     """
     pattern = "*/predictions/*/*/nfe_*.h5"
     files = sorted(inference_root.glob(pattern))
     results: list[tuple[str, str, int, Path]] = []
+    # Cache per shard-root to avoid re-reading decision.json for every file.
+    _shard_smoke: dict[Path, bool] = {}
+    skipped_smoke: set[str] = set()
+
     for p in files:
-        # predictions/<METHOD>/<COHORT>/nfe_<NNN>.h5
+        # Layout: <inference_root>/<shard>/predictions/<METHOD>/<COHORT>/nfe_N.h5
+        # p.parents: [0]=<COHORT>, [1]=<METHOD>, [2]=predictions, [3]=<shard>
         try:
             nfe = int(p.stem.split("_")[-1])
             cohort = p.parent.name
             method = p.parent.parent.name
+            shard_root = p.parents[3]
         except (ValueError, IndexError):
             logger.debug("skipping unparseable path: %s", p)
+            continue
+
+        # Smoke-shard guard: exclude shards produced by a smoke inference run.
+        if shard_root not in _shard_smoke:
+            dec_path = shard_root / "decision.json"
+            is_smoke = False
+            if dec_path.is_file():
+                try:
+                    dec = json.loads(dec_path.read_text())
+                    smoke_cfg = dec.get("smoke", {})
+                    is_smoke = bool(
+                        smoke_cfg.get("enabled", False)
+                        if isinstance(smoke_cfg, dict)
+                        else smoke_cfg
+                    )
+                except (OSError, ValueError) as exc:
+                    logger.debug("could not read %s: %s", dec_path, exc)
+            _shard_smoke[shard_root] = is_smoke
+
+        if _shard_smoke[shard_root]:
+            if shard_root.name not in skipped_smoke:
+                logger.info("skipping smoke shard: %s", shard_root.name)
+            skipped_smoke.add(shard_root.name)
             continue
 
         if method_filter and method not in method_filter:
@@ -173,8 +213,14 @@ def _discover_pred_files(
 
         results.append((method, cohort, nfe, p))
 
-    logger.info("discovered %d prediction files", len(results))
-    return results
+    skipped_smoke_shards = sorted(skipped_smoke)
+    logger.info(
+        "discovered %d prediction files; skipped %d smoke shards: %s",
+        len(results),
+        len(skipped_smoke_shards),
+        skipped_smoke_shards,
+    )
+    return results, skipped_smoke_shards
 
 
 def _read_pred_row(pred_path: Path, row_idx: int, *, ref_cache: ReferenceCache) -> dict[str, Any]:
@@ -303,7 +349,7 @@ class DownstreamSegEngine:
         sel_nfe: dict[str, int] = dict(SELECTION_NFE)
 
         # Discover prediction files
-        pred_files = _discover_pred_files(
+        pred_files, skipped_smoke_shards = _discover_pred_files(
             self.cfg.inference_root,
             method_filter=self.cfg.methods,
             cohort_filter=self.cfg.cohorts,
@@ -527,6 +573,7 @@ class DownstreamSegEngine:
             "n_scans_processed": n_scans_processed,
             "n_real_arm_unique_calls": n_real_arm_unique,
             "n_rows_csv": len(df),
+            "skipped_smoke_shards": skipped_smoke_shards,
             "skipped_cohorts_no_corpus": sorted(skipped_no_corpus),
             "skipped_scans_n": len(skipped_no_scan),
             "wall_clock_s": round(wall_clock_s, 1),
