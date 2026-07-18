@@ -9,7 +9,7 @@
 #SBATCH --partition=cpu_partition
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
-#SBATCH --time=0-04:00:00
+#SBATCH --time=0-16:00:00
 #SBATCH --constraint=cpu
 set -eo pipefail
 
