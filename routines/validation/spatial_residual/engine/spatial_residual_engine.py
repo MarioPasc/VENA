@@ -1,8 +1,10 @@
 """Engine for the spatial_residual validation routine (§4.3).
 
-Shardable by (method, cohort, nfe): pass ``methods``/``cohorts``/``nfes``
-filters in the YAML to restrict the sweep to one slice, then merge the per_scan
-CSVs from each shard before running aggregate_patient_tests.
+Shardable by (method, cohort, nfe): the SLURM sweep runs one shard per
+(method, cohort) prediction file (at that method's selection_nfe), then merges
+all shard_*.csv files via ``cli_merge`` before calling ``run_postprocess``.
+The monolithic ``run()`` path computes all shards in a single process and calls
+``run_postprocess`` internally — the two paths produce byte-identical per_scan rows.
 
 Design notes
 ------------
@@ -12,6 +14,9 @@ Design notes
 - No GPU dependencies — pure NumPy / SciPy / sklearn.
 - References are resolved from the ``references_h5`` attr baked into each
   prediction H5; no separate ``reference_cache`` path is needed in the config.
+- ``run_postprocess`` is the single merge point: patient collapse, Holm
+  correction, figures, report.md, decision.json, and LATEST symlink.  Never
+  call any of those downstream steps per shard.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -144,6 +150,12 @@ class SpatialResidualEngine:
     def run(self) -> Path:
         """Execute the spatial residual analysis and write artifacts.
 
+        Monolithic single-process path: iterates over all prediction files,
+        computes per-scan rows, then delegates to :meth:`run_postprocess` for
+        patient collapse, statistics, figures, and artifact writing.  Produces
+        byte-identical per_scan rows to the shard→merge pipeline on the same
+        inputs.
+
         Returns
         -------
         Path
@@ -152,6 +164,7 @@ class SpatialResidualEngine:
         cfg = self._cfg
         _setup_logging(cfg.log_level)
 
+        t_start = time.perf_counter()
         inference_root = Path(cfg.inference_root)
         output_root = Path(cfg.output_root)
 
@@ -183,9 +196,6 @@ class SpatialResidualEngine:
         run_dir = make_run_dir(output_root, "spatial_residual")
         logger.info("Run dir: %s", run_dir)
 
-        # Persist config for reproducibility.
-        _persist_config(run_dir, cfg)
-
         # Shared reference cache — one ReferenceCache amortises repeated reads
         # across 16 methods that share the same cohort reference file.
         ref_cache = ReferenceCache(maxsize=40)
@@ -196,7 +206,6 @@ class SpatialResidualEngine:
 
         # Main scan loop: iterate over every pred file in the filtered index.
         rows: list[dict] = []
-        n_empty_region = 0
         n_scans_done = 0
 
         for _, row in index.iterrows():
@@ -214,10 +223,6 @@ class SpatialResidualEngine:
                 rows.extend(scan_rows)
                 n_scans_done += 1
 
-                for r in scan_rows:
-                    if r.get("n_voxels_region", 1) == 0:
-                        n_empty_region += 1
-
                 if cfg.scan_limit and n_scans_done >= cfg.scan_limit:
                     logger.info("scan_limit=%d reached; stopping.", cfg.scan_limit)
                     break
@@ -229,10 +234,9 @@ class SpatialResidualEngine:
                 logger.info("Processed %d scans …", n_scans_done)
 
         logger.info(
-            "Scan loop done: %d scans, %d rows, %d empty-region NaN rows",
+            "Scan loop done: %d scans, %d rows",
             n_scans_done,
             len(rows),
-            n_empty_region,
         )
 
         if not rows:
@@ -240,8 +244,85 @@ class SpatialResidualEngine:
                 "No rows produced. Check prediction file schema and reference resolution."
             )
 
-        # D3: Write per-scan CSV into per_scan/ (not tables/).
         per_scan_df = pd.DataFrame(rows, columns=SPATIAL_CSV_COLUMNS)
+        elapsed_s = time.perf_counter() - t_start
+
+        return self.run_postprocess(
+            run_dir,
+            per_scan_df=per_scan_df,
+            n_files=len(index),
+            n_scans=n_scans_done,
+            elapsed_s=elapsed_s,
+            skipped_smoke_shards=shard_discovery.skipped_smoke,
+        )
+
+    def run_postprocess(
+        self,
+        run_dir: Path,
+        *,
+        per_scan_df: pd.DataFrame,
+        n_files: int,
+        n_scans: int,
+        elapsed_s: float,
+        skipped_smoke_shards: list[str],
+    ) -> Path:
+        """Run the analysis phase from a pre-collected per-scan DataFrame.
+
+        Called by :meth:`run` (monolithic single-process) and by ``cli_merge``
+        after concatenating sweep shards.  Patient collapse, Holm correction,
+        figures, report.md, decision.json, and the LATEST symlink all happen
+        exactly once here — never per shard.
+
+        Parameters
+        ----------
+        run_dir :
+            Destination artifact directory (already created by the caller via
+            :func:`~vena.validation.artifacts.make_run_dir`).
+        per_scan_df :
+            Concatenated per-scan rows (columns = SPATIAL_CSV_COLUMNS).
+        n_files :
+            Number of prediction files (or shard CSVs) consumed upstream.
+        n_scans :
+            Unique scan count (used in decision.json; equals
+            ``per_scan_df["scan_id"].nunique()`` when scan_id is present).
+        elapsed_s :
+            Wall-clock seconds for the upstream work (scan loop or shard concat).
+        skipped_smoke_shards :
+            Shard tags excluded by ``discover_shards`` (§3.1 audit — passed
+            through to decision.json so the artifact is self-auditing).
+
+        Returns
+        -------
+        Path
+            The artifact directory (same as *run_dir*).
+        """
+        cfg = self._cfg
+
+        if per_scan_df.empty:
+            raise SpatialResidualError(
+                "per_scan_df is empty — nothing to analyse.  "
+                "Check that prediction files contain valid scan data."
+            )
+
+        # Persist config so the artifact is self-contained regardless of which
+        # path (monolithic or merge) produced it.
+        _persist_config(run_dir, cfg)
+
+        # Derive n_empty_region from per_scan_df instead of tracking it in the
+        # scan loop — so both the monolithic and merge paths agree.
+        n_empty_region = (
+            int((per_scan_df["n_voxels_region"] == 0).sum())
+            if "n_voxels_region" in per_scan_df.columns
+            else 0
+        )
+        logger.info(
+            "run_postprocess: %d rows, %d scans, %d empty-region NaN rows",
+            len(per_scan_df),
+            n_scans,
+            n_empty_region,
+        )
+
+        # D3: Write per-scan CSV into per_scan/ (not tables/).
         per_scan_csv = run_dir / "per_scan" / "spatial_residual.csv"
         per_scan_df.to_csv(per_scan_csv, index=False)
         logger.info("per_scan/spatial_residual.csv: %d rows → %s", len(per_scan_df), per_scan_csv)
@@ -256,6 +337,18 @@ class SpatialResidualEngine:
             }
         else:
             pred_mode_counts = {}
+
+        # Derive cohorts/methods from data — self-describing, no hard-coded list.
+        cohorts_analysed = (
+            sorted(per_scan_df["cohort"].unique().tolist())
+            if "cohort" in per_scan_df.columns
+            else []
+        )
+        methods_analysed = (
+            sorted(per_scan_df["method"].unique().tolist())
+            if "method" in per_scan_df.columns
+            else []
+        )
 
         # Aggregate tests — non-blocking; a partial sweep (not all 8 competitors)
         # triggers a family-size WARNING inside aggregate_patient_tests.
@@ -287,17 +380,22 @@ class SpatialResidualEngine:
             "produced_at": datetime.now(UTC).isoformat(),
             "producer": _PRODUCER,
             "git_sha": _git_sha(),  # D4: uses repo-root anchor, not cwd
-            "inference_root": str(inference_root),
-            "n_pred_files": len(index),
-            "n_scans": n_scans_done,
-            "n_rows": len(rows),
+            "inference_root": cfg.inference_root,
+            "n_pred_files": n_files,
+            "n_scans": n_scans,
+            "n_rows": len(per_scan_df),
             "n_empty_region": n_empty_region,
+            "elapsed_s": elapsed_s,
             "dilate_k": cfg.dilate_k,
             "n_shuffles": cfg.n_shuffles,
             "n_boot": cfg.n_boot,
             "rng_seed": cfg.rng_seed,
             "mi_n_voxels": cfg.mi_n_voxels,
             "vena_method": cfg.vena_method,
+            # §4.2 — both shuffle domains always computed (within-brain and within-R).
+            "shuffle_domains": ["brain", "R"],
+            "cohorts_analysed": cohorts_analysed,
+            "methods_analysed": methods_analysed,
             "n_wilcoxon_tests": len(test_results),
             # D2: scoring-space provenance (SHARED_CONTRACTS §7.0).
             "pred_mode_counts_by_method": pred_mode_counts,
@@ -307,7 +405,7 @@ class SpatialResidualEngine:
                 "Not a hard-coded method list — works for future BraTS-PED/competitor shards."
             ),
             # D2: smoke shard audit (SHARED_CONTRACTS §3.1).
-            "skipped_smoke_shards": shard_discovery.skipped_smoke,
+            "skipped_smoke_shards": skipped_smoke_shards,
         }
         write_decision_json(run_dir, decision)
         symlink_latest(run_dir)
