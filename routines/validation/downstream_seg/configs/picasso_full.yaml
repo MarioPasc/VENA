@@ -1,0 +1,46 @@
+# Downstream-seg FULL SWEEP config (§4.4) — all 16 methods × all 9 cohorts.
+#
+# Single monolithic GPU job: the engine computes the real arm ONCE per scan
+# and reuses it across every method (n_real_arm_unique_calls == n_scans), so the
+# full sweep is ~727 real + 16×727 synth ≈ 12.4k segmenter passes (~7 GPU-h on
+# one A100). No sharding/merge needed — the engine does the full patient-collapse
+# + Holm aggregate in one run.
+#
+# selection_nfe_only: true → each method scored only at its pre-registered NFE.
+# VENA-S1-v3a is included so the oracle-mask confound (§4b) is reported next to
+# every VENA-S1-v3b-rw number.
+#
+# Run from fscratch/repos/VENA-validation (a real git repo) so git_sha resolves.
+# Corpus H5 paths verified on Picasso 2026-07-18: all carry masks/tumor with a
+# label_system attr (UCSF-PDGM/UPENN-GBM/IvyGAP/REMBRANDT = BraTS2021 {1,2,4};
+# LUMIERE/BraTS-Africa-*/BraTS-PED = BraTS2023 {1,2,3}). BraTS-PED additionally
+# carries stray label 4 — its Ring-B ET-Dice is interpretation-limited anyway
+# (BraTS-pretrained instrument degrades on pediatric OOD, §5).
+
+inference_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+output_root:    /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference/analyses
+
+bundle_path:    /mnt/home/users/tic_163_uma/mpascual/fscratch/bundles/brats_mri_segmentation
+
+corpus_map:
+  UCSF-PDGM:            /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSF_PDGM/h5/UCSFPDGM_image.h5
+  BraTS-GLI:            /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_image.h5
+  UPENN-GBM:           /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/upenn_gbm/h5/UPENN-GBM_image.h5
+  IvyGAP:              /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/ivy_gap/h5/IvyGAP_image.h5
+  LUMIERE:             /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/lumiere/h5/LUMIERE_image.h5
+  REMBRANDT:           /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/rembrandt/h5/REMBRANDT_image.h5
+  BraTS-Africa-Glioma: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/brats_africa_glioma/h5/BraTS_Africa_glioma_image.h5
+  BraTS-Africa-Other:  /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/brats_africa_other/h5/BraTS_Africa_other_image.h5
+  BraTS-PED:           /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/brats_ped/h5/BraTS_PED_image.h5
+
+ring_partitions_path: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference/analyses/preregister/LATEST/ring_partitions.json
+
+# Empty = all discovered methods / all cohorts with a corpus_map entry.
+methods: []
+cohorts: []
+
+device: cuda:0
+amp:    true
+selection_nfe_only: true
+
+log_level: INFO
