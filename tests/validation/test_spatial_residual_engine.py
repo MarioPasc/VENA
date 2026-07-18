@@ -300,3 +300,129 @@ def test_engine_lumiere_collapse(synth_shard: Path, tmp_path: Path) -> None:
         f"collapse_to_patient must yield 3 unique patients from LUMIERE 5 scans; "
         f"got {patient_df['patient_id'].nunique()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Shard → merge equivalence test
+# ---------------------------------------------------------------------------
+
+
+def test_shard_merge_reproduces_monolithic(synth_shard: Path, tmp_path: Path) -> None:
+    """Shard→merge pipeline must produce identical per_scan rows to monolithic run().
+
+    Strategy: run monolithic engine (VENA-S1-v3b-rw only, nfe=5) and compare its
+    per_scan/spatial_residual.csv against the output of the shard→merge API path
+    (build_index → per-file compute_scan_rows → concat → run_postprocess).
+
+    The synth_shard only contains nfe=5 for both methods.  VENA-S1-v3b-rw has
+    selection_nfe=5; C0-Identity has selection_nfe=1.  The equivalence test therefore
+    exercises exactly the method that cli_manifest would include in the manifest.
+
+    Determinism guarantee: compute_scan_rows uses a fixed rng_seed per scan — not
+    accumulated state — so the order in which files are processed does not affect
+    the rows, and shard→merge with one-file-per-shard is byte-equivalent.
+    """
+    from routines.validation.spatial_residual.engine import (
+        SpatialResidualConfig,
+        SpatialResidualEngine,
+    )
+
+    from vena.validation.artifacts import make_run_dir
+    from vena.validation.io import ReferenceCache, build_index, iter_scans
+    from vena.validation.spatial_residual import SPATIAL_CSV_COLUMNS, compute_scan_rows
+
+    bench = tmp_path / "bench_equiv"
+    bench.mkdir()
+    (bench / "shard0").symlink_to(synth_shard)
+
+    cfg = SpatialResidualConfig(
+        inference_root=str(bench),
+        output_root=str(tmp_path / "artifacts_equiv"),
+        methods=["VENA-S1-v3b-rw"],
+        cohorts=None,
+        nfes=[5],
+        dilate_k=5,
+        n_shuffles=5,
+        n_boot=5,
+        rng_seed=42,
+        mi_n_voxels=500,
+        n_deciles=5,
+        vena_method="VENA-S1-v3b-rw",
+        scan_limit=None,
+        run_convergence_check=False,
+        log_level="WARNING",
+    )
+
+    # ---- Path A: monolithic run() ----
+    engine_a = SpatialResidualEngine(cfg)
+    run_dir_a = engine_a.run()
+    df_mono = pd.read_csv(run_dir_a / "per_scan" / "spatial_residual.csv")
+
+    # ---- Path B: shard→merge via API ----
+    # Simulate cli_manifest (filter to VENA-S1-v3b-rw@nfe=5 only).
+    index = build_index(bench)
+    index = index[(index["method"] == "VENA-S1-v3b-rw") & (index["nfe"] == 5)].copy()
+    assert len(index) > 0, "Index should have at least one VENA-S1-v3b-rw@nfe=5 file"
+
+    # Simulate cli_shard: one DataFrame per file.
+    ref_cache = ReferenceCache(maxsize=40)
+    shard_dfs: list[pd.DataFrame] = []
+    for _, row in index.iterrows():
+        shard_rows: list[dict] = []
+        for sample in iter_scans(Path(row["path"]), reference_cache=ref_cache):
+            shard_rows.extend(
+                compute_scan_rows(
+                    sample,
+                    dilate_k=cfg.dilate_k,
+                    n_shuffles=cfg.n_shuffles,
+                    n_boot=cfg.n_boot,
+                    rng_seed=cfg.rng_seed,
+                    mi_n_voxels=cfg.mi_n_voxels,
+                    n_deciles=cfg.n_deciles,
+                )
+            )
+        shard_dfs.append(pd.DataFrame(shard_rows, columns=SPATIAL_CSV_COLUMNS))
+
+    per_scan_merge = pd.concat(shard_dfs, ignore_index=True)
+
+    # Simulate cli_merge: create run_dir and call run_postprocess.
+
+    run_dir_b = make_run_dir(tmp_path / "artifacts_merge", "spatial_residual")
+    engine_b = SpatialResidualEngine(cfg)
+    engine_b.run_postprocess(
+        run_dir_b,
+        per_scan_df=per_scan_merge,
+        n_files=len(index),
+        n_scans=len(per_scan_merge) // 2,  # 2 rows per scan (C-WB + C-noT)
+        elapsed_s=0.0,
+        skipped_smoke_shards=[],
+    )
+    df_merge = pd.read_csv(run_dir_b / "per_scan" / "spatial_residual.csv")
+
+    # ---- Equivalence check ----
+    # Sort both DataFrames by a stable key to make the comparison order-independent.
+    sort_cols = ["method", "cohort", "scan_id", "condition"]
+    sort_cols_present = [c for c in sort_cols if c in df_mono.columns]
+
+    df_mono_sorted = df_mono.sort_values(sort_cols_present).reset_index(drop=True)
+    df_merge_sorted = df_merge.sort_values(sort_cols_present).reset_index(drop=True)
+
+    assert len(df_mono_sorted) == len(df_merge_sorted), (
+        f"Row count mismatch: monolithic={len(df_mono_sorted)}, merge={len(df_merge_sorted)}"
+    )
+
+    # Check every numeric column matches to float32 precision.
+    numeric_cols = df_mono_sorted.select_dtypes(include="number").columns.tolist()
+    for col in numeric_cols:
+        mono_vals = df_mono_sorted[col].values
+        merge_vals = df_merge_sorted[col].values
+        # Both NaN → pass; otherwise must be close.
+        both_nan = np.isnan(mono_vals) & np.isnan(merge_vals)
+        non_nan_mask = ~both_nan
+        if non_nan_mask.any():
+            np.testing.assert_allclose(
+                mono_vals[non_nan_mask],
+                merge_vals[non_nan_mask],
+                rtol=1e-5,
+                err_msg=f"Column '{col}' differs between monolithic and merge paths",
+            )

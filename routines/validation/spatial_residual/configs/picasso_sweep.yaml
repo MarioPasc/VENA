@@ -1,0 +1,39 @@
+# Spatial residual — FULL SWEEP on Picasso.
+#
+# This config drives the sharded sweep (manifest → shard array → merge).
+# The cli_manifest filters each method to its selection_nfe; the resulting
+# manifest has one task per (method, cohort) pair at selection_nfe.
+#
+# Do NOT use this config with the monolithic cli.py — it omits all NFE
+# filtering (nfes: null) and would process every prediction file.
+# For the monolithic smoke, use picasso_smoke.yaml.
+#
+# run_convergence_check: false — the convergence proof is in
+#   inference/analyses/spatial_residual/.../tables/shuffle_convergence.json
+#   from the 2026-07-16 local smoke; re-running on every Picasso shard would
+#   waste CPU and read the first scan of each file redundantly.
+
+inference_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/inference
+output_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/spatial_residual_sweep/analyses
+
+# --- Grid filters: null = the whole grid.
+# cli_manifest reduces to one row per method at selection_nfe.
+# cli_shard does not filter; it processes whichever file the manifest row points at.
+methods: null
+cohorts: null
+nfes: null
+
+# --- Region / residual parameters (must match across all runs — a change = rerun everything)
+dilate_k: 5
+n_shuffles: 200
+n_boot: 1000
+rng_seed: 42
+mi_n_voxels: 30000
+n_deciles: 10
+
+vena_method: VENA-S1-v3b-rw
+
+scan_limit: null
+run_convergence_check: false
+
+log_level: INFO
