@@ -369,3 +369,66 @@ def test_n_pairs_positive_for_c5_rflow() -> None:
             f"D1 regression: n_pairs=0 for C5-T1C-RFlow / {r.stat_name}. "
             "The _filter_to_selection_nfe fix has regressed."
         )
+
+
+def test_holm_families_partitioned_by_role() -> None:
+    """Holm families follow registry.method_role, not "every present method".
+
+    2026-07-19 fix: the competitor family (role="family") and the ablation family
+    (role="ablation") are Holm-corrected SEPARATELY; supplementary methods are
+    reported but never tested; the VENA reference arm is never tested against
+    itself.  The pre-fix behaviour lumped all 15 non-VENA methods into one
+    30-test family.
+    """
+    vena = "VENA-S1-v3b-rw"
+    # (method, selection_nfe, expected role)
+    methods = [
+        (vena, 5),
+        ("C0-Identity", 1),  # competitor
+        ("C5-T1C-RFlow", 5),  # competitor
+        ("VENA-S1-v3a", 5),  # ablation
+        ("VENA-S3-LPL-b2c", 5),  # ablation
+        ("C1-pGAN-t2", 1),  # supplementary
+        ("C3-SynDiff-t2", 4),  # supplementary
+    ]
+    rng = np.random.default_rng(1)
+    rows = []
+    for pid in [f"P{i:03d}" for i in range(12)]:
+        for method, nfe in methods:
+            rows.append(
+                {
+                    "scan_id": f"{pid}_{method}_nfe{nfe}",
+                    "patient_id": pid,
+                    "cohort": "UCSF-PDGM",
+                    "ring": "A",
+                    "condition": "C-noT",
+                    "method": method,
+                    "nfe": nfe,
+                    "rho_s": float(rng.uniform(0.0, 0.5)),
+                    "conc_01": float(rng.uniform(1.0, 4.0)),
+                    "conc_05": float(rng.uniform(1.0, 3.0)),
+                    "conc_10": float(rng.uniform(1.0, 2.0)),
+                    "delta_brain_rho": 0.0,
+                    "delta_brain_conc05": 0.0,
+                    "delta_R_rho": 0.0,
+                    "delta_R_conc05": 0.0,
+                }
+            )
+    df = pd.DataFrame(rows)
+    _, results = aggregate_patient_tests(df, vena_method=vena)
+
+    families: dict[str, set[str]] = {}
+    for r in results:
+        families.setdefault(r.competitor, set()).add(r.family)
+
+    assert families.get("C0-Identity") == {"competitor"}
+    assert families.get("C5-T1C-RFlow") == {"competitor"}
+    assert families.get("VENA-S1-v3a") == {"ablation"}
+    assert families.get("VENA-S3-LPL-b2c") == {"ablation"}
+    # Supplementary methods and the VENA reference arm are never tested.
+    assert "C1-pGAN-t2" not in families
+    assert "C3-SynDiff-t2" not in families
+    assert vena not in families
+    # Each tested method contributes exactly 2 tests (rho_s + conc_05).
+    for method in ("C0-Identity", "C5-T1C-RFlow", "VENA-S1-v3a", "VENA-S3-LPL-b2c"):
+        assert sum(1 for r in results if r.competitor == method) == 2

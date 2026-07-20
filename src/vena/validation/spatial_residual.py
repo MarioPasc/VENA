@@ -46,6 +46,7 @@ from sklearn.feature_selection import mutual_info_regression
 from vena.validation import registry
 from vena.validation.io import ScanSample
 from vena.validation.stats import (
+    HolmResult,
     SpearmanResult,
     bootstrap_ci,
     cliffs_delta,
@@ -73,6 +74,11 @@ _N_STATS: int = 2
 assert HOLM_FAMILY_SIZE == _N_COMPETITORS * _N_STATS, (
     f"HOLM_FAMILY_SIZE mismatch: {_N_COMPETITORS} × {_N_STATS} ≠ {HOLM_FAMILY_SIZE}"
 )
+
+#: The ablation family (VENA-S1-v3b, VENA-S1-v3a, VENA-S3-LPL-b2c) is a SEPARATE
+#: Holm family (proposal §4.3.4): 2 statistics × 3 ablations = 6 tests.
+_N_ABLATIONS: int = 3
+ABLATION_FAMILY_SIZE: int = _N_STATS * _N_ABLATIONS
 
 #: Quantile values for Conc(q).
 CONC_QUANTILES: tuple[float, ...] = (0.01, 0.05, 0.10)
@@ -737,6 +743,58 @@ class WilcoxonTestResult:
     reject: bool
     n_pairs: int
     cliffs_delta: float
+    #: Pre-registered Holm family this test belongs to: "competitor" (8-method
+    #: family, §4.3.4) or "ablation" (3-method family). Each family is Holm-
+    #: corrected independently; supplementary methods are never tested.
+    family: str = "competitor"
+
+
+def _run_wilcoxon_family(
+    patient_df: pd.DataFrame,
+    vena_pat: pd.DataFrame,
+    members: list[str],
+    stats_to_test: list[str],
+) -> tuple[list[tuple[str, str, float, int, float]], dict[str, HolmResult]]:
+    """Run VENA-vs-each-member paired Wilcoxon (× each stat), Holm within this family.
+
+    Parameters
+    ----------
+    patient_df :
+        Patient-collapsed DataFrame (all methods).
+    vena_pat :
+        VENA arm already filtered to its selection NFE and indexed by ``patient_id``.
+    members :
+        Methods in this ONE Holm family (competitors XOR ablations — never mixed).
+    stats_to_test :
+        Statistics to test, e.g. ``["rho_s", "conc_05"]``.
+
+    Returns
+    -------
+    (raw_results, holm)
+        ``raw_results``: list of ``(method, stat, pvalue_raw, n_pairs, cliffs_delta)``.
+        ``holm``: Holm-corrected results keyed ``"<method>::<stat>"`` — the
+        correction spans ONLY this family's p-values.
+    """
+    pvalue_dict: dict[str, float] = {}
+    raw_results: list[tuple[str, str, float, int, float]] = []
+    for comp in members:
+        comp_pat = _filter_to_selection_nfe(patient_df, comp).set_index("patient_id")
+        for stat in stats_to_test:
+            key = f"{comp}::{stat}"
+            try:
+                wx = paired_wilcoxon(vena_pat[stat].dropna(), comp_pat[stat].dropna())
+                pvalue_dict[key] = wx.pvalue
+                cd = cliffs_delta(
+                    vena_pat[stat].dropna().to_numpy(),
+                    comp_pat[stat].dropna().to_numpy(),
+                )
+                raw_results.append((comp, stat, wx.pvalue, wx.n, cd))
+            except (ValueError, KeyError) as exc:
+                logger.warning("Wilcoxon failed for %s / %s: %s", comp, stat, exc)
+                pvalue_dict[key] = float("nan")
+                raw_results.append((comp, stat, float("nan"), 0, float("nan")))
+    holm = holm_bonferroni({k: v for k, v in pvalue_dict.items() if np.isfinite(v)})
+    return raw_results, holm
 
 
 def aggregate_patient_tests(
@@ -746,10 +804,13 @@ def aggregate_patient_tests(
     condition: str = "C-noT",
     ring: str = "A",
 ) -> tuple[pd.DataFrame, list[WilcoxonTestResult]]:
-    """Collapse scans → patients, run Wilcoxon + Holm (family of 16).
+    """Collapse scans → patients, run Wilcoxon + Holm within pre-registered families.
 
-    Must be called with a DataFrame that includes VENA and all 8 competitors
-    for the assertion on family size to hold.
+    Non-VENA methods are partitioned by ``registry.method_role``: the
+    **competitor** family (8, role ``"family"``) and the **ablation** family
+    (3, role ``"ablation"``) are Holm-corrected SEPARATELY (proposal §4.3.4);
+    **supplementary** methods are reported in tables but never tested.  Each
+    returned :class:`WilcoxonTestResult` carries its ``family``.
 
     Parameters
     ----------
@@ -787,75 +848,61 @@ def aggregate_patient_tests(
         by=("method", "cohort", "ring", "nfe", "patient_id"),
     )
 
-    # Identify competitors present.
+    # Partition non-VENA methods by their PRE-REGISTERED role (proposal §4.3.4,
+    # SHARED_CONTRACTS §4.1).  The competitor family (8) and ablation family (3)
+    # are Holm-corrected SEPARATELY; supplementary methods are reported in tables
+    # but never enter a test family.  Lumping all present non-VENA methods into
+    # one family (the pre-2026-07-19 behaviour) Holm-corrected over 30 tests
+    # instead of 16 — over-conservative and NOT the pre-registered plan.
     methods_present = set(patient_df["method"].unique())
-    competitors = [m for m in methods_present if m != vena_method]
+    family_methods = sorted(
+        m for m in methods_present if m != vena_method and registry.method_role(m) == "family"
+    )
+    ablation_methods = sorted(
+        m for m in methods_present if m != vena_method and registry.method_role(m) == "ablation"
+    )
 
-    # Build Holm family: 2 stats × all present competitors.
     stats_to_test: list[str] = ["rho_s", "conc_05"]
-    pvalue_dict: dict[str, float] = {}
-    raw_results: list[tuple[str, str, float, int, float]] = []
 
-    # D1 fix: filter VENA and each competitor to their selection_nfe BEFORE
-    # indexing by patient_id.  Without this, methods with multiple NFE values
-    # produce duplicate patient_id index entries; vena.loc[common] then returns
-    # more rows than competitor.loc[common], making (v - c) a shape-mismatch
-    # that raises ValueError → silently caught → n_pairs=0.
-    # Fix: each arm contributes exactly one row per patient at its headline NFE.
+    # D1 fix: filter VENA to its selection_nfe BEFORE indexing by patient_id, so
+    # each arm contributes exactly one row per patient at its headline NFE (else
+    # multi-NFE methods duplicate the patient index and (v - c) is a shape
+    # mismatch → ValueError → silently caught → n_pairs=0).
     vena_pat = _filter_to_selection_nfe(patient_df, vena_method).set_index("patient_id")
 
-    for comp in competitors:
-        comp_pat = _filter_to_selection_nfe(patient_df, comp).set_index("patient_id")
-        for stat in stats_to_test:
-            key = f"{comp}::{stat}"
-            try:
-                wx = paired_wilcoxon(
-                    vena_pat[stat].dropna(),
-                    comp_pat[stat].dropna(),
-                )
-                pvalue_dict[key] = wx.pvalue
-                cd = cliffs_delta(
-                    vena_pat[stat].dropna().to_numpy(),
-                    comp_pat[stat].dropna().to_numpy(),
-                )
-                raw_results.append((comp, stat, wx.pvalue, wx.n, cd))
-            except (ValueError, KeyError) as exc:
-                logger.warning("Wilcoxon failed for %s / %s: %s", comp, stat, exc)
-                pvalue_dict[key] = float("nan")
-                raw_results.append((comp, stat, float("nan"), 0, float("nan")))
-
-    # Holm-Bonferroni correction.
-    holm = holm_bonferroni({k: v for k, v in pvalue_dict.items() if np.isfinite(v)})
-
     results: list[WilcoxonTestResult] = []
-    for comp, stat, praw, n_pairs, cd in raw_results:
-        key = f"{comp}::{stat}"
-        holm_r = holm.get(key)
-        results.append(
-            WilcoxonTestResult(
-                competitor=comp,
-                stat_name=stat,
-                condition=condition,
-                statistic=float("nan"),  # Wilcoxon statistic merged in pvalue_dict
-                pvalue_raw=praw,
-                pvalue_adj=holm_r.pvalue_adj if holm_r else float("nan"),
-                reject=holm_r.reject if holm_r else False,
-                n_pairs=n_pairs,
-                cliffs_delta=cd,
+    for family_name, members, expected in (
+        ("competitor", family_methods, HOLM_FAMILY_SIZE),
+        ("ablation", ablation_methods, ABLATION_FAMILY_SIZE),
+    ):
+        raw_results, holm = _run_wilcoxon_family(patient_df, vena_pat, members, stats_to_test)
+        n_finite = sum(1 for r in raw_results if np.isfinite(r[2]))
+        if n_finite != expected:
+            logger.warning(
+                "%s Holm family has %d finite tests (expected %d = %d stats × %d methods "
+                "present). Family assignment comes from registry.method_role.",
+                family_name,
+                n_finite,
+                expected,
+                _N_STATS,
+                len(members),
             )
-        )
-
-    # Diagnostic: warn if family size ≠ 16.
-    family_size = len([k for k in pvalue_dict if np.isfinite(pvalue_dict[k])])
-    if family_size != HOLM_FAMILY_SIZE:
-        logger.warning(
-            "Holm family has %d tests (expected %d = %d stats × %d competitors). "
-            "Ensure all 8 competitors are present before drawing conclusions.",
-            family_size,
-            HOLM_FAMILY_SIZE,
-            _N_STATS,
-            _N_COMPETITORS,
-        )
+        for comp, stat, praw, n_pairs, cd in raw_results:
+            holm_r = holm.get(f"{comp}::{stat}")
+            results.append(
+                WilcoxonTestResult(
+                    competitor=comp,
+                    stat_name=stat,
+                    condition=condition,
+                    statistic=float("nan"),  # Wilcoxon statistic merged in pvalue_dict
+                    pvalue_raw=praw,
+                    pvalue_adj=holm_r.pvalue_adj if holm_r else float("nan"),
+                    reject=holm_r.reject if holm_r else False,
+                    n_pairs=n_pairs,
+                    cliffs_delta=cd,
+                    family=family_name,
+                )
+            )
 
     return patient_df, results
 
