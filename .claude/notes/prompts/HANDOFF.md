@@ -1,8 +1,53 @@
 # VENA Phase-2 Validation — SESSION HANDOFF
 
-*Rewritten 2026-07-17 by the orchestrator at the end of the second session.
-The 2026-07-16 version is superseded; its §11 acceptance criteria are **all
-met**. Read this top to bottom before touching anything.*
+## 2026-07-19 UPDATE — §8 P0 (both remaining sweeps) is DONE
+
+The two sweeps §8 asked for are **run, verified, and archived** (byte-hash
+matched to `/media/.../results/fm/inference/analyses/`, README updated). Both ran
+from `picasso:fscratch/repos/VENA-validation` (real git_sha `2c57c9e`) — the
+`git_sha "unknown"` bug is closed.
+
+- **downstream_seg full** (`2026-07-18T15-58-58Z`): 144 files / 727 scans / 11,632
+  rows, 16 methods × 9 cohorts. Oracle confound on the full set: v3a (no mask)
+  ΔDice_ET **+0.472** vs v3b-rw (GT mask) **+0.093**; synth beats real T1c in
+  **27/242** patients for v3b-rw vs 9 for v3a. Dice_real medians sane (WT/TC 0.92,
+  ET 0.85). New: v3a degrades ET-Dice *less* than ResViT/pGAN/SynDiff — the latent
+  tier does better on downstream ET-Dice than on MAE.
+- **spatial_residual full** (LATEST `2026-07-20T08-41-41Z`, Holm-corrected): 144 files / 23,264 rows
+  (727×16×2 conditions), 9 cohorts, `n_shuffles=100 n_boot=0`. Shuffle null
+  verified (null ρ ≈ 0.0000 ∀ method). **VENA-S1-v3b-rw ρ_S=0.197 is the lowest of
+  the latent generative tier** (C4 0.725 / C5 0.506 / C6 0.459) and beats identity
+  (0.351) — the §4.3 vessel claim HOLDS. C4/C5/C6 > C0 on ρ_S is a real finding
+  (under-saturating latent methods worse than identity), not a bug. Conc(5%) does
+  not discriminate (C0 ≈ null), confirming §4f.
+
+**Spatial Holm family — FIXED 2026-07-20 (commit `cebc078`).** The 07-19 merge
+recorded `n_wilcoxon_tests: 30` (VENA vs all 15 methods, one over-conservative
+family). `aggregate_patient_tests` now partitions by `registry.method_role`:
+competitor family = 16 (8×2) Holm-corrected **separately** from the ablation
+family = 6 (3×2), supplementary excluded (`_run_wilcoxon_family` helper +
+`WilcoxonTestResult.family` + `test_holm_families_partitioned_by_role`). Re-merged
+on the **frozen** shards → corrected LATEST `spatial_residual/2026-07-20T08-41-41Z`
+(`n_wilcoxon_tests: 22`, `per_scan/` byte-identical to 07-19 → all ρ_S/Conc numbers
+unchanged, only p-value grouping corrected). Only remaining spatial gap: 2 of ~5
+spec figures — buildable from the same frozen CSV.
+
+**Ops (separate task this session):** Picasso HOME was over quota (452 GB / 286
+GB, 3-day grace). Freed by deleting the 290 GB non-PED prediction shards
+(`inference/picasso_shard_*`, byte-verified mirrored on local) + the stale
+`smoke_loginexa`. HOME now 0.16 TB, in quota. KEPT on Picasso: `picasso_ped_*`
+(165 GB BraTS-PED preds, Picasso-only), all analyses, spatial shards, fscratch
+corpus. `fscratch` is a separate filesystem — it never counted against HOME.
+
+**Folder/file scaffold — for a fast start, do NOT re-explore.** The predictions
+tree + H5 schema are in `results/fm/inference/README.md` (§1, §4); the
+`analyses/` per-routine artifact layout + the exact file inventory (which
+`per_scan`/`tables`/`figures` each of the 4 routines emits, where each lives on
+Picasso) is now in `results/fm/inference/analyses/README.md` → "Folder & file
+scaffold". Read `decision.json` in any `<routine>/<UTC>/` before scripting.
+
+*The rest of this file (2026-07-17, second session) remains current for the P1/P2
+items §8 still lists. Its §11 acceptance criteria are all met.*
 
 > Companion docs, still current: `01_SHARED_CONTRACTS.md` (verified facts +
 > traps — **still wins over every other doc**), `00_ORCHESTRATION.md`,
