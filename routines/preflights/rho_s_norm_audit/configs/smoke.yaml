@@ -1,0 +1,22 @@
+# ρ_S normalisation audit — smoke test (3 scans, fast import/logic check).
+#
+# Verifies: imports resolve, H5 reads work, compute_scan_rows runs,
+# decision.json emitted.  Not a scientific result.
+# Runtime: < 30 s.
+
+inference_root: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference
+
+frozen_csv_path: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference/analyses/spatial_residual/2026-07-20T08-41-41Z/per_scan/spatial_residual.csv
+
+output_root: /home/mpascual/research/code/VENA/artifacts
+
+image_h5_map:
+  UCSF-PDGM: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_image.h5
+
+methods: [VENA-S1-v3a]
+cohorts: [UCSF-PDGM]
+percentiles: [99.5]
+condition: C-noT
+ring: A
+scan_limit: 3
+log_level: DEBUG

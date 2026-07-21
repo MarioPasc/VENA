@@ -1,0 +1,28 @@
+# ρ_S normalisation audit — PILOT (UCSF-PDGM / VENA-S1-v3a / 10 scans).
+#
+# Purpose: reproduce the §14.3 swing before committing to the full run.
+# Expected results:
+#   P=99.5  (pred_harmonised vs real_harmonised): ρ_S should drop vs frozen 0.309
+#   P=99.95 (both re-normalised at 99.95):        ρ_S should approach ~0.0
+#
+# If ρ_S_P99.5 ≈ ρ_S_frozen → premise FALSE (harmonisation already applied).
+# If ρ_S_P99.5 << ρ_S_frozen → premise confirmed; proceed to full audit.
+#
+# Runtime: < 2 min locally (10 scans × 2 percentiles, no shuffle null).
+
+inference_root: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference
+
+frozen_csv_path: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference/analyses/spatial_residual/2026-07-20T08-41-41Z/per_scan/spatial_residual.csv
+
+output_root: /home/mpascual/research/code/VENA/artifacts
+
+image_h5_map:
+  UCSF-PDGM: /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_image.h5
+
+methods: [VENA-S1-v3a]
+cohorts: [UCSF-PDGM]
+percentiles: [99.5, 99.95]
+condition: C-noT
+ring: A
+scan_limit: 10
+log_level: INFO

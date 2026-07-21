@@ -1,0 +1,31 @@
+# ρ_S normalisation audit — full 16-method Ring-A run (local).
+#
+# Runtime: ~40 min on the local workstation (321 scans × 16 methods × 2
+# percentiles; n_shuffles=0 n_boot=0 → pure spearman, no permutation null).
+
+inference_root: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference
+
+frozen_csv_path: /media/mpascual/Sandisk2TB/research/vena/results/fm/inference/analyses/spatial_residual/2026-07-20T08-41-41Z/per_scan/spatial_residual.csv
+
+output_root: /home/mpascual/research/code/VENA/artifacts
+
+# Local image H5 paths — required for P=99.95 normalisation.
+image_h5_map:
+  UCSF-PDGM:          /media/mpascual/MeningD2/GLIOMA/UCSF_PDGM/h5/UCSFPDGM_image.h5
+  BraTS-GLI:          /media/mpascual/MeningD2/GLIOMA/BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_image.h5
+  IvyGAP:             /media/mpascual/MeningD2/GLIOMA/IVYGAP/h5/IvyGAP_image.h5
+  LUMIERE:            /media/mpascual/MeningD2/GLIOMA/LUMIERE/h5/LUMIERE_image.h5
+  REMBRANDT:          /media/mpascual/MeningD2/GLIOMA/REMBRANDT/h5/REMBRANDT_image.h5
+  UPENN-GBM:          /media/mpascual/MeningD2/GLIOMA/UPENN_GBM/h5/UPENN-GBM_image.h5
+
+# null = all 16 pre-registered methods
+methods: null
+
+# null = all Ring-A cohorts (BraTS-GLI, IvyGAP, LUMIERE, REMBRANDT, UCSF-PDGM, UPENN-GBM)
+cohorts: null
+
+percentiles: [99.5, 99.95]
+condition: C-noT
+ring: A
+scan_limit: null
+log_level: INFO
