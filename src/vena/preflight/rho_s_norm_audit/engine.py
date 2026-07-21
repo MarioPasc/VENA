@@ -41,12 +41,13 @@ import h5py
 import numpy as np
 import pandas as pd
 import torch
+from scipy import stats as _scipy_stats
+from scipy.ndimage import binary_dilation
 
 from vena.common import percentile_normalise
 from vena.validation.artifacts import make_run_dir, symlink_latest, write_decision_json
 from vena.validation.io import ReferenceCache, ScanSample, iter_scans
 from vena.validation.registry import METHOD_SPECS, SELECTION_NFE
-from vena.validation.spatial_residual import SPATIAL_CSV_COLUMNS, compute_scan_rows
 
 from .config import RhoSNormAuditConfig
 
@@ -152,6 +153,79 @@ def _force_normalise(
 
 
 # ---------------------------------------------------------------------------
+# Fast ρ_S computation (Spearman only, no KSG MI, no bootstrap/shuffle)
+# ---------------------------------------------------------------------------
+
+#: Voxel subsample cap for Spearman.  100k gives stable ρ_S estimates
+#: (SE < 0.01 for N=100k, ρ≈0.3) in < 50 ms; KSG MI at 30k takes ~2.5 s.
+_SPEARMAN_N_SUB: int = 100_000
+
+_RHO_ROW_COLUMNS: list[str] = ["method", "patient_id", "scan_id", "cohort", "condition", "rho_s"]
+
+
+def _fast_rho_rows(
+    sample: ScanSample,
+    dilate_k: int = 5,
+    n_sub: int = _SPEARMAN_N_SUB,
+    rng: np.random.Generator | None = None,
+) -> list[dict]:
+    """Return two minimal rows (C-WB, C-noT) with Spearman ρ_S.
+
+    Skips KSG MI, bootstrap CI, and shuffle null — this preflight only needs
+    ρ_S to quantify the normalisation confound.  Subsamples to *n_sub* voxels
+    to keep each call < 50 ms (vs ~2.5 s with KSG MI).
+
+    Parameters
+    ----------
+    sample :
+        Normalisation-forced ScanSample with ``pred`` and ``real`` at the
+        same percentile.
+    dilate_k :
+        WT binary-dilation kernel size (odd integer).
+    n_sub :
+        Maximum voxel count passed to Spearman.  ``None`` = no subsampling.
+    rng :
+        Optional NumPy random generator.  Created fresh if ``None``.
+
+    Returns
+    -------
+    list[dict]
+        Two rows with keys in ``_RHO_ROW_COLUMNS``.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    brain = sample.brain.astype(bool)
+    wt = sample.wt.astype(bool)
+
+    abs_resid = np.abs(sample.real.astype(np.float64) - sample.pred.astype(np.float64))
+    real_f64 = sample.real.astype(np.float64)
+
+    wt_dil = binary_dilation(wt, iterations=max(1, dilate_k // 2))
+    noT_mask = brain & ~wt_dil
+
+    def _rho(mask: np.ndarray) -> float:
+        idx = np.where(mask.ravel())[0]
+        if idx.size < 10:
+            return float("nan")
+        if n_sub is not None and idx.size > n_sub:
+            idx = rng.choice(idx, n_sub, replace=False)
+        r, _ = _scipy_stats.spearmanr(abs_resid.ravel()[idx], real_f64.ravel()[idx])
+        return float(r)
+
+    base = {
+        "method": sample.method,
+        "patient_id": sample.patient_id,
+        "scan_id": sample.scan_id,
+        "cohort": sample.cohort,
+    }
+    return [
+        {**base, "condition": "C-WB", "rho_s": _rho(brain)},
+        {**base, "condition": "C-noT", "rho_s": _rho(noT_mask)},
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Prediction H5 discovery
 # ---------------------------------------------------------------------------
 
@@ -231,7 +305,7 @@ def _collapse_patient_rho_s(rows: list[dict], condition: str) -> pd.DataFrame:
     pd.DataFrame
         Columns: method, patient_id, rho_s.  One row per (method, patient_id).
     """
-    df = pd.DataFrame(rows, columns=SPATIAL_CSV_COLUMNS)
+    df = pd.DataFrame(rows, columns=_RHO_ROW_COLUMNS)
     df = df[df["condition"] == condition].copy()
     agg = df.groupby(["method", "patient_id"], sort=False)["rho_s"].mean().reset_index()
     return agg
@@ -320,13 +394,9 @@ class RhoSNormAuditEngine:
                             "Skipping scan %s (P=%.2f): %s", sample.scan_id, percentile, exc
                         )
                         continue
-                    scan_rows = compute_scan_rows(
-                        forced,
-                        n_shuffles=0,
-                        n_boot=0,
-                        dilate_k=5,
-                        rng_seed=42,
-                    )
+                    # Fast Spearman-only path: skips KSG MI (~2.5 s/scan) and
+                    # shuffle/bootstrap null — this audit only needs ρ_S.
+                    scan_rows = _fast_rho_rows(forced, dilate_k=5)
                     rows_by_percentile[percentile].extend(scan_rows)
 
                 n_processed += 1
@@ -444,7 +514,7 @@ class RhoSNormAuditEngine:
         # Per-scan rows
         for p, rows in rows_by_percentile.items():
             if rows:
-                pd.DataFrame(rows, columns=SPATIAL_CSV_COLUMNS).to_csv(
+                pd.DataFrame(rows, columns=_RHO_ROW_COLUMNS).to_csv(
                     tables_dir / f"scan_rows_P{p}.csv", index=False
                 )
 
