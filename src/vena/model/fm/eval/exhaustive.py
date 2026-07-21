@@ -35,6 +35,7 @@ import numpy as np
 import torch
 
 from vena.model.autoencoder.maisi.preprocessing import (
+    ENCODER_PERCENTILE_UPPER,
     CropPadSpec,
     apply_crop_pad,
     percentile_normalise,
@@ -52,13 +53,13 @@ def load_real_t1c_normalised(
     patient_id: str,
     *,
     percentile_lower: float = 0.0,
-    percentile_upper: float = 99.5,
+    percentile_upper: float = ENCODER_PERCENTILE_UPPER,
     foreground_only: bool = True,
 ) -> torch.Tensor:
     """Load and normalise a patient's reference T1c from the image-domain H5.
 
     The normalisation mirrors the MAISI encoder exactly
-    (``percentile_normalise(lower=0, upper=99.5, foreground_only=True)`` over
+    (``percentile_normalise(lower=0, upper=99.95, foreground_only=True)`` over
     the skull-stripped brain foreground), so the decoded prediction (already in
     ``[0, 1]``) and the reference live in the same intensity space.
 
@@ -105,7 +106,7 @@ def load_real_t1c_box(
     crop_spec: CropPadSpec,
     *,
     percentile_lower: float = 0.0,
-    percentile_upper: float = 99.5,
+    percentile_upper: float = ENCODER_PERCENTILE_UPPER,
     foreground_only: bool = True,
 ) -> torch.Tensor:
     """Load, crop to the box, and normalise a patient's reference T1c.

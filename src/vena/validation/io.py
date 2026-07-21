@@ -29,13 +29,16 @@ import json
 import logging
 from collections import OrderedDict
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import h5py
 import numpy as np
 import pandas as pd
+import torch
+
+from vena.common import ENCODER_PERCENTILE_UPPER, percentile_normalise
 
 if TYPE_CHECKING:
     pass
@@ -197,6 +200,95 @@ def select_scoring_volume(
     if p995 <= SCORING_P995_MAX and float(b.min()) >= SCORING_MIN_FLOOR:
         return raw, "raw"
     return harmonised, "harmonised"
+
+
+def _decode_ids(f: h5py.File) -> list[str]:
+    """Decode an H5 ``ids`` dataset into Python strings."""
+    return [s.decode() if isinstance(s, bytes) else str(s) for s in f["ids"][:]]
+
+
+def harmonise_sample_to_percentile(
+    sample: ScanSample,
+    image_h5_map: dict[str, Path],
+    *,
+    percentile_upper: float = ENCODER_PERCENTILE_UPPER,
+) -> ScanSample:
+    """Return a copy of *sample* with ``pred`` and ``real`` in one intensity space.
+
+    Canonical re-normalisation for the analysis path, mirroring the encoder's
+    ``percentile_upper`` (default :data:`ENCODER_PERCENTILE_UPPER` = 99.95). The
+    stored ``reference/t1c_real_harmonised`` and
+    ``predictions/t1c_synthetic_harmonised`` are baked at **99.5**, while the
+    VAE-decoded ``pred_raw`` lives in the encoder's **99.95** space — scoring one
+    against the other is the 2026-07-21 ρ_S normalisation confound (99.5 saturates
+    the enhancing-rim/vessel tail). This forces both to *percentile_upper* over the
+    brain mask:
+
+    * ``99.5`` — return the stored harmonised fields unchanged (already at 99.5).
+    * ``99.95`` — re-normalise ``pred_raw`` at 99.95 **and** re-derive ``real`` from
+      the **raw** image-H5 ``images/t1c`` at 99.95 (the stored harmonised real is
+      clipped at 99.5 and cannot be un-clipped), keyed by ``scan_id`` then
+      ``patient_id``.
+
+    This is the single canonical implementation; the ``rho_s_norm_audit`` preflight's
+    ``_force_normalise`` mirrors it and should delegate here.
+
+    Parameters
+    ----------
+    sample :
+        A :class:`ScanSample` from :func:`iter_scans`.
+    image_h5_map :
+        ``cohort -> image-H5 path`` (raw ``images/t1c``). Consulted only for 99.95.
+    percentile_upper :
+        Target percentile; must be 99.5 or :data:`ENCODER_PERCENTILE_UPPER`.
+
+    Returns
+    -------
+    ScanSample
+        A frozen copy with ``pred`` and ``real`` replaced.
+
+    Raises
+    ------
+    ValueError
+        If *percentile_upper* is unsupported, or an ``image_h5_map`` entry is
+        missing for the 99.95 path.
+    KeyError
+        If neither ``scan_id`` nor ``patient_id`` is present in the image H5.
+    """
+    if abs(percentile_upper - 99.5) < 1e-3:
+        return replace(sample, pred=sample.pred_harmonised, real=sample.real)
+    if abs(percentile_upper - ENCODER_PERCENTILE_UPPER) >= 1e-3:
+        raise ValueError(
+            f"Unsupported percentile_upper {percentile_upper}; must be 99.5 or "
+            f"{ENCODER_PERCENTILE_UPPER}."
+        )
+
+    brain_t = torch.from_numpy(sample.brain.astype(np.float32))[None, None]
+    pred_t = torch.from_numpy(sample.pred_raw)[None, None]
+    new_pred = percentile_normalise(pred_t, upper=percentile_upper, mask=brain_t)[0, 0].numpy()
+
+    h5_path = image_h5_map.get(sample.cohort)
+    if h5_path is None:
+        raise ValueError(
+            f"percentile_upper={percentile_upper} requires an image_h5_map entry for "
+            f"cohort {sample.cohort!r} (raw images/t1c is needed — the stored "
+            "harmonised real is clipped at 99.5)."
+        )
+    with h5py.File(h5_path, "r") as f:
+        ids = _decode_ids(f)
+        idx = next(
+            (ids.index(lid) for lid in (sample.scan_id, sample.patient_id) if lid in ids),
+            None,
+        )
+        if idx is None:
+            raise KeyError(
+                f"Neither scan_id={sample.scan_id!r} nor patient_id="
+                f"{sample.patient_id!r} found in {h5_path}"
+            )
+        real_raw = np.asarray(f["images/t1c"][idx], dtype=np.float32)
+    real_t = torch.from_numpy(real_raw)[None, None]
+    new_real = percentile_normalise(real_t, upper=percentile_upper, mask=brain_t)[0, 0].numpy()
+    return replace(sample, pred=new_pred, real=new_real)
 
 
 # ---------------------------------------------------------------------------

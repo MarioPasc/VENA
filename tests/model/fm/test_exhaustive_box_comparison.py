@@ -284,6 +284,28 @@ def test_load_real_t1c_box_deterministic(tmp_path: Path) -> None:
     assert torch.allclose(a, b)
 
 
+@pytest.mark.unit
+def test_reference_t1c_default_percentile_matches_encoder() -> None:
+    """Guard against the 2026-07-21 ρ_S-audit confound: the reference-T1c
+    normalisation must default to the encoder's 99.95, never 99.5 (which
+    saturates the enhancing rim/vessel tail and mis-scores every val metric)."""
+    import inspect
+
+    from vena.model.fm.eval.exhaustive import (
+        ENCODER_PERCENTILE_UPPER,
+        load_real_t1c_box,
+        load_real_t1c_normalised,
+    )
+
+    assert ENCODER_PERCENTILE_UPPER == 99.95
+    for fn in (load_real_t1c_normalised, load_real_t1c_box):
+        default = inspect.signature(fn).parameters["percentile_upper"].default
+        assert default == 99.95, (
+            f"{fn.__name__} percentile_upper default {default!r} != 99.95 — "
+            "reverting to 99.5 reintroduces the normalisation confound"
+        )
+
+
 # ---------------------------------------------------------------------------
 # full_volume_psnr_ssim on box tensors
 # ---------------------------------------------------------------------------

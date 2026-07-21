@@ -52,6 +52,19 @@ class DepthPad:
     padded_depth: int
 
 
+#: Intensity percentile the frozen MAISI encoder used for EVERY production latent
+#: cache. All production encode configs set ``percentile_upper: 99.95``
+#: (``routines/encode/maisi/configs/picasso.yaml``, ``server3.yaml`` and every
+#: ``*_server3.yaml``); only the smoke/``default.yaml`` configs use 99.5. Confirmed
+#: by the 2026-07-21 ρ_S normalisation audit: a decode of the cached ``z_t1c`` is
+#: self-consistent at 99.95 (PSNR 29.5 dB, ρ_S≈0) but mismatched at 99.5 (20.9 dB,
+#: ρ_S 0.66, because 99.5 saturates the enhancing-rim/vessel tail). Any decode-vs-real
+#: comparison MUST normalise the reference at this percentile so the decoded prediction
+#: (99.95-latent space) and the reference share one intensity space. Do NOT revert to
+#: 99.5 — that reintroduces the audit's confound. Single source for eval + analysis.
+ENCODER_PERCENTILE_UPPER: float = 99.95
+
+
 def percentile_normalise(
     x: torch.Tensor,
     lower: float = 0.0,

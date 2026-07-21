@@ -13,7 +13,9 @@ Re-exports
 * :func:`load_autoencoder` — instantiate the frozen VAE with provenance.
 * :class:`AutoencoderHandle` — dataclass returned by ``load_autoencoder``.
 * :func:`percentile_normalise` — canonical intensity normalisation matching
-  the MAISI training transform (``lower=0`` / ``upper=99.5``).
+  the MAISI training transform (``lower=0``; production latent caches use
+  ``upper=99.95`` — see ``ENCODER_PERCENTILE_UPPER`` in
+  ``vena.model.fm.eval.exhaustive``; the smoke/default encode configs use 99.5).
 * :class:`DepthPad`, :func:`pad_depth_to_multiple_of`,
   :func:`crop_to_original` — depth-axis pad/crop helpers (used by the
   in-process training-time decode proxy).
@@ -47,6 +49,7 @@ from vena.model.autoencoder.maisi.decode import (
 )
 from vena.model.autoencoder.maisi.encode import EncodeResult, MaisiEncoder
 from vena.model.autoencoder.maisi.preprocessing import (
+    ENCODER_PERCENTILE_UPPER,
     CropPadSpec,
     apply_crop_pad,
     invert_crop_pad,
@@ -60,6 +63,7 @@ from .decode import (
 )
 
 __all__ = [
+    "ENCODER_PERCENTILE_UPPER",
     "LATENT_CHANNELS",
     "SPATIAL_COMPRESSION",
     "AutoencoderHandle",

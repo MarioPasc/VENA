@@ -515,3 +515,80 @@ def test_iter_scans_surfaces_pred_mode_and_raw_p995(pred_path: Path) -> None:
         # Synthetic fixtures are in [0, 1] → pred should alias pred_raw.
         assert s.pred_mode == "raw", "Synthetic volumes in [0,1] should select 'raw' mode"
         assert np.array_equal(s.pred, s.pred_raw)
+
+
+def _make_scan_sample() -> object:
+    """A minimal ScanSample with distinct pred_raw / stored-real for norm tests."""
+    from vena.validation.io import ScanSample
+
+    shape = (4, 4, 4)
+    ramp = np.linspace(0.0, 1.0, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+    brain = np.ones(shape, dtype=bool)
+    return ScanSample(
+        scan_id="SCAN-A",
+        patient_id="PID-A",
+        cohort="TestCohort",
+        ring="A",
+        method="VENA",
+        nfe=5,
+        pred=np.zeros(shape, np.float32),
+        pred_raw=ramp,  # VAE-space raw synthetic
+        pred_harmonised=np.full(shape, 0.5, np.float32),  # stored 99.5 field
+        pred_mode="raw",
+        raw_p995=0.9,
+        real=np.zeros(shape, np.float32),  # stored t1c_real_harmonised (99.5)
+        brain=brain,
+        wt=np.zeros(shape, bool),
+        inference_seconds=1.0,
+        peak_vram_mb=1.0,
+    )
+
+
+def _make_image_h5(path: Path) -> None:
+    """Image H5 with raw scanner-unit t1c (distinct from the stored harmonised real)."""
+    ramp = np.linspace(0.0, 2000.0, 4 * 4 * 4, dtype=np.float32).reshape(1, 4, 4, 4)
+    with h5py.File(path, "w") as f:
+        f.create_dataset("ids", data=np.array([b"SCAN-A"]))
+        f.create_dataset("images/t1c", data=ramp)
+
+
+def test_harmonise_sample_9995_renormalises_from_image_h5(tmp_path: Path) -> None:
+    """99.95 path re-derives real from the raw image H5, not the stored 99.5 field."""
+    from vena.common import ENCODER_PERCENTILE_UPPER
+    from vena.validation.io import harmonise_sample_to_percentile
+
+    assert ENCODER_PERCENTILE_UPPER == 99.95
+    sample = _make_scan_sample()
+    img = tmp_path / "img.h5"
+    _make_image_h5(img)
+
+    out = harmonise_sample_to_percentile(sample, {"TestCohort": img})  # default 99.95
+    # real is re-derived from the image H5 ramp → non-trivial in [0,1], NOT the zeros
+    # that were stored in sample.real.
+    assert float(out.real.min()) >= 0.0 and float(out.real.max()) <= 1.0
+    assert float(out.real.max()) == pytest.approx(1.0, abs=1e-4)
+    assert not np.array_equal(out.real, sample.real)
+    # pred re-normalised from pred_raw → [0,1].
+    assert float(out.pred.min()) >= 0.0 and float(out.pred.max()) <= 1.0
+    assert float(out.pred.max()) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_harmonise_sample_995_returns_stored_fields(tmp_path: Path) -> None:
+    """99.5 path returns the stored harmonised fields unchanged (no image H5 needed)."""
+    from vena.validation.io import harmonise_sample_to_percentile
+
+    sample = _make_scan_sample()
+    out = harmonise_sample_to_percentile(sample, {}, percentile_upper=99.5)
+    assert np.array_equal(out.pred, sample.pred_harmonised)
+    assert np.array_equal(out.real, sample.real)
+
+
+def test_harmonise_sample_rejects_bad_percentile_and_missing_map(tmp_path: Path) -> None:
+    """Unsupported percentile and a missing image-H5 entry both raise ValueError."""
+    from vena.validation.io import harmonise_sample_to_percentile
+
+    sample = _make_scan_sample()
+    with pytest.raises(ValueError, match=r"must be 99\.5"):
+        harmonise_sample_to_percentile(sample, {}, percentile_upper=95.0)
+    with pytest.raises(ValueError, match="image_h5_map entry"):
+        harmonise_sample_to_percentile(sample, {}, percentile_upper=99.95)
