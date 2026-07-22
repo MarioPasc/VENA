@@ -95,7 +95,7 @@ byte-identical.
 4. The T-13 oracle run YAML config-validates and builds the model (2-ch `[WT,NETC]` ControlNet, `conv_in`
    `in_channels` correct) in a loginexa/CPU smoke; a 2-step train loop runs.
 5. Every new H5 producer passes its `assert_*_valid`; every routine writes `decision.json` with a bumped
-   `schema_version`; the mask cache is `(2,60,60,40)` float32.
+   `schema_version`; the mask cache is `(2,48,56,48)` float32.
 6. Each task's own **Tests** section passes with the stated known-property assertions.
 
 ## Task-file template (every `NN_*.md` follows it)

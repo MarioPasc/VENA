@@ -5,6 +5,11 @@
 > `/orchestrate` §3 warns that transcribed stale numbers are the most dangerous kind. If a fact here is
 > contradicted by the code, **stop and report it**.
 
+> **🔴 ERRATUM (2026-07-22) — the served latent grid is `(48,56,48)`, NOT `(60,60,40)`.** Verified against Picasso
+> disk, the producer `data/h5/latent_domain/manifest.py`, and the v3a warm-start config. Every mask/cache is
+> `(2,48,56,48)`. Any `(60,60,40)` / `144000` in older revisions of this file or the task specs is stale; the code
+> is correct. See §Geometry below.
+
 ## Environment, paths, commands
 
 | What | Value |
@@ -52,11 +57,15 @@ Never `pip install -e .` from a worktree; the env is shared read-only.
 
 ## Geometry & normalization (LOAD-BEARING — audited)
 
-- **Served latent grid = `(60, 60, 40)`**, 4 channels (MAISI 4× spatial compression of ~`(240,240,155)`). Every
-  mask target, avg-pool output, and cached predicted mask is **`(2, 60, 60, 40)` float32**. The `(48,56,48)` /
-  `129024` figures in `../model_redesign_2026-07-21.md` (T-04) are **stale** — do not use them.
-- `rflow.base_img_size_numel = 129024 = 48×56×48 ≠ 60×60×40 = 144000` in the v3a config — a **timestep-transform
-  reference mismatch** to reconcile (task 20 flags it; only scales SD3 timestep weighting, effect ~1.12×).
+- **Served latent grid = `(48, 56, 48)`**, 4 channels (MAISI 4× compression of the `(192,224,192)` crop of
+  ~`(240,240,155)`; avg-pool stride 4). Every mask target, avg-pool output, and cached mask is **`(2, 48, 56, 48)`
+  float32**. **[CORRECTED 2026-07-22: the earlier `(60, 60, 40)` was a transcription error. Verified against Picasso
+  disk (`latents/* (N,4,48,56,48)`, `masks/tumor_latent (N,3,48,56,48)`), the producer
+  `data/h5/latent_domain/manifest.py` (`LATENT_SPATIAL=(48,56,48)`, `LATENT_CROP_BOX=(192,224,192)`), and the v3a
+  warm-start config. `(48,56,48)` is CORRECT; `(60,60,40)=144000` is the stale value.]**
+- `rflow.base_img_size_numel = 129024 = 48×56×48` in the v3a config — this **matches** the served latent grid
+  (CORRECT; there is **no** grid mismatch to reconcile — the earlier `(60,60,40)=144000` claim was the error). It
+  only scales SD3 resolution-aware timestep weighting.
 - **Intensity norm is 99.95 canonical** for the VAE/latent path (`percentile_normalise(lower=0, upper=99.95,
   foreground_only=True)` on skull-stripped brain foreground). The **segmenter** is a separate world: it works in
   **image space** with **z-score-on-brain** (nonzero, channel-wise; the `downstream_seg` convention) and never
@@ -73,17 +82,17 @@ Never `pip install -e .` from a worktree; the env is shared read-only.
 
 ## Latent H5 schema (what the generator DataModule consumes) — verify in `src/vena/data/h5/`
 
-- Per-cohort latent H5 groups today: `latents/*` (per modality), `masks/tumor_latent` **`(N, 3, 60, 60, 40)`
+- Per-cohort latent H5 groups today: `latents/*` (per modality), `masks/tumor_latent` **`(N, 3, 48, 56, 48)`
   float32 = soft `[NETC, ED, ET]`**, `masks/brain_latent` `(N, 1, …)` int8 (when encoded). Root attrs incl.
   `vae_checkpoint_sha256`. The image-domain H5 carries `images/*`, `masks/{tumor,brain}`, `splits/*`, `metadata/*`.
-- **New group to add (task 18):** `masks/tumor_latent_pred` **`(N, 2, 60, 60, 40)`** float32 = soft `[WT, NETC]`
+- **New group to add (task 18):** `masks/tumor_latent_pred` **`(N, 2, 48, 56, 48)`** float32 = soft `[WT, NETC]`
   predicted, + a `predicted_mask_seg_sha256` root attr, + a `schema_version` bump. Written **beside**
   `masks/tumor_latent` (oracle), never replacing it. Reuse the shared writer/validator under
   `src/vena/data/h5/shared/` and the augmented latent path `src/vena/data/h5/augmented/latent_domain.py`.
 
 ## DataModule batch keys (verify in `src/vena/model/fm/lightning/data.py`)
 
-`patient_id`; `z_t1pre, z_t2, z_flair, z_t1c` `(4,60,60,40)`; `m_wt` `(1,…)` **binary** (0.5-threshold of the soft
+`patient_id`; `z_t1pre, z_t2, z_flair, z_t1c` `(4,48,56,48)`; `m_wt` `(1,…)` **binary** (0.5-threshold of the soft
 union); `m_tumor` `(3,…)` soft `[NETC,ED,ET]`; `m_netc/m_ed/m_et` `(1,…)` views; `m_brain` `(1,…)` when present.
 **`m_wt_soft` does NOT exist yet — task 20 adds it** = `clip(Σ m_tumor, 0, 1)` (the pre-threshold soft union).
 

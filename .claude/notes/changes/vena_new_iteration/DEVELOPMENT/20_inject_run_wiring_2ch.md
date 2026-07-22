@@ -11,7 +11,7 @@ correctly, and author the run + loginexa-smoke YAMLs. Design authority: Part A /
 
 ## Read and verify first
 - `01_SHARED_CONTRACTS.md` (ControlNet contract; v3a config; grid; warm-start caveat).
-- Task 19's cache group `masks/tumor_latent_soft (N,2,60,60,40)` (channel 0 = WT_soft, 1 = NETC_soft).
+- Task 19's cache group `masks/tumor_latent_soft (N,2,48,56,48)` (channel 0 = WT_soft, 1 = NETC_soft).
 - `src/vena/model/fm/lightning/data.py` (mask serving), `controlnet/` (assembler/specs/downsamplers),
   `lightning/module.py` (`_trunk_forward`), `maisi/maisi_controlnet.py` (`conditioning_in_channels`,
   `controlnet_cond_embedding`).
@@ -29,7 +29,7 @@ CREATE routines/fm/train/configs/smoke/loginexa_v3a+cn[WT,NETC]_2ep.yaml        
 ## Interface & contract
 - **Serving**: `data.mask_source ∈ {oracle_soft, predicted}` selects the H5 group (`masks/tumor_latent_soft` vs
   `masks/tumor_latent_pred`); the DataModule serves `batch["m_wt_soft"]` = group[:,0:1] and
-  `batch["m_netc_soft"]` = group[:,1:2], each `(1,60,60,40)`. **Fallback** (if the soft cache is absent): derive
+  `batch["m_netc_soft"]` = group[:,1:2], each `(1,48,56,48)`. **Fallback** (if the soft cache is absent): derive
   `m_wt_soft = clip(Σ m_tumor,0,1)` on the fly and log a WARNING (so a run never silently trains on a missing
   mask). The oracle and predicted paths differ **only** by `mask_source` — the swap guarantee (task 19) end-to-end.
 - **Conditioning**: `model.controlnet.conditioning_inputs: [mask:wt_soft:identity, mask:netc_soft:identity]` →
@@ -46,11 +46,12 @@ CREATE routines/fm/train/configs/smoke/loginexa_v3a+cn[WT,NETC]_2ep.yaml        
   - **J1–J4** — `trunk.trainable: true` (joint-low-LR + trunk-EMA), `region_weights:{brain:1,wt:1|5|10|20}` — the
     ceiling + WT-up-weight sweep; **need v3a's `trunk_ema_snapshot.pt`** on Picasso. Siblings of J0 differing by two
     keys; `region_weights` comes from task 21.
-- **base_img_size_numel**: leave v3a's value; **add a YAML comment flagging the `(60,60,40)` vs `129024` mismatch
-  (A.8-§6)** and raise it in the report — do NOT silently "fix" the timestep-transform reference.
+- **base_img_size_numel**: leave v3a's value `129024`. **It is CORRECT: `129024 = 48×56×48` = the served latent
+  grid** — there is NO `(60,60,40)` mismatch (that was a stale-doc transcription error, corrected 2026-07-22 after
+  verifying disk + producer + v3a config). No reconciliation needed; a brief confirming YAML comment is fine.
 
 ## Acceptance criteria
-1. With `mask_source: oracle_soft`, `batch["m_wt_soft"]`/`batch["m_netc_soft"]` present `(1,60,60,40)` ∈ [0,1] and
+1. With `mask_source: oracle_soft`, `batch["m_wt_soft"]`/`batch["m_netc_soft"]` present `(1,48,56,48)` ∈ [0,1] and
    read from `masks/tumor_latent_soft`; `NETC_soft ≤ WT_soft`.
 2. Assembler from `[mask:wt_soft:identity, mask:netc_soft:identity]` → mask-part `total_channels == 2`; ControlNet
    `conditioning_in_channels == 2`.
