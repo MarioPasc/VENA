@@ -227,12 +227,13 @@ class ValidateMasksEngine:
         # Per-patient QC figures
         for pv in patient_views:
             lat_mask = mask_latents_dict[pv.patient_id]  # (2, 48, 56, 48)
-            # Hard mask: binarise WT channel of soft mask at image resolution
-            hard_mask = (pv.soft_mask[0] > 0.5).astype(np.int32)
             fig_path = figures_dir / f"qc_{pv.patient_id}.png"
             render_mask_qc(
                 image=pv.t1pre,
-                hard_mask=hard_mask,
+                # Pass the true integer label so render_mask_qc's ndim==3 branch
+                # uses WT=(label>0) and NETC=(label==1) — not the WT binary
+                # (which would make label==1 select the entire WT region).
+                hard_mask=pv.hard_label,
                 soft_mask_img=pv.soft_mask,
                 soft_mask_latent=lat_mask,
                 patient_id=pv.patient_id,
@@ -243,7 +244,7 @@ class ValidateMasksEngine:
 
         # Montage figure
         montage_path = figures_dir / "montage.png"
-        render_slice_montage(patient_views, n_cols=5, alpha=0.7, path=montage_path)
+        render_slice_montage(patient_views, n_cols=10, alpha=0.6, path=montage_path)
         figure_paths.append(montage_path)
 
         # Latent-embedding figure (only when >= 3 patients for PCA to be meaningful)
@@ -410,6 +411,7 @@ class ValidateMasksEngine:
                 patient_id=scan_id,
                 t1pre=t1pre,
                 soft_mask=soft_img,
+                hard_label=label,  # true integer label; render_mask_qc uses label==1 for NETC
                 tumor_volume=tumor_vol,
                 cohort=cohort,
             )

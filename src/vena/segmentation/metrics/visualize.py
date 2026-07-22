@@ -45,6 +45,15 @@ logger = logging.getLogger(__name__)
 _EMPTY_MASK_THRESHOLD: float = 0.01
 _NETC_VIOLATION_EPSILON: float = 1e-6
 
+# High-contrast overlay colours: WT = saturated green; NETC = saturated magenta.
+# Chosen to read clearly on greyscale MRI and to be mutually distinct (no blend
+# with bright anatomy the way hot/cool colormaps do at low probability).
+_WT_COLOR: tuple[float, float, float] = (0.1, 0.9, 0.2)
+_NETC_COLOR: tuple[float, float, float] = (1.0, 0.1, 0.6)
+_COLORS: tuple[tuple[float, float, float], ...] = (_WT_COLOR, _NETC_COLOR)
+_CONTOUR_LEVELS: list[float] = [0.25, 0.5, 0.75]
+_CONTOUR_LW: float = 0.6
+
 
 def _to_numpy(x: Any) -> np.ndarray:
     """Convert a torch Tensor or numpy array to numpy, no-op otherwise."""
@@ -74,7 +83,7 @@ def _axial_tumor_slices(soft_mask: np.ndarray, n_cols: int) -> np.ndarray:
         1-D int array of length *n_cols*, depth indices into axis 2.
     """
     wt = soft_mask[0]  # (H, W, D)
-    depth_presence = wt.max(axis=(0, 1)) > 0  # (D,)
+    depth_presence = wt.sum(axis=(0, 1)) > 0  # area-based: any tumour-covered voxels
     z_tumour = np.where(depth_presence)[0]
     if len(z_tumour) == 0:
         d = wt.shape[2]
@@ -84,29 +93,53 @@ def _axial_tumor_slices(soft_mask: np.ndarray, n_cols: int) -> np.ndarray:
 
 def _overlay_rgba(
     soft_ch: np.ndarray,
-    cmap_name: str,
-    alpha: float,
+    color_rgb: tuple[float, float, float],
+    alpha_max: float,
 ) -> np.ndarray:
-    """Build a (H, W, 4) RGBA overlay where the alpha channel = soft_ch * alpha.
+    """Build a (H, W, 4) RGBA overlay; opacity proportional to probability.
 
     Parameters
     ----------
     soft_ch : np.ndarray
         2-D float array in ``[0, 1]``, shape ``(H, W)``.
-    cmap_name : str
-        Matplotlib colormap name.
-    alpha : float
-        Maximum overlay opacity (scales the per-pixel alpha).
+    color_rgb : tuple[float, float, float]
+        Fixed RGB colour for the overlay (R, G, B in ``[0, 1]``).
+    alpha_max : float
+        Maximum overlay opacity; per-pixel alpha = ``soft_ch * alpha_max``.
 
     Returns
     -------
     np.ndarray
         Shape ``(H, W, 4)`` float32 RGBA image.
     """
-    cmap = plt.get_cmap(cmap_name)
-    rgba = cmap(soft_ch).astype(np.float32)  # (H, W, 4)
-    rgba[..., 3] = (soft_ch * alpha).astype(np.float32)
+    h, w = soft_ch.shape[:2]
+    rgba = np.zeros((h, w, 4), dtype=np.float32)
+    rgba[..., 0] = color_rgb[0]
+    rgba[..., 1] = color_rgb[1]
+    rgba[..., 2] = color_rgb[2]
+    rgba[..., 3] = np.clip(soft_ch * alpha_max, 0.0, 1.0)
     return rgba
+
+
+def _add_contours(
+    ax: Any,
+    arr: np.ndarray,
+    color_rgb: tuple[float, float, float],
+) -> None:
+    """Draw probability contour lines at levels 0.25, 0.5, 0.75.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Target axes; must already contain the base imshow call.
+    arr : np.ndarray
+        2-D float array in ``[0, 1]``, same spatial orientation as the imshow.
+    color_rgb : tuple[float, float, float]
+        Contour colour — same hue as the filled overlay.
+    """
+    if arr.max() <= 0.0:
+        return  # nothing to contour; avoids empty-contour matplotlib warning
+    ax.contour(arr, levels=_CONTOUR_LEVELS, colors=[color_rgb], linewidths=_CONTOUR_LW, alpha=0.9)
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +171,10 @@ class PatientView:
     soft_mask: np.ndarray
     tumor_volume: float
     cohort: str = field(default="")
+    # Integer BraTS-style tumour label (H,W,D); used by render_mask_qc for the
+    # hard-mask row so WT=(label>0) and NETC=(label==1) render correctly.
+    # None is the legacy default — callers should always provide the true label.
+    hard_label: np.ndarray | None = field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -289,14 +326,14 @@ def render_mask_qc(
             f"soft_mask_latent must be {expected_lat}; got {soft_mask_latent.shape}"
         )
 
-    # Pick the axial slice with maximum WT presence at image resolution
+    # Pick the axial slice with the largest WT tumour area (sum over H, W)
     wt_img = soft_mask_img[0]  # (H, W, D)
-    depth_sums_img = wt_img.max(axis=(0, 1))
+    depth_sums_img = wt_img.sum(axis=(0, 1))
     k_img = int(np.argmax(depth_sums_img)) if depth_sums_img.max() > 0 else wt_img.shape[2] // 2
 
-    # Pick the best latent-grid slice (depth axis = axis 2 of LATENT_SPATIAL)
+    # Same area criterion for the latent-grid row (depth = axis 2 of LATENT_SPATIAL)
     wt_lat = soft_mask_latent[0]  # (48, 56, 48)
-    depth_sums_lat = wt_lat.max(axis=(0, 1))
+    depth_sums_lat = wt_lat.sum(axis=(0, 1))
     k_lat = int(np.argmax(depth_sums_lat)) if depth_sums_lat.max() > 0 else wt_lat.shape[2] // 2
 
     # Anatomy slice window
@@ -315,9 +352,8 @@ def render_mask_qc(
         ["WT (soft, image res)", "NETC (soft, image res)"],
         ["WT (latent grid)", "NETC (latent grid)"],
     ]
-    cmap_names = ["hot", "cool"]
 
-    # Row 0: anatomy + hard mask
+    # Row 0: anatomy + hard mask (binary; high-contrast colours)
     for col in range(2):
         ax = axes[0, col]
         ax.set_facecolor("black")
@@ -331,28 +367,31 @@ def render_mask_qc(
         else:
             ch = min(col, hard_mask.shape[0] - 1)
             hm_bin = (hard_mask[ch, :, :, k_img] > 0).astype(np.float32)
-        overlay = _overlay_rgba(np.rot90(hm_bin), cmap_names[col], alpha=0.6)
-        ax.imshow(overlay)
+        arr_rot = np.rot90(hm_bin)
+        ax.imshow(_overlay_rgba(arr_rot, _COLORS[col], alpha_max=0.6))
         ax.set_title(col_labels[0][col], color="white", fontsize=8)
         ax.axis("off")
 
-    # Row 1: anatomy + soft mask at image resolution
+    # Row 1: anatomy + soft mask (continuous probability overlay + contours)
     for col in range(2):
         ax = axes[1, col]
         ax.set_facecolor("black")
         ax.imshow(np.rot90(anat_sl), cmap="gray", vmin=v0, vmax=v1)
         soft_sl = soft_mask_img[col, :, :, k_img]
-        overlay = _overlay_rgba(np.rot90(soft_sl), cmap_names[col], alpha=0.7)
-        ax.imshow(overlay)
+        arr_rot = np.rot90(soft_sl)
+        ax.imshow(_overlay_rgba(arr_rot, _COLORS[col], alpha_max=0.6))
+        _add_contours(ax, arr_rot, _COLORS[col])
         ax.set_title(col_labels[1][col], color="white", fontsize=8)
         ax.axis("off")
 
-    # Row 2: soft mask on the latent grid
+    # Row 2: soft mask on the latent grid (continuous colour on black + contours)
     for col in range(2):
         ax = axes[2, col]
         ax.set_facecolor("black")
         lat_sl = soft_mask_latent[col, :, :, k_lat]
-        ax.imshow(np.rot90(lat_sl), cmap=cmap_names[col], vmin=0.0, vmax=1.0)
+        arr_rot = np.rot90(lat_sl)
+        ax.imshow(_overlay_rgba(arr_rot, _COLORS[col], alpha_max=1.0))
+        _add_contours(ax, arr_rot, _COLORS[col])
         ax.set_title(col_labels[2][col], color="white", fontsize=8)
         ax.axis("off")
 
@@ -368,8 +407,8 @@ def render_mask_qc(
 def render_slice_montage(
     patients: list[PatientView],
     *,
-    n_cols: int = 5,
-    alpha: float = 0.7,
+    n_cols: int = 10,
+    alpha: float = 0.6,
     path: Path,
 ) -> Path:
     """Produce a multi-patient montage with the pinned layout.
@@ -384,9 +423,9 @@ def render_slice_montage(
     patients : list[PatientView]
         Patient data bundles.  Sorted by ``tumor_volume`` inside.
     n_cols : int
-        Number of tumour-bearing slice columns per row.  Default 5.
+        Number of tumour-bearing slice columns per row.  Default 10.
     alpha : float
-        Overlay opacity.  Default 0.7.
+        Overlay opacity.  Default 0.6.
     path : Path
         Output PNG path.
 
@@ -431,13 +470,17 @@ def render_slice_montage(
                 v0, v1 = 0.0, 1.0
             ax.imshow(np.rot90(anat_sl), cmap="gray", vmin=v0, vmax=v1)
 
-            # WT overlay (hot colormap)
+            # WT overlay (continuous probability, green + contours)
             wt_sl = pv.soft_mask[0, :, :, k]
-            ax.imshow(_overlay_rgba(np.rot90(wt_sl), "hot", alpha=alpha))
+            wt_rot = np.rot90(wt_sl)
+            ax.imshow(_overlay_rgba(wt_rot, _WT_COLOR, alpha_max=alpha))
+            _add_contours(ax, wt_rot, _WT_COLOR)
 
-            # NETC overlay (cool colormap)
+            # NETC overlay (continuous probability, magenta + contours)
             netc_sl = pv.soft_mask[1, :, :, k]
-            ax.imshow(_overlay_rgba(np.rot90(netc_sl), "cool", alpha=alpha))
+            netc_rot = np.rot90(netc_sl)
+            ax.imshow(_overlay_rgba(netc_rot, _NETC_COLOR, alpha_max=alpha))
+            _add_contours(ax, netc_rot, _NETC_COLOR)
 
             ax.axis("off")
             if c_idx == 0:
@@ -669,8 +712,8 @@ def render_injection_sanity(
 
     ratio = compute_residual_energy_ratio(res_scale, wt_mask)
 
-    # Pick best depth slice in the wt_mask
-    depth_sums = wt_mask.max(axis=(0, 1)) if wt_mask.ndim == 3 else wt_mask
+    # Pick the depth slice with the largest WT area (sum over in-plane axes)
+    depth_sums = wt_mask.sum(axis=(0, 1)) if wt_mask.ndim == 3 else wt_mask
     k = int(np.argmax(depth_sums)) if depth_sums.max() > 0 else wt_mask.shape[2] // 2
 
     def _sl(vol3d: np.ndarray) -> np.ndarray:

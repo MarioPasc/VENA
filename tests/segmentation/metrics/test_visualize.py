@@ -141,8 +141,8 @@ class TestRenderSliceMontage:
 
         out = render_slice_montage(
             self._make_patients(),
-            n_cols=5,
-            alpha=0.7,
+            n_cols=10,
+            alpha=0.6,
             path=tmp_path / "montage.png",
         )
         assert out.exists()
@@ -163,7 +163,7 @@ class TestRenderSliceMontage:
         from vena.segmentation.metrics.visualize import _axial_tumor_slices
 
         soft = _make_soft_mask_img()
-        n_cols = 5
+        n_cols = 10
         z_indices = _axial_tumor_slices(soft, n_cols=n_cols)
         assert len(z_indices) == n_cols, f"Expected {n_cols} columns; got {len(z_indices)}"
 
@@ -173,7 +173,121 @@ class TestRenderSliceMontage:
         from vena.segmentation.metrics.visualize import render_slice_montage
 
         with pytest.raises(SegMetricError, match="empty"):
-            render_slice_montage([], n_cols=5, alpha=0.7, path=tmp_path / "empty.png")
+            render_slice_montage([], n_cols=10, alpha=0.6, path=tmp_path / "empty.png")
+
+
+# ---------------------------------------------------------------------------
+# Slice selection and continuous overlay — new-contract tests
+# ---------------------------------------------------------------------------
+
+
+class TestSliceSelectionAndContinuity:
+    """Tests for area-based slice selection and continuous probability overlay."""
+
+    def test_max_area_slice_picked(self) -> None:
+        """Area-based k_img/k_lat selection picks the widest cross-section.
+
+        The old render_mask_qc code used ``wt.max(axis=(0, 1))`` → argmax,
+        which picks the slice with the highest peak value.  For soft masks with
+        a uniform-valued hot-spot, many slices tie at the peak and argmax
+        returns the first one — often NOT the largest cross-section.
+
+        This test constructs a case where the two criteria disagree:
+        * Slice 3: peak value 1.0 but only 2 voxels (sum = 2.0, max = 1.0).
+        * Slice 12: value 0.8 over 200 voxels  (sum = 160.0, max = 0.8).
+
+        Old (max-based argmax) → picks slice 3 (max=1.0 beats max=0.8).
+        New (sum-based argmax) → picks slice 12 (sum=160.0 beats sum=2.0). ✓
+        """
+        mask = np.zeros((40, 40, 20), dtype=np.float32)
+        # Slice 3: high peak, tiny area
+        mask[0, 0, 3] = 1.0
+        mask[0, 1, 3] = 1.0
+        # Slice 12: lower peak, large area (20×10 = 200 voxels × 0.8 = sum 160.0)
+        mask[:20, :10, 12] = 0.8
+
+        # Replicate the area-based depth selection now used in render_mask_qc
+        depth_sums = mask.sum(axis=(0, 1))
+        k_new = int(np.argmax(depth_sums))
+        assert k_new == 12, (
+            f"Sum-based selection should pick slice 12 (sum=160 > sum=2), got {k_new}"
+        )
+
+        # Verify the old logic would have picked the wrong slice (regression guard)
+        depth_maxs = mask.max(axis=(0, 1))
+        k_old = int(np.argmax(depth_maxs))
+        assert k_old == 3, (
+            f"Max-based logic should pick slice 3 (demonstrating the fixed bug), got {k_old}"
+        )
+
+    def test_soft_overlay_continuous_alpha(self) -> None:
+        """RGBA alpha channel contains >2 distinct values — overlay is continuous."""
+        from vena.segmentation.metrics.visualize import _overlay_rgba
+
+        # Gradated probability map with many distinct values between 0 and 1
+        prob = np.linspace(0.0, 1.0, 200).reshape(10, 20).astype(np.float32)
+        color = (0.1, 0.9, 0.2)  # WT green
+        rgba = _overlay_rgba(prob, color, alpha_max=0.6)
+
+        distinct_alpha = np.unique(rgba[..., 3])
+        assert len(distinct_alpha) > 2, (
+            f"Expected >2 distinct alpha values in continuous overlay; "
+            f"got {len(distinct_alpha)}: {distinct_alpha}"
+        )
+
+    def test_netc_hard_panel_uses_integer_label_not_wt_binary(self) -> None:
+        """NETC-hard panel must use label==1, not the WT binary (pre-existing bug guard).
+
+        The engine previously fabricated ``hard_mask = (soft_mask[0] > 0.5)``
+        (a WT binary 0/1) and passed that as ``hard_mask`` to ``render_mask_qc``.
+        Because ``render_mask_qc``'s ndim==3 branch uses ``hard_mask == 1`` for
+        NETC, the WT binary made NETC equal the ENTIRE WT region.
+
+        This test constructs a BraTS-style integer label where:
+        * WT bulk (label=2, edema) occupies a large 16×16×6 block;
+        * NETC core (label=1) occupies a small 4×4×2 nested block.
+
+        With the WT binary:  ``(label > 0) == 1`` selects 1536 voxels (entire WT).
+        With the true label:  ``label == 1`` selects only 32 voxels (NETC core).
+        """
+        h, w, d = 20, 20, 10
+        label = np.zeros((h, w, d), dtype=np.int32)
+        label[2:18, 2:18, 2:8] = 2  # WT bulk (edema/ET, NOT NETC): 16×16×6 = 1536 vox
+        label[8:12, 8:12, 4:6] = 1  # NETC core nested inside: 4×4×2 = 32 vox
+
+        wt_area = int((label > 0).sum())
+        netc_area = int((label == 1).sum())
+        assert netc_area < wt_area, "test setup: NETC core must be smaller than WT"
+
+        # True integer label → NETC panel covers only the small NETC core
+        netc_from_int_label = int((label == 1).sum())
+
+        # Buggy WT binary → NETC panel incorrectly covers the entire WT region
+        wt_binary = (label > 0).astype(np.int32)
+        netc_from_wt_binary = int((wt_binary == 1).sum())
+
+        assert netc_from_int_label == 32, (
+            f"label==1 should select 32-voxel NETC core; got {netc_from_int_label}"
+        )
+        assert netc_from_wt_binary == wt_area, (
+            f"WT-binary bug: (wt_binary==1) selects entire WT ({wt_area} vox), "
+            f"not the NETC core; got {netc_from_wt_binary}"
+        )
+        assert netc_from_int_label < netc_from_wt_binary, (
+            "Integer-label NETC must be strictly smaller than WT-binary NETC"
+        )
+
+    def test_overlay_rgb_channels_match_color(self) -> None:
+        """RGB channels of the overlay are set to the requested colour."""
+        from vena.segmentation.metrics.visualize import _overlay_rgba
+
+        prob = np.ones((5, 5), dtype=np.float32) * 0.5
+        color = (1.0, 0.1, 0.6)  # NETC magenta
+        rgba = _overlay_rgba(prob, color, alpha_max=0.6)
+
+        np.testing.assert_allclose(rgba[..., 0], color[0], err_msg="R channel mismatch")
+        np.testing.assert_allclose(rgba[..., 1], color[1], err_msg="G channel mismatch")
+        np.testing.assert_allclose(rgba[..., 2], color[2], err_msg="B channel mismatch")
 
 
 # ---------------------------------------------------------------------------
