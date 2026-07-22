@@ -26,8 +26,13 @@ from vena.segmentation.exceptions import SegMetricError
 if TYPE_CHECKING:
     import pandas as pd
 
+    # CropPadSpec lives in vena.common (MAISI adapter). Importing at module
+    # level would drag in all MAISI model code; defer to the call site.
+    from vena.common import CropPadSpec
+
 __all__ = [
     "PatientView",
+    "check_mask_invariants",
     "compute_mask_stats",
     "compute_residual_energy_ratio",
     "render_injection_sanity",
@@ -45,14 +50,20 @@ logger = logging.getLogger(__name__)
 _EMPTY_MASK_THRESHOLD: float = 0.01
 _NETC_VIOLATION_EPSILON: float = 1e-6
 
-# High-contrast overlay colours: WT = saturated green; NETC = saturated magenta.
-# Chosen to read clearly on greyscale MRI and to be mutually distinct (no blend
-# with bright anatomy the way hot/cool colormaps do at low probability).
+# High-contrast overlay colours: TC = saturated green; NETC = saturated magenta.
+# Used for hard-mask (binary) rows and as contour colours on soft rows.
 _WT_COLOR: tuple[float, float, float] = (0.1, 0.9, 0.2)
 _NETC_COLOR: tuple[float, float, float] = (1.0, 0.1, 0.6)
 _COLORS: tuple[tuple[float, float, float], ...] = (_WT_COLOR, _NETC_COLOR)
 _CONTOUR_LEVELS: list[float] = [0.25, 0.5, 0.75]
 _CONTOUR_LW: float = 0.6
+
+# Perceptual colormaps for continuous soft-probability overlays.
+# Higher probability → hotter/darker colour.  Both are visually distinct on
+# greyscale MRI and map naturally onto the existing green/magenta convention.
+_TC_CMAP = plt.cm.YlGn  # yellow (low prob) → dark green (high prob)  — TC
+_NETC_CMAP = plt.cm.RdPu  # light pink (low) → dark magenta (high)       — NETC
+_CMAPS: tuple[Any, ...] = (_TC_CMAP, _NETC_CMAP)
 
 
 def _to_numpy(x: Any) -> np.ndarray:
@@ -121,6 +132,38 @@ def _overlay_rgba(
     return rgba
 
 
+def _overlay_cmap_rgba(
+    soft_ch: np.ndarray,
+    cmap: Any,
+    alpha_max: float,
+) -> np.ndarray:
+    """Build (H, W, 4) RGBA using a perceptual colormap; alpha ∝ probability.
+
+    Higher probability → hotter/darker colour **and** higher opacity.  At
+    probability 0 the overlay is fully transparent so the anatomy layer shows.
+
+    Parameters
+    ----------
+    soft_ch : np.ndarray
+        2-D float array in ``[0, 1]``, shape ``(H, W)``.
+    cmap : callable
+        A matplotlib colormap (e.g. ``plt.cm.YlGn``, ``plt.cm.RdPu``).
+        Called as ``cmap(array)`` → ``(H, W, 4)`` RGBA.
+    alpha_max : float
+        Maximum overlay opacity for pixels at probability 1.
+
+    Returns
+    -------
+    np.ndarray
+        Shape ``(H, W, 4)`` float32 RGBA.
+    """
+    rgba = cmap(np.clip(soft_ch, 0.0, 1.0)).astype(np.float32)  # (H, W, 4)
+    # Replace cmap's alpha with probability-proportional opacity so background
+    # anatomy remains visible and the halo (low-prob boundary) is semi-transparent.
+    rgba[:, :, 3] = np.clip(soft_ch * alpha_max, 0.0, 1.0)
+    return rgba
+
+
 def _add_contours(
     ax: Any,
     arr: np.ndarray,
@@ -158,8 +201,10 @@ class PatientView:
     t1pre : np.ndarray
         T1pre volume, shape ``(H, W, D)``, float in ``[0, 1]``.
     soft_mask : np.ndarray
-        Soft ``[TC, NETC]`` (or ``[WT, NETC]`` for ablation) probability map at **image** resolution,
-        shape ``(2, H, W, D)``, float in ``[0, 1]``.
+        Soft ``[TC, NETC]`` (or ``[WT, NETC]`` for ablation) probability map
+        at **image** resolution, shape ``(2, H, W, D)``, float in ``[0, 1]``.
+        Engine sets this to the true sigmoid(SDT/σ) map produced by
+        :func:`vena.segmentation.targets.soft_targets.make_soft_targets`.
     tumor_volume : float
         Tumour volume in voxels (WT channel sum); used for row ordering.
     cohort : str
@@ -275,6 +320,166 @@ def compute_residual_energy_ratio(
 
 
 # ---------------------------------------------------------------------------
+# Invariant checker
+# ---------------------------------------------------------------------------
+
+
+def check_mask_invariants(
+    soft_img_crop: np.ndarray,
+    hard_label_crop: np.ndarray,
+    soft_latent: np.ndarray,
+    *,
+    patient_id: str,
+) -> dict[str, Any]:
+    """Verify per-patient mask invariants; return a stats dict.
+
+    All three inputs must be in the **crop frame** (192, 224, 192).
+    Specifically:
+
+    * *soft_img_crop* is the sigmoid(SDT/σ) probability map already
+      cropped to ``(2, 192, 224, 192)`` via :func:`vena.common.apply_crop_pad`.
+    * *hard_label_crop* is the BraTS integer label cropped to ``(192, 224, 192)``.
+    * *soft_latent* is the latent-grid soft mask ``(2, 48, 56, 48)`` which
+      this function up-scales ×4 → ``(2, 192, 224, 192)`` via trilinear
+      interpolation before comparison.
+
+    Invariants checked
+    ------------------
+    (a) **hard ⊆ soft**: every hard-TC voxel has ``soft_TC > 0.5`` (the
+        calibration guarantee: soft > 0.5 ↔ hard label).  Reports the
+        fraction of hard-TC voxels that violate this (should be ≈ 0).
+    (b) **soft continuous**: a non-trivial fraction of TC-channel voxels
+        lies in ``(0.05, 0.95)`` (the halo).  A value near 0 means the
+        soft map has collapsed to binary — SDT derivation failure.
+    (c) **latent ≈ image (registration)**: IoU of the up-scaled latent
+        ``> 0.5`` region and the image-soft ``> 0.5`` region.  Low IoU
+        (≲ 0.6) or large centroid distance indicates a crop/pool
+        registration bug in ``pool_to_latent`` — **do not fix silently**.
+
+    Parameters
+    ----------
+    soft_img_crop : np.ndarray
+        Shape ``(2, 192, 224, 192)``, float32 in ``[0, 1]``.
+        Channel 0 = TC/WT, channel 1 = NETC.
+    hard_label_crop : np.ndarray
+        Shape ``(192, 224, 192)``, int32 (BraTS-2021 convention).
+    soft_latent : np.ndarray
+        Shape ``(2, 48, 56, 48)``, float32 in ``[0, 1]``.
+    patient_id : str
+        Used for log messages; included in the returned dict.
+
+    Returns
+    -------
+    dict
+        Keys:
+
+        * ``patient_id`` (str)
+        * ``hard_subset_soft_violation_frac`` (float) — (a)
+        * ``soft_intermediate_frac`` (float) — (b)
+        * ``latent_image_iou`` (float) — (c)
+        * ``latent_image_centroid_dist_vox`` (float | None) — (c)
+        * ``invariant_ok`` (bool) — True when all checks pass
+
+    Raises
+    ------
+    SegMetricError
+        If array shapes are inconsistent.
+    """
+    import torch
+    import torch.nn.functional as F  # noqa: N812
+
+    # Validate shapes
+    expected_crop = (2, 192, 224, 192)
+    if soft_img_crop.shape != expected_crop:
+        raise SegMetricError(f"soft_img_crop must be {expected_crop}; got {soft_img_crop.shape}")
+    if hard_label_crop.shape != (192, 224, 192):
+        raise SegMetricError(
+            f"hard_label_crop must be (192, 224, 192); got {hard_label_crop.shape}"
+        )
+    expected_lat = (2, *LATENT_SPATIAL)
+    if soft_latent.shape != expected_lat:
+        raise SegMetricError(f"soft_latent must be {expected_lat}; got {soft_latent.shape}")
+
+    # Up-scale latent ×4 → (2, 192, 224, 192) via trilinear interpolation.
+    # avg-pool is a box filter; trilinear upscale is the approximate inverse.
+    lat_t = torch.from_numpy(soft_latent).float().unsqueeze(0)  # (1, 2, 48, 56, 48)
+    lat_up = F.interpolate(lat_t, scale_factor=4, mode="trilinear", align_corners=False)
+    lat_up_np: np.ndarray = lat_up.squeeze(0).numpy()  # (2, 192, 224, 192)
+
+    soft_tc = soft_img_crop[0]  # (192, 224, 192)
+
+    # (a) hard ⊆ soft: TC hard = (label > 0) & (label != 2)
+    tc_hard = (hard_label_crop > 0) & (hard_label_crop != 2)
+    n_hard = int(tc_hard.sum())
+    if n_hard > 0:
+        n_violation = int((soft_tc[tc_hard] <= 0.5).sum())
+        hard_subset_soft_violation_frac = float(n_violation) / n_hard
+    else:
+        hard_subset_soft_violation_frac = 0.0
+
+    # (b) soft continuous: fraction of voxels in (0.05, 0.95)
+    n_vox = int(soft_tc.size)
+    n_intermediate = int(((soft_tc > 0.05) & (soft_tc < 0.95)).sum())
+    soft_intermediate_frac = float(n_intermediate) / n_vox if n_vox > 0 else 0.0
+
+    # (c) registration IoU: upscaled-latent vs image-soft, both >0.5
+    lat_up_tc = lat_up_np[0]  # (192, 224, 192)
+    lat_bin = lat_up_tc > 0.5
+    soft_bin = soft_tc > 0.5
+    intersection = int((lat_bin & soft_bin).sum())
+    union = int((lat_bin | soft_bin).sum())
+    iou = float(intersection) / float(union + 1e-8) if union > 0 else 0.0
+
+    # Centroid distance in voxels (None when either region is empty)
+    if soft_bin.any() and lat_bin.any():
+        c_soft = np.array(np.where(soft_bin)).mean(axis=1)  # (3,)
+        c_lat = np.array(np.where(lat_bin)).mean(axis=1)  # (3,)
+        centroid_dist: float | None = float(np.linalg.norm(c_soft - c_lat))
+    else:
+        centroid_dist = None
+
+    # Whether any TC region is present — gates checks (b) and (c).
+    # Patients with no TC (e.g. edema-only, label==2 throughout) are valid:
+    # make_soft_targets returns all-zero TC channel for empty TC sets, which
+    # produces soft_cont=0 and IoU=0 by construction — not a derivation bug.
+    has_tc_region = (n_hard > 0) or (float(soft_tc.max()) > 0.05)
+
+    # Threshold judgements — thresholds are intentionally conservative
+    _hard_ok = hard_subset_soft_violation_frac < 0.05
+    # (b) and (c) only apply when TC region exists; empty-TC patients trivially pass
+    _soft_ok = (soft_intermediate_frac > 0.001) if has_tc_region else True
+    _reg_ok = (
+        iou >= 0.60 and (centroid_dist is None or centroid_dist < 20.0) if has_tc_region else True
+    )
+    invariant_ok = _hard_ok and _soft_ok and _reg_ok
+
+    if not invariant_ok:
+        logger.warning(
+            "check_mask_invariants FAIL %s | hard_viol=%.3f  soft_cont=%.4f  IoU=%.3f  "
+            "centroid=%.1f  has_tc=%s  [hard_ok=%s soft_ok=%s reg_ok=%s]",
+            patient_id,
+            hard_subset_soft_violation_frac,
+            soft_intermediate_frac,
+            iou,
+            centroid_dist if centroid_dist is not None else float("nan"),
+            has_tc_region,
+            _hard_ok,
+            _soft_ok,
+            _reg_ok,
+        )
+
+    return {
+        "patient_id": patient_id,
+        "has_tc_region": has_tc_region,
+        "hard_subset_soft_violation_frac": hard_subset_soft_violation_frac,
+        "soft_intermediate_frac": soft_intermediate_frac,
+        "latent_image_iou": iou,
+        "latent_image_centroid_dist_vox": centroid_dist,
+        "invariant_ok": invariant_ok,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Figure builders
 # ---------------------------------------------------------------------------
 
@@ -288,14 +493,32 @@ def render_mask_qc(
     patient_id: str,
     path: Path,
     roi_label: str = "TC",
+    crop_spec: CropPadSpec | None = None,
 ) -> Path:
     """Produce a 3-row QC figure for a single patient.
 
     Row 0: T1pre anatomy + hard-mask overlay (``roi_label`` | NETC).
-    Row 1: T1pre anatomy + soft-mask overlay at image resolution
-           (``roi_label`` | NETC).
-    Row 2: soft-mask displayed on the ``(48, 56, 48)`` latent grid
-           (``roi_label`` | NETC).
+    Row 1: T1pre anatomy + soft-mask overlay at image resolution with
+           perceptual colormap and probability contours (``roi_label`` | NETC).
+    Row 2: T1pre anatomy + soft-mask at the latent grid, upscaled ×4 and
+           rendered with the same colormap + contours (``roi_label`` | NETC).
+
+    When *crop_spec* is provided (recommended):
+
+    * All three arrays are projected into the **crop frame** ``(192, 224, 192)``
+      via :func:`vena.common.apply_crop_pad` (image, hard mask, soft image)
+      and trilinear upscaling ×4 (latent → crop frame).
+    * A **single reference depth slice** ``k`` is chosen as the argmax of
+      the hard-TC area in the crop frame so that ALL rows show the same
+      physical z-level.  This eliminates the independent-argmax discrepancy
+      that made masks appear in one row but not another.
+    * Row 2 shows anatomy underneath the latent-upscaled overlay (same frame
+      as Rows 0/1) rather than a plain black background.
+
+    When *crop_spec* is ``None`` (legacy/test path):
+
+    * Slice selection is independent per resolution (old behaviour) and
+      rows may not align physically.
 
     Parameters
     ----------
@@ -306,10 +529,11 @@ def render_mask_qc(
         ``(2, H, W, D)`` pre-binarized per-channel.
     soft_mask_img : np.ndarray
         Soft ``[roi_label, NETC]`` map at image resolution, shape
-        ``(2, H, W, D)``.
+        ``(2, H, W, D)``.  Engine should provide the true sigmoid(SDT/σ)
+        result from :func:`make_soft_targets`, not a binary approximation.
     soft_mask_latent : np.ndarray
         Soft ``[roi_label, NETC]`` map at latent grid, shape
-        ``(2, *LATENT_SPATIAL)``.
+        ``(2, *LATENT_SPATIAL)`` = ``(2, 48, 56, 48)``.
     patient_id : str
         Label used in the figure suptitle.
     path : Path
@@ -319,6 +543,11 @@ def render_mask_qc(
         Use ``"WT"`` for legacy whole-tumour ablation runs.  Affects panel
         titles and hard-mask rendering: ``"TC"`` uses
         ``(label > 0) & (label != 2)``; any other value uses ``label > 0``.
+    crop_spec : CropPadSpec or None
+        Per-scan brain-centred crop specification from the image H5.  When
+        provided, all arrays are aligned to the crop frame before rendering
+        (recommended).  When ``None``, falls back to the legacy independent-
+        slice behaviour (backward-compatible, used by tests without a crop_spec).
 
     Returns
     -------
@@ -336,6 +565,24 @@ def render_mask_qc(
             f"soft_mask_latent must be {expected_lat}; got {soft_mask_latent.shape}"
         )
 
+    # ------------------------------------------------------------------
+    # Branch A: consistent crop-frame rendering (crop_spec provided)
+    # ------------------------------------------------------------------
+    if crop_spec is not None:
+        return _render_mask_qc_crop_frame(
+            image=image,
+            hard_mask=hard_mask,
+            soft_mask_img=soft_mask_img,
+            soft_mask_latent=soft_mask_latent,
+            patient_id=patient_id,
+            path=path,
+            roi_label=roi_label,
+            crop_spec=crop_spec,
+        )
+
+    # ------------------------------------------------------------------
+    # Branch B: legacy independent-slice rendering (no crop_spec)
+    # ------------------------------------------------------------------
     # Pick the axial slice with the largest channel-0 tumour area (sum over H, W)
     ch0_img = soft_mask_img[0]  # (H, W, D)
     depth_sums_img = ch0_img.sum(axis=(0, 1))
@@ -355,12 +602,12 @@ def render_mask_qc(
 
     fig, axes = plt.subplots(3, 2, figsize=(8, 9))
     fig.patch.set_facecolor("black")
-    fig.suptitle(f"Mask QC — {patient_id}", color="white", fontsize=11)
+    fig.suptitle(f"Mask QC — {patient_id} (native frame)", color="white", fontsize=11)
 
     col_labels = [
         [f"{roi_label} (hard)", "NETC (hard)"],
         [f"{roi_label} (soft, image res)", "NETC (soft, image res)"],
-        [f"{roi_label} (latent grid)", "NETC (latent grid)"],
+        [f"{roi_label} (latent grid, k={k_lat})", "NETC (latent grid)"],
     ]
 
     # Row 0: anatomy + hard mask (binary; high-contrast colours)
@@ -369,9 +616,7 @@ def render_mask_qc(
         ax.set_facecolor("black")
         ax.imshow(np.rot90(anat_sl), cmap="gray", vmin=v0, vmax=v1)
         if hard_mask.ndim == 3:
-            # BraTS integer label — derive hard mask for the appropriate region
             if col == 0:
-                # TC: NETC+ET, excludes edema (label==2); WT: any non-background
                 if roi_label.upper() == "TC":
                     hm_bin = ((hard_mask[:, :, k_img] > 0) & (hard_mask[:, :, k_img] != 2)).astype(
                         np.float32
@@ -388,25 +633,25 @@ def render_mask_qc(
         ax.set_title(col_labels[0][col], color="white", fontsize=8)
         ax.axis("off")
 
-    # Row 1: anatomy + soft mask (continuous probability overlay + contours)
+    # Row 1: anatomy + soft mask (continuous probability colormap + contours)
     for col in range(2):
         ax = axes[1, col]
         ax.set_facecolor("black")
         ax.imshow(np.rot90(anat_sl), cmap="gray", vmin=v0, vmax=v1)
         soft_sl = soft_mask_img[col, :, :, k_img]
         arr_rot = np.rot90(soft_sl)
-        ax.imshow(_overlay_rgba(arr_rot, _COLORS[col], alpha_max=0.6))
+        ax.imshow(_overlay_cmap_rgba(arr_rot, _CMAPS[col], alpha_max=0.75))
         _add_contours(ax, arr_rot, _COLORS[col])
         ax.set_title(col_labels[1][col], color="white", fontsize=8)
         ax.axis("off")
 
-    # Row 2: soft mask on the latent grid (continuous colour on black + contours)
+    # Row 2: soft mask on the latent grid (black bg + continuous colour + contours)
     for col in range(2):
         ax = axes[2, col]
         ax.set_facecolor("black")
         lat_sl = soft_mask_latent[col, :, :, k_lat]
         arr_rot = np.rot90(lat_sl)
-        ax.imshow(_overlay_rgba(arr_rot, _COLORS[col], alpha_max=1.0))
+        ax.imshow(_overlay_cmap_rgba(arr_rot, _CMAPS[col], alpha_max=1.0))
         _add_contours(ax, arr_rot, _COLORS[col])
         ax.set_title(col_labels[2][col], color="white", fontsize=8)
         ax.axis("off")
@@ -416,8 +661,167 @@ def render_mask_qc(
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=100, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
-    logger.debug("render_mask_qc -> %s", path)
+    logger.debug("render_mask_qc (native) -> %s", path)
     return path
+
+
+def _render_mask_qc_crop_frame(
+    *,
+    image: np.ndarray,
+    hard_mask: np.ndarray,
+    soft_mask_img: np.ndarray,
+    soft_mask_latent: np.ndarray,
+    patient_id: str,
+    path: Path,
+    roi_label: str,
+    crop_spec: CropPadSpec,
+) -> Path:
+    """Crop-frame rendering backend for :func:`render_mask_qc`.
+
+    All arrays are projected into the ``(192, 224, 192)`` crop frame and a
+    single reference depth slice ``k`` is selected from the hard-TC area,
+    ensuring all rows show the same physical z-level at the same resolution.
+    """
+    import torch
+    import torch.nn.functional as F  # noqa: N812
+
+    from vena.common import apply_crop_pad
+
+    # --- Crop image (H,W,D) → (192,224,192) --------------------------------
+    img_t = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)  # (1,1,H,W,D)
+    img_crop: np.ndarray = apply_crop_pad(img_t, crop_spec).squeeze().numpy()
+
+    # --- Crop hard_mask → (192,224,192) -------------------------------------
+    if hard_mask.ndim == 3:
+        hm_t = torch.from_numpy(hard_mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+        hard_crop: np.ndarray = (
+            apply_crop_pad(hm_t, crop_spec).squeeze().numpy().round().astype(np.int32)
+        )
+    else:
+        # (2,H,W,D) pre-binarized
+        hm_t = torch.from_numpy(hard_mask.astype(np.float32)).unsqueeze(0)
+        hard_crop = apply_crop_pad(hm_t, crop_spec).squeeze(0).numpy()
+
+    # --- Crop soft_mask_img (2,H,W,D) → (2,192,224,192) --------------------
+    sm_t = torch.from_numpy(soft_mask_img).unsqueeze(0)  # (1,2,H,W,D)
+    soft_img_crop: np.ndarray = apply_crop_pad(sm_t, crop_spec).squeeze(0).numpy()
+
+    # --- Upscale soft_mask_latent (2,48,56,48) → (2,192,224,192) -----------
+    lat_t = torch.from_numpy(soft_mask_latent).float().unsqueeze(0)
+    lat_up: np.ndarray = (
+        F.interpolate(lat_t, scale_factor=4, mode="trilinear", align_corners=False)
+        .squeeze(0)
+        .numpy()
+    )
+
+    # --- Reference slice: argmax of hard TC area in crop frame --------------
+    if hard_crop.ndim == 3:
+        if roi_label.upper() == "TC":
+            tc_hard = ((hard_crop > 0) & (hard_crop != 2)).astype(np.float32)
+        else:
+            tc_hard = (hard_crop > 0).astype(np.float32)
+    else:
+        tc_hard = (hard_crop[0] > 0).astype(np.float32)
+
+    depth_sums = tc_hard.sum(axis=(0, 1))  # (192,) depth profile
+    k = int(np.argmax(depth_sums)) if depth_sums.max() > 0 else img_crop.shape[2] // 2
+
+    # --- Anatomy slice (same k for all rows) --------------------------------
+    anat_sl = img_crop[:, :, k]
+    v0 = float(anat_sl.min())
+    v1 = float(anat_sl.max())
+    if v1 <= v0:
+        v0, v1 = 0.0, 1.0
+
+    fig, axes = plt.subplots(3, 2, figsize=(8, 9))
+    fig.patch.set_facecolor("black")
+    fig.suptitle(f"Mask QC — {patient_id} (crop frame, k={k})", color="white", fontsize=11)
+
+    col_labels = [
+        [f"{roi_label} (hard)", "NETC (hard)"],
+        [f"{roi_label} (soft, image)", "NETC (soft, image)"],
+        [f"{roi_label} (latent ×4)", "NETC (latent ×4)"],
+    ]
+
+    # Row 0: anatomy + hard mask (binary overlay; existing green/magenta)
+    for col in range(2):
+        ax = axes[0, col]
+        ax.set_facecolor("black")
+        ax.imshow(np.rot90(anat_sl), cmap="gray", vmin=v0, vmax=v1)
+        hm_bin = _hard_slice(hard_crop, k, col, roi_label)
+        ax.imshow(_overlay_rgba(np.rot90(hm_bin), _COLORS[col], alpha_max=0.6))
+        ax.set_title(col_labels[0][col], color="white", fontsize=8)
+        ax.axis("off")
+
+    # Row 1: anatomy + true sigmoid soft (perceptual colormap + contours)
+    for col in range(2):
+        ax = axes[1, col]
+        ax.set_facecolor("black")
+        ax.imshow(np.rot90(anat_sl), cmap="gray", vmin=v0, vmax=v1)
+        soft_sl = soft_img_crop[col, :, :, k]
+        arr_rot = np.rot90(soft_sl)
+        ax.imshow(_overlay_cmap_rgba(arr_rot, _CMAPS[col], alpha_max=0.75))
+        _add_contours(ax, arr_rot, _COLORS[col])
+        ax.set_title(col_labels[1][col], color="white", fontsize=8)
+        ax.axis("off")
+
+    # Row 2: anatomy + latent-upscaled soft (perceptual colormap + contours)
+    # Anatomy shown underneath so spatial alignment against the real MRI is
+    # immediately visible — all three rows are now directly comparable.
+    for col in range(2):
+        ax = axes[2, col]
+        ax.set_facecolor("black")
+        ax.imshow(np.rot90(anat_sl), cmap="gray", vmin=v0, vmax=v1)
+        lat_sl = lat_up[col, :, :, k]
+        arr_rot = np.rot90(lat_sl)
+        ax.imshow(_overlay_cmap_rgba(arr_rot, _CMAPS[col], alpha_max=0.80))
+        _add_contours(ax, arr_rot, _COLORS[col])
+        ax.set_title(col_labels[2][col], color="white", fontsize=8)
+        ax.axis("off")
+
+    fig.tight_layout()
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=100, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    logger.debug("render_mask_qc (crop-frame k=%d) -> %s", k, path)
+    return path
+
+
+def _hard_slice(
+    hard_crop: np.ndarray,
+    k: int,
+    col: int,
+    roi_label: str,
+) -> np.ndarray:
+    """Extract a binary hard-mask slice from *hard_crop* at depth *k*.
+
+    Parameters
+    ----------
+    hard_crop : np.ndarray
+        Either ``(H, W, D)`` integer label or ``(2, H, W, D)`` binary.
+    k : int
+        Depth index.
+    col : int
+        0 = channel-0 (TC/WT), 1 = NETC.
+    roi_label : str
+        ``"TC"`` triggers edema exclusion; any other value uses ``label > 0``.
+
+    Returns
+    -------
+    np.ndarray
+        2-D float32 binary mask ``(H, W)``.
+    """
+    if hard_crop.ndim == 3:
+        sl = hard_crop[:, :, k]
+        if col == 0:
+            if roi_label.upper() == "TC":
+                return ((sl > 0) & (sl != 2)).astype(np.float32)
+            return (sl > 0).astype(np.float32)
+        return (sl == 1).astype(np.float32)
+    # (2, H, W, D) pre-binarized
+    ch = min(col, hard_crop.shape[0] - 1)
+    return (hard_crop[ch, :, :, k] > 0).astype(np.float32)
 
 
 def render_slice_montage(
