@@ -174,6 +174,26 @@ on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note bel
   a tiny TC core, not the WT blob; hard TC == soft TC>0.5 exactly). Docs: fact-sheet erratum banner + this note +
   memory `[[project_channel0_tumor_core_not_wt]]`. **S2 carries this:** `m_wt_soft`→`m_tc_soft`, `[WT,NETC]`→`[TC,NETC]`,
   region-loss WT→TC, **Phase-2 segmenter target = TC** (G-SEG WT-Dice gate must become a TC-Dice gate). **Use PSNR_ET.**
+  Segmenter specs (11/13/15/17/18) + config updated: predict `[TC,NETC]`, G-SEG **TC-Dice ≥ 0.75 provisional**
+  (`MetricsConfig.gseg_wt_dice`→`gseg_tc_dice`, re-derive in S5 — TC harder than WT), `T_TC` temperature.
+- **🔴 QC-round-2 + CACHE CLEAN REDO (2026-07-22, Opus-4.8 agent, merged `1b9f946`, seg suite 137).** Scientist flagged
+  QC inconsistencies (mask in one row not another; soft looks hard). Root causes found — **one a real bug I MISSED**:
+  - **Figure bug (engine):** `validate_masks._build_patient_views` set `soft_img = stack([(label>0),(label==1)])` — a
+    **BINARY WT** — and passed it as `soft_mask_img`; so the montage + QC "soft" rows rendered binary WT, NOT soft TC.
+    My earlier "figures look correct" was compromised (I verified the derivation data, not that the figure rendered it).
+    Fixed → `make_soft_targets(label, cfg.targets)` (real soft TC).
+  - **Slice bug:** `k_img`/`k_lat` argmaxed INDEPENDENTLY on different-res volumes → rows at different z. Fixed →
+    crop-frame (192,224,192), ONE reference slice (max hard-TC area), latent upscaled ×4; all rows same slice+res.
+  - Soft rows now colormap (TC=YlGn / NETC=RdPu, higher prob=brighter) + contours {0.25,0.5,0.75}; `check_mask_invariants`
+    added (hard⊆soft, soft-continuous, latent-upscaled≈image-soft IoU).
+  - **NO derivation/registration bug** (independently cross-checked: 0159 IoU 0.864 / 0.24 vox; crop preserves TC).
+    0236/0485 are **genuinely 100% edema (TC=0)** → correctly blank. Faint "soft" = the `0.034` SDT floor
+    (`sigmoid(-clip/σ)`) — a design detail (label-smoothing vs clean conditioning; relevant to G-SHORTCUT). **OPEN for the
+    user:** clamp the soft floor to 0? (would need a derivation change + re-cache.)
+  - **Cache clean redo (per user):** the WT cache 1629508 had written stale WT to 7 cohorts; 1630643 (TC) only
+    overwrote 3 before cancel → MIXED state. Cancelled 1630643, **deleted `masks/tumor_latent_soft` from all 9 latent
+    H5s + reset schema 2.0.0** (oracle+latents preserved, shapes verified), re-synced `1b9f946`, **re-submitted fresh
+    all-TC cache = job 1630706** (worker `tumor_region: tc`). Monitor armed. Corrected figures re-rendering → GT dir.
 - **⚠ S2 note (deferred):** aug latent H5s `*_latents_aug.h5` are NOT in the registry list; if S2 trains with offline
   aug, the soft mask must be present+consistently-transformed there too (task-20/DataModule concern).
 
