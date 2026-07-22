@@ -273,13 +273,14 @@ green; K-fold plan deterministic + leakage-free; metrics + G-SEG gate + dual sel
 1. **17** (engine: `SegTrainer` one-model-per-invocation + `predict_oof` ensemble/TTA) → **18** (train routine +
    `decision.json` + `vena-segmentation-train`).
 2. `[O]` **Train the K+1 models** as a Picasso array (K fold-models + the all-FM-train model); Monitor.
-3. `[O]` **G-SEG evaluation** per cohort incl. Ring B (WT Dice ≥ 0.80, NETC Dice ≥ 0.50; healthy → ~empty); fit
-   per-class `T_WT`, `T_NETC`; report DSC **and** Brier/classwise-ECE (dual selection).
+3. `[O]` **G-SEG evaluation** per cohort incl. Ring B (**TC Dice ≥ 0.75 provisional** — re-derive from measured TC
+   Dice; TC is harder than WT — NETC Dice ≥ 0.50; healthy → ~empty **TC** volume); fit per-class `T_TC`, `T_NETC`;
+   report DSC **and** Brier/classwise-ECE (dual selection). **Target/gate is TC (=NETC+ET, edema excluded), not WT.**
 
 **Gates.** S4 merged green; GPU budget on Picasso (K+1 SwinUNETR trainings).
 
 **Exit criteria.** K+1 checkpoints + `temperatures.json` + `fold_plan.json`; the G-SEG table passes (or the
-documented fallback to a single coarse WT channel is invoked and recorded); no in-fold self-prediction (OOF routing
+documented fallback to a single coarse TC channel is invoked and recorded); no in-fold self-prediction (OOF routing
 asserted).
 
 **Orchestrator notes (append-only).**

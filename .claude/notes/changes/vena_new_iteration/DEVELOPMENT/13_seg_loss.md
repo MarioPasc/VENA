@@ -28,7 +28,7 @@ class SegmentationLoss(nn.Module):
     def __init__(self, cfg: LossConfig): ...
     def forward(self, outputs, target) -> Tensor:   # outputs = main logits OR (main, *aux) for deep supervision
 ```
-- `probs = sigmoid(logits)` per channel (independent WT/NETC sigmoids, region-based — **not** softmax; the two
+- `probs = sigmoid(logits)` per channel (independent TC/NETC sigmoids, region-based — **not** softmax; the two
   channels are nested, not mutually exclusive).
 - DML operates on **soft** `probs` and **soft** `target ∈ [0,1]` (the SDT-sigmoid targets from task 12) and must
   reduce to standard soft-Dice when `target ∈ {0,1}`.

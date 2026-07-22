@@ -25,7 +25,7 @@ Modify: `pyproject.toml` (console script `vena-segmentation-train`).
   `experiments/segmentation/<run_id>/` with `checkpoints/`, `logs/train.log`, `metrics/*.csv`, `temperatures.json`,
   `fold_plan.json`, and `decision.json`.
 - **`decision.json`** (segmenter schema — its own `schema_version`, not the FM one): backbone arm, `fold`,
-  ckpt SHA-256, `k_folds`, per-cohort {WT,NETC} Dice/AHD/ECE/Brier (incl. Ring B), `T_WT`/`T_NETC`,
+  ckpt SHA-256, `k_folds`, per-cohort {TC,NETC} Dice/AHD/ECE/Brier (incl. Ring B), `T_TC`/`T_NETC`,
   `selection_metric`, seed, corpus registry.
 - `cli.py` one positional arg; no heavy work at import; `Engine.run() -> Path`.
 - **SLURM-friendly**: `fold` is a config field so a Picasso array trains the K+1 models as separate tasks.

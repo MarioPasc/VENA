@@ -2,9 +2,14 @@
 
 **Track/Wave/Deps.** SEG · **Wave 1 (parallel)** · deps: 10. Owns `src/vena/segmentation/models/` only.
 
+> **🔴 TC, not WT (2026-07-22).** The 2-channel output is `[TC, NETC]` — channel 0 = **tumour core (TC = NETC+ET)**,
+> edema EXCLUDED (`TargetConfig.tumor_region="tc"`); `TC−NETC = ET` = the enhancing region. The architecture is
+> unchanged (2 soft channels), but the target/eval is TC not WT — and TC is harder to segment (see task 15's G-SEG note
+> + `[[project_channel0_tumor_core_not_wt]]`). BSF-SwinUNETR's tumour-aware SSL (BraTS) suits the harder ET/TC boundary.
+
 ## Objective
 Provide the three backbone arms as registry-registered builders returning a `torch.nn.Module` mapping
-`(B, 3, H, W, D) → (B, 2, H, W, D)` logits `[WT, NETC]` (+ deep-supervision heads when configured). **BSF-SwinUNETR
+`(B, 3, H, W, D) → (B, 2, H, W, D)` logits `[TC, NETC]` (+ deep-supervision heads when configured). **BSF-SwinUNETR
 is primary** (Arm A BraTS-SSL, Arm B UKB-SSL); **SegResNet is Arm C**, forked from the existing
 `src/vena/validation/downstream_seg.py` 4-input model (drop the T1c input → 3-input). Design authority: Part B.a,
 B.f-§1.

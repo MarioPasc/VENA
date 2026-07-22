@@ -30,7 +30,7 @@ class SegTrainer:
 def predict_oof(cfg: SegmentationConfig, ckpts: Mapping[int | str, Path], plan: FoldPlan,
                 patient_ids: Sequence[str], *, tta: bool = False) -> dict[str, Tensor]:
     # for each patient, pick its OOF model (fold model, or all_train for FM-val/test), run derivation,
-    # return {patient_id: soft [WT,NETC] at IMAGE res} (pooling to latent happens in the mask_predict routine)
+    # return {patient_id: soft [TC,NETC] at IMAGE res} (pooling to latent happens in the mask_predict routine)
 ```
 - `fit` trains one model on `plan.folds` minus the held-out fold (or all FM-train for `all_train`), with deep
   supervision (task 13), the augmentation pipeline (task 14), AMP, cosine LR, early stopping; it fits `T_WT,T_NETC`
@@ -48,7 +48,7 @@ def predict_oof(cfg: SegmentationConfig, ckpts: Mapping[int | str, Path], plan: 
 1. `SegTrainer(cfg, fold=0).fit()` on a **synthetic 8-patient fixture** drives training loss **down** and returns a
    run dir with a checkpoint + `fold_plan.json` + metrics CSV.
 2. On a tiny fixture the model can **overfit** (train Dice → high), proving the wiring is correct end-to-end.
-3. `predict_oof` returns per-patient soft `[WT,NETC]` in `[0,1]`; **no patient is predicted by a model that trained
+3. `predict_oof` returns per-patient soft `[TC,NETC]` in `[0,1]`; **no patient is predicted by a model that trained
    on it** (OOF routing asserted).
 4. TTA path runs and averages ≥2 augmentations without shape error.
 

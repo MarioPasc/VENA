@@ -92,8 +92,9 @@ Never `pip install -e .` from a worktree; the env is shared read-only.
 - Per-cohort latent H5 groups today: `latents/*` (per modality), `masks/tumor_latent` **`(N, 3, 48, 56, 48)`
   float32 = soft `[NETC, ED, ET]`**, `masks/brain_latent` `(N, 1, …)` int8 (when encoded). Root attrs incl.
   `vae_checkpoint_sha256`. The image-domain H5 carries `images/*`, `masks/{tumor,brain}`, `splits/*`, `metadata/*`.
-- **New group to add (task 18):** `masks/tumor_latent_pred` **`(N, 2, 48, 56, 48)`** float32 = soft `[WT, NETC]`
-  predicted, + a `predicted_mask_seg_sha256` root attr, + a `schema_version` bump. Written **beside**
+- **New group to add (task 18):** `masks/tumor_latent_pred` **`(N, 2, 48, 56, 48)`** float32 = soft `[TC, NETC]`
+  predicted (channel 0 = tumour core, edema excluded), + a `predicted_mask_seg_sha256` root attr, + a
+  `schema_version` bump. Written **beside**
   `masks/tumor_latent` (oracle), never replacing it. Reuse the shared writer/validator under
   `src/vena/data/h5/shared/` and the augmented latent path `src/vena/data/h5/augmented/latent_domain.py`.
 
@@ -101,7 +102,9 @@ Never `pip install -e .` from a worktree; the env is shared read-only.
 
 `patient_id`; `z_t1pre, z_t2, z_flair, z_t1c` `(4,48,56,48)`; `m_wt` `(1,…)` **binary** (0.5-threshold of the soft
 union); `m_tumor` `(3,…)` soft `[NETC,ED,ET]`; `m_netc/m_ed/m_et` `(1,…)` views; `m_brain` `(1,…)` when present.
-**`m_wt_soft` does NOT exist yet — task 20 adds it** = `clip(Σ m_tumor, 0, 1)` (the pre-threshold soft union).
+**`m_tc_soft` does NOT exist yet — task 20 adds it**, served from the cached `masks/tumor_latent_soft` channel 0 (=TC).
+Fallback if the cache is absent = `clip(m_netc + m_et, 0, 1)` (tumour core = NETC+ET, **excluding** ED) — NOT the WT
+union `clip(Σ m_tumor)`. (Channel 0 = TC per the erratum banner; `m_wt` binary is retained separately for back-compat.)
 
 ## ControlNet conditioning contract (verify in `src/vena/model/fm/controlnet/` + `…/maisi/`)
 
@@ -109,8 +112,8 @@ union); `m_tumor` `(3,…)` soft `[NETC,ED,ET]`; `m_netc/m_ed/m_et` `(1,…)` vi
   → `z_<key>` / `m_<key>` / `prior_<key>`. Downsamplers: `identity, nearest, avg_pool, trilinear, zero_out`
   (stateless, `out_channels=None`) and `lift_to_4ch` (override `out_channels=4`, needs `in_channels=k`).
 - `ConditioningAssembler.channels_per_spec` uses the **`mask_channels` constructor default (=1)**, NOT the runtime
-  tensor shape. **⇒ a 2-ch `[WT,NETC]` mask MUST be two 1-ch specs** `mask:wt:identity` + `mask:netc:identity`
-  (keys `m_wt_soft`, `m_netc`), else `total_channels` under-counts silently and the hint-net first conv is built wrong.
+  tensor shape. **⇒ a 2-ch `[TC,NETC]` mask MUST be two 1-ch specs** `mask:tc:identity` + `mask:netc:identity`
+  (keys `m_tc_soft`, `m_netc`), else `total_channels` under-counts silently and the hint-net first conv is built wrong.
 - **`MaisiControlNet`**: mask enters a **separate `controlnet_cond_embedding` hint net** (`[64]` = zero spatial
   downsampling), **added** to the CN `conv_in` output — **not** concatenated to the noisy latent. Residuals are
   emitted at conv_in + every down resblock + mid, added into the trunk **out-of-place** by `maisi/grad_safe.py`
@@ -165,7 +168,8 @@ premise rather than guessing. MONAI `SwinUNETR` + `SegResNet` are the library ba
 
 ## Region semantics for the generator loss (task 21) — verify in `controlnet/losses/` + `lightning/module.py`
 
-Regions for the region-weighted CFM: **`BG`** (outside brain, from `m_brain`), **`WT`** (from the mask), **`Brain
-= NOT-BG ∩ NOT-WT`** (brain tissue minus tumour). Iter-8 default weights `{brain: 1.0, wt: 1.0}` (BG excluded or
+Regions for the region-weighted CFM: **`BG`** (outside brain, from `m_brain`), **`TC`** (tumour core, from the mask
+channel 0 — edema EXCLUDED), **`Brain = NOT-BG ∩ NOT-TC`** (brain tissue minus tumour core; **edema now falls in the
+Brain region** and is reconstructed from the inputs — this is intended). Iter-8 default weights `{brain: 1.0, tc: 1.0}` (BG excluded or
 weight-0 per the existing `region_weights` semantics — **verify which**) → **numerically identical** to the current
 unweighted L1 velocity loss. That equivalence is a required test (task 21).

@@ -251,9 +251,15 @@ class MetricsConfig(BaseModel):
 
     Attributes
     ----------
-    gseg_wt_dice:
-        Gate threshold: mean Dice on WT must exceed this value across folds
-        for the model to be accepted.
+    gseg_tc_dice:
+        G-SEG gate threshold: mean Dice on the **tumour core (TC = NETC+ET)**
+        must exceed this across folds for the model to be accepted. The
+        segmenter predicts the same ``[TC, NETC]`` soft targets used for
+        conditioning (channel 0 = TC, edema excluded — see
+        ``TargetConfig.tumor_region``). TC is harder to segment than WT
+        (BraTS TC Dice ~0.80-0.87 vs WT ~0.88-0.92), so this default (0.75) is
+        **PROVISIONAL** and must be re-derived from the measured per-cohort TC
+        Dice in S5 before the gate is trusted.
     gseg_netc_dice:
         Gate threshold: mean Dice on NETC must exceed this value.
     selection_metric:
@@ -264,7 +270,7 @@ class MetricsConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    gseg_wt_dice: float = 0.80
+    gseg_tc_dice: float = 0.75  # PROVISIONAL — re-derive from S5 measured TC Dice
     gseg_netc_dice: float = 0.50
     selection_metric: Literal["dice", "brier", "dual"] = "dual"
 
