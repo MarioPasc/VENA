@@ -117,6 +117,10 @@ class ValidateMasksRoutineConfig(BaseModel):
         Optional explicit list of patient / scan IDs to include.  When
         provided, overrides ``patient_selection`` and ``n_patients``.
         IDs not found in the corpus are silently skipped with a WARNING.
+    anatomy_sequence:
+        Image-domain sequence shown as the greyscale anatomy background
+        ("t1pre", "t1c", "t2", or "flair"). The overlaid soft/hard masks are
+        unchanged; only the underlying image differs.
     targets:
         Soft target generation settings (SDT sigma, operator, clip radius).
     derivation:
@@ -132,6 +136,7 @@ class ValidateMasksRoutineConfig(BaseModel):
     patient_selection: Literal["random", "best", "worst"] = "random"
     n_patients: int = 10
     patient_ids: list[str] | None = None
+    anatomy_sequence: str = "t1pre"
     targets: TargetConfig = TargetConfig()
     derivation: DerivationConfig = DerivationConfig()
     log_level: str = "INFO"
@@ -493,8 +498,9 @@ class ValidateMasksEngine:
             row: int = entry["row"]
             cohort: str = entry["cohort"]
 
+            anat_seq = self._cfg.anatomy_sequence
             with h5py.File(image_h5_path, "r") as f:
-                t1pre: np.ndarray = f["images/t1pre"][row].astype(np.float32)
+                t1pre: np.ndarray = f[f"images/{anat_seq}"][row].astype(np.float32)
                 label: np.ndarray = f["masks/tumor"][row].astype(np.int32)
                 crop_origin_arr: np.ndarray = f["crop/origin"][row]
 
