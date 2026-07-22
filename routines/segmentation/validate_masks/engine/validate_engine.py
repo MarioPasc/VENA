@@ -1,7 +1,7 @@
 """Thin engine for the validate-masks routine.
 
 Reads T1pre anatomy and GT labels from image-domain H5 files, recomputes
-the soft [WT, NETC] mask on-the-fly via :func:`derive_latent_soft_mask`, and
+the soft [TC, NETC] mask on-the-fly via :func:`derive_latent_soft_mask`, and
 writes QC figures + a machine-readable ``decision.json``.
 
 Design constraints
@@ -14,6 +14,14 @@ Design constraints
 * **No Picasso latent cache required** — reads only the LOCAL image H5s.
 * **``masks_look_valid`` is human-set** — the engine writes ``null`` and the
   human fills it in after reviewing the figures.
+* **Soft image mask** — ``PatientView.soft_mask`` is the true sigmoid(SDT/σ)
+  produced by :func:`make_soft_targets`, NOT a binary binarisation.  Row 1
+  of the QC figure therefore shows the real calibrated probability halo.
+* **Invariant checks** — :func:`check_mask_invariants` runs per patient;
+  results are written to ``decision.json`` as ``invariant_stats``.  A loud
+  WARNING is emitted for any failing patient.
+* **Consistent-slice rendering** — the per-scan ``CropPadSpec`` is passed to
+  :func:`render_mask_qc` so all three rows share one physical z-slice.
 """
 
 from __future__ import annotations
@@ -22,7 +30,7 @@ import json
 import logging
 import random
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import yaml
@@ -34,19 +42,25 @@ from vena.segmentation.derivation.derive import derive_latent_soft_mask
 from vena.segmentation.exceptions import SegDerivationError, SegMetricError
 from vena.segmentation.metrics.visualize import (
     PatientView,
+    check_mask_invariants,
     compute_mask_stats,
     render_latent_embedding,
     render_mask_qc,
     render_slice_montage,
 )
+from vena.segmentation.targets.soft_targets import make_soft_targets
 
 if TYPE_CHECKING:
-    pass
+    from vena.common import CropPadSpec
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = "1.0"
-_PRODUCER = "routines.segmentation.validate_masks:1.0"
+_SCHEMA_VERSION = "1.1"
+_PRODUCER = "routines.segmentation.validate_masks:1.1"
+
+# Thresholds for flagging invariant failures in the decision.json summary.
+_IOU_WARN_THRESHOLD: float = 0.60
+_HARD_VIOL_WARN_THRESHOLD: float = 0.05
 
 # ---------------------------------------------------------------------------
 # Corpus registry
@@ -95,8 +109,14 @@ class ValidateMasksRoutineConfig(BaseModel):
         Patient sampling policy.  ``"random"`` picks uniformly;
         ``"best"`` selects the largest-tumour patients; ``"worst"``
         selects the smallest non-empty-tumour patients.
+        Ignored when ``patient_ids`` is set.
     n_patients:
-        Number of patients to include in the QC figures.
+        Number of patients to include in the QC figures.  Ignored when
+        ``patient_ids`` is set.
+    patient_ids:
+        Optional explicit list of patient / scan IDs to include.  When
+        provided, overrides ``patient_selection`` and ``n_patients``.
+        IDs not found in the corpus are silently skipped with a WARNING.
     targets:
         Soft target generation settings (SDT sigma, operator, clip radius).
     derivation:
@@ -111,6 +131,7 @@ class ValidateMasksRoutineConfig(BaseModel):
     output_root: Path = Path("artifacts/segmentation/validate_masks")
     patient_selection: Literal["random", "best", "worst"] = "random"
     n_patients: int = 10
+    patient_ids: list[str] | None = None
     targets: TargetConfig = TargetConfig()
     derivation: DerivationConfig = DerivationConfig()
     log_level: str = "INFO"
@@ -206,10 +227,12 @@ class ValidateMasksEngine:
         selected = self._select_patients(candidates, cfg.n_patients, cfg.patient_selection)
         logger.info("selected %d patients (policy=%s)", len(selected), cfg.patient_selection)
 
-        # Derive masks and build PatientView list
-        patient_views, mask_latents_dict, meta_rows = self._build_patient_views(selected)
+        # Derive masks and build PatientView list; crop_specs_dict maps scan_id → CropPadSpec
+        patient_views, mask_latents_dict, meta_rows, crop_specs_dict = self._build_patient_views(
+            selected
+        )
 
-        # Compute machine stats
+        # Compute machine stats on latent-grid masks
         all_latent_masks = np.stack(
             [mask_latents_dict[pv.patient_id] for pv in patient_views], axis=0
         )
@@ -221,24 +244,79 @@ class ValidateMasksEngine:
             stats["empty_mask_count"],
         )
 
+        # Per-patient invariant checks (need crop-frame arrays)
+        invariant_stats: list[dict[str, Any]] = []
+        n_invariant_violations = 0
+        n_reg_iou_low = 0
+
+        import torch
+
+        from vena.common import apply_crop_pad
+
+        for pv in patient_views:
+            crop_spec = crop_specs_dict.get(pv.patient_id)
+            lat_mask = mask_latents_dict[pv.patient_id]
+
+            if crop_spec is None:
+                logger.warning("no crop_spec for %s; skipping invariant check", pv.patient_id)
+                continue
+
+            # Crop native-res soft mask and hard label to (2,192,224,192) / (192,224,192)
+            sm_t = torch.from_numpy(pv.soft_mask).unsqueeze(0)  # (1,2,H,W,D)
+            soft_img_crop: np.ndarray = apply_crop_pad(sm_t, crop_spec).squeeze(0).numpy()
+
+            hm_t = (
+                torch.from_numpy(pv.hard_label.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+            )  # (1,1,H,W,D)
+            hard_crop: np.ndarray = (
+                apply_crop_pad(hm_t, crop_spec).squeeze().numpy().round().astype(np.int32)
+            )
+
+            inv = check_mask_invariants(
+                soft_img_crop,
+                hard_crop,
+                lat_mask,
+                patient_id=pv.patient_id,
+            )
+            invariant_stats.append(inv)
+
+            if not inv["invariant_ok"]:
+                n_invariant_violations += 1
+            iou = inv.get("latent_image_iou", 1.0)
+            if isinstance(iou, float) and iou < _IOU_WARN_THRESHOLD:
+                n_reg_iou_low += 1
+                logger.warning(
+                    "REGISTRATION LOW IoU %.3f for %s — possible pool/crop bug in "
+                    "pool_to_latent; check LATENT_CROP_BOX alignment.",
+                    iou,
+                    pv.patient_id,
+                )
+
+        if n_invariant_violations:
+            logger.warning(
+                "%d / %d patients failed mask invariants; see decision.json::invariant_stats",
+                n_invariant_violations,
+                len(patient_views),
+            )
+
         # Render figures
         figure_paths: list[Path] = []
 
-        # Per-patient QC figures
+        # Per-patient QC figures — now with crop_spec for consistent-slice rendering
         for pv in patient_views:
-            lat_mask = mask_latents_dict[pv.patient_id]  # (2, 48, 56, 48)
+            lat_mask = mask_latents_dict[pv.patient_id]
             fig_path = figures_dir / f"qc_{pv.patient_id}.png"
             render_mask_qc(
                 image=pv.t1pre,
-                # Pass the true integer label so render_mask_qc's ndim==3 branch
-                # uses TC=(label>0)&(label!=2) or WT=(label>0) for channel 0
-                # and NETC=(label==1) — not the channel-0 binary.
+                # True integer label; render_mask_qc uses TC=(label>0)&(label!=2)
+                # for channel 0 and NETC=(label==1) for channel 1.
                 hard_mask=pv.hard_label,
                 soft_mask_img=pv.soft_mask,
                 soft_mask_latent=lat_mask,
                 patient_id=pv.patient_id,
                 path=fig_path,
                 roi_label=cfg.targets.tumor_region.upper(),
+                crop_spec=crop_specs_dict.get(pv.patient_id),
             )
             figure_paths.append(fig_path)
             logger.debug("wrote QC figure for %s", pv.patient_id)
@@ -267,20 +345,37 @@ class ValidateMasksEngine:
 
         # Write report.md
         report_path = artifact_dir / "report.md"
-        self._write_report(report_path, patient_views, stats, figure_paths, produced_at)
+        self._write_report(
+            report_path, patient_views, stats, invariant_stats, figure_paths, produced_at
+        )
 
-        # Write decision.json
+        # Write decision.json (schema 1.1 adds invariant_stats + soft_mask_source)
         decision_path = artifact_dir / "decision.json"
-        decision = {
+
+        # Serialise invariant_stats: convert None centroid_dist → JSON null
+        def _json_safe(v: Any) -> Any:
+            if v is None or (isinstance(v, float) and (v != v)):  # None or NaN
+                return None
+            return v
+
+        inv_serialised = [{k: _json_safe(val) for k, val in row.items()} for row in invariant_stats]
+
+        decision: dict[str, Any] = {
             "schema_version": _SCHEMA_VERSION,
             "produced_at": produced_at,
             "producer": _PRODUCER,
             "git_sha": git_sha,
             "n_patients": len(patient_views),
             "patient_ids": [pv.patient_id for pv in patient_views],
+            # 1.1: soft_mask_source clarifies that pv.soft_mask = sigmoid(SDT/σ)
+            "soft_mask_source": "make_soft_targets(sigmoid_sdt)",
             "soft_mass_fraction_in_wt": stats["soft_mass_fraction_in_wt"],
             "netc_violation_count": stats["netc_violation_count"],
             "empty_mask_count": stats["empty_mask_count"],
+            # 1.1: per-patient invariant check results
+            "invariant_violation_count": n_invariant_violations,
+            "reg_iou_low_count": n_reg_iou_low,
+            "invariant_stats": inv_serialised,
             # Human-set after visual review; engine writes null.
             "masks_look_valid": None,
         }
@@ -337,7 +432,25 @@ class ValidateMasksEngine:
         n: int,
         policy: str,
     ) -> list[dict]:
-        """Select up to *n* candidates according to *policy*."""
+        """Select up to *n* candidates according to *policy*.
+
+        When ``cfg.patient_ids`` is set (non-None), the explicit list takes
+        priority: candidates are filtered to those whose ``scan_id`` appears
+        in the list; ``n`` and ``policy`` are ignored.  IDs not found in the
+        candidate pool emit a WARNING.
+        """
+        explicit_ids = self._cfg.patient_ids
+        if explicit_ids is not None:
+            id_set = set(explicit_ids)
+            filtered = [c for c in candidates if c["scan_id"] in id_set]
+            found_ids = {c["scan_id"] for c in filtered}
+            missing_ids = id_set - found_ids
+            for mid in sorted(missing_ids):
+                logger.warning("patient_id %r not found in corpus; skipping", mid)
+            # Preserve the explicit order given in the config
+            order = {sid: i for i, sid in enumerate(explicit_ids)}
+            return sorted(filtered, key=lambda c: order.get(c["scan_id"], len(order)))
+
         n = min(n, len(candidates))
         if policy == "random":
             return random.sample(candidates, n)
@@ -352,8 +465,18 @@ class ValidateMasksEngine:
     def _build_patient_views(
         self,
         selected: list[dict],
-    ) -> tuple[list[PatientView], dict[str, np.ndarray], list[dict]]:
-        """Derive masks and build PatientView objects for the selected scans."""
+    ) -> tuple[list[PatientView], dict[str, np.ndarray], list[dict], dict[str, CropPadSpec]]:
+        """Derive masks and build PatientView objects for the selected scans.
+
+        Returns
+        -------
+        tuple
+            ``(patient_views, mask_latents_dict, meta_rows, crop_specs_dict)``
+
+            ``crop_specs_dict`` maps ``scan_id`` → ``CropPadSpec`` for use by
+            :func:`render_mask_qc` (consistent-slice crop-frame rendering) and
+            :func:`check_mask_invariants` (crop-frame invariant checks).
+        """
         import h5py
 
         from vena.common import CropPadSpec
@@ -362,6 +485,7 @@ class ValidateMasksEngine:
         patient_views: list[PatientView] = []
         mask_latents_dict: dict[str, np.ndarray] = {}
         meta_rows: list[dict] = []
+        crop_specs_dict: dict[str, Any] = {}  # scan_id → CropPadSpec
 
         for entry in selected:
             scan_id: str = entry["scan_id"]
@@ -383,6 +507,7 @@ class ValidateMasksEngine:
                 native_shape=(label.shape[0], label.shape[1], label.shape[2]),
                 target_shape=(192, 224, 192),
             )
+            crop_specs_dict[scan_id] = crop_spec
 
             try:
                 soft_latent = derive_latent_soft_mask(
@@ -399,20 +524,16 @@ class ValidateMasksEngine:
             soft_latent_np = soft_latent.numpy()  # (2, 48, 56, 48)
             mask_latents_dict[scan_id] = soft_latent_np
 
-            # Image-resolution soft mask: reuse the GT-path intermediate
-            # (SDT sigmoid before pooling) — approximate via a simple
-            # binarisation + smooth for the viz.  The latent mask is the
-            # authoritative one; the image-res mask is for visual reference.
-            wt_bin = (label > 0).astype(np.float32)
-            netc_bin = (label == 1).astype(np.float32)
-            soft_img = np.stack([wt_bin, netc_bin], axis=0)  # (2, H, W, D)
+            # True sigmoid(SDT/σ) at image resolution — NOT a binary step function.
+            # This is what powers the colormap overlay in Row 1 of the QC figure.
+            soft_img: np.ndarray = make_soft_targets(label, cfg.targets)  # (2, H, W, D)
 
             tumor_vol = float((label > 0).sum())
             pv = PatientView(
                 patient_id=scan_id,
                 t1pre=t1pre,
                 soft_mask=soft_img,
-                hard_label=label,  # true integer label; render_mask_qc uses label==1 for NETC
+                hard_label=label,  # true integer label; render_mask_qc ndim==3 branch
                 tumor_volume=tumor_vol,
                 cohort=cohort,
             )
@@ -425,23 +546,25 @@ class ValidateMasksEngine:
                 }
             )
             logger.debug(
-                "derived mask for %s  WT_mean=%.4f  NETC_mean=%.4f",
+                "derived mask for %s  TC_mean=%.4f  NETC_mean=%.4f",
                 scan_id,
                 float(soft_latent_np[0].mean()),
                 float(soft_latent_np[1].mean()),
             )
 
-        return patient_views, mask_latents_dict, meta_rows
+        return patient_views, mask_latents_dict, meta_rows, crop_specs_dict
 
     def _write_report(
         self,
         path: Path,
         patient_views: list[PatientView],
         stats: dict,
+        invariant_stats: list[dict],
         figure_paths: list[Path],
         produced_at: str,
     ) -> None:
         """Write a minimal Markdown report."""
+        n_fail = sum(1 for r in invariant_stats if not r.get("invariant_ok", True))
         lines = [
             "# validate_masks — soft-mask QC report",
             "",
@@ -453,6 +576,27 @@ class ValidateMasksEngine:
             f"- `soft_mass_fraction_in_wt`: {stats['soft_mass_fraction_in_wt']:.4f}",
             f"- `netc_violation_count`: {stats['netc_violation_count']}",
             f"- `empty_mask_count`: {stats['empty_mask_count']}",
+            "",
+            "## Invariant checks",
+            "",
+            f"- **{n_fail} / {len(invariant_stats)} patients failed** (see `decision.json::invariant_stats`)",
+        ]
+        if n_fail > 0:
+            lines.append("")
+            lines.append("### Failing patients")
+            lines.append("")
+            for row in invariant_stats:
+                if not row.get("invariant_ok", True):
+                    pid = row["patient_id"]
+                    iou = row.get("latent_image_iou", "?")
+                    viol = row.get("hard_subset_soft_violation_frac", "?")
+                    cont = row.get("soft_intermediate_frac", "?")
+                    lines.append(
+                        f"- `{pid}`: hard_viol={viol:.3f}  soft_cont={cont:.4f}  IoU={iou:.3f}"
+                        if isinstance(iou, float)
+                        else f"- `{pid}`: data unavailable"
+                    )
+        lines += [
             "",
             "## Figures",
             "",

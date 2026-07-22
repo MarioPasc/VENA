@@ -564,3 +564,341 @@ class TestComputeMaskStats:
 
         with pytest.raises(SegMetricError):
             compute_mask_stats(np.zeros((4, 10, 10), dtype=np.float32))
+
+
+# ---------------------------------------------------------------------------
+# check_mask_invariants — per-patient crop-frame invariant checks
+# ---------------------------------------------------------------------------
+
+
+def _make_inv_soft_img(*, wt_val: float = 0.8, netc_val: float = 0.4) -> np.ndarray:
+    """Build (2, 192, 224, 192) soft mask with TC and nested NETC."""
+    mask = np.zeros((2, 192, 224, 192), dtype=np.float32)
+    mask[0, 80:112, 90:134, 80:112] = wt_val  # TC block 32×44×32
+    mask[1, 88:104, 100:124, 88:104] = netc_val  # NETC nested inside
+    return mask
+
+
+def _make_inv_hard_label() -> np.ndarray:
+    """Build (192, 224, 192) BraTS int label matching _make_inv_soft_img."""
+    label = np.zeros((192, 224, 192), dtype=np.int32)
+    label[80:112, 90:134, 80:112] = 4  # ET — part of TC
+    label[88:104, 100:124, 88:104] = 1  # NETC nested inside ET
+    return label
+
+
+def _make_inv_latent_aligned() -> np.ndarray:
+    """Build (2, 48, 56, 48) latent whose ×4 upscale overlaps the TC region.
+
+    TC at [80:112, 90:134, 80:112] → latent approx [20:28, 22:33, 20:28].
+    After upscale ×4: [80:112, 88:132, 80:112].
+    Intersection with soft TC: [80:112, 90:132, 80:112] → IoU ≈ 0.91.
+    """
+    mask = np.zeros((2, 48, 56, 48), dtype=np.float32)
+    mask[0, 20:28, 22:33, 20:28] = 0.8
+    mask[1, 22:26, 25:31, 22:26] = 0.4
+    return mask
+
+
+def _make_inv_latent_misaligned() -> np.ndarray:
+    """Build (2, 48, 56, 48) latent far from the TC region (registration failure)."""
+    mask = np.zeros((2, 48, 56, 48), dtype=np.float32)
+    # Place the TC region at the opposite corner from [20:28, 22:33, 20:28]
+    mask[0, 0:4, 0:4, 44:48] = 0.8
+    mask[1, 0:2, 0:2, 45:48] = 0.4
+    return mask
+
+
+class TestCheckMaskInvariants:
+    """Tests for vena.segmentation.metrics.visualize.check_mask_invariants."""
+
+    def test_all_invariants_pass(self) -> None:
+        """Well-formed masks pass all invariants; invariant_ok=True."""
+        from vena.segmentation.metrics.visualize import check_mask_invariants
+
+        result = check_mask_invariants(
+            _make_inv_soft_img(),
+            _make_inv_hard_label(),
+            _make_inv_latent_aligned(),
+            patient_id="SYN-PASS",
+        )
+        assert result["invariant_ok"] is True, (
+            f"Expected invariant_ok=True for well-formed masks; got {result}"
+        )
+
+    def test_hard_subset_soft_no_violation(self) -> None:
+        """Hard TC voxels all have soft_TC > 0.5 → violation_frac ≈ 0."""
+        from vena.segmentation.metrics.visualize import check_mask_invariants
+
+        result = check_mask_invariants(
+            _make_inv_soft_img(wt_val=0.8),
+            _make_inv_hard_label(),
+            _make_inv_latent_aligned(),
+            patient_id="SYN-HSS",
+        )
+        assert result["hard_subset_soft_violation_frac"] < 0.01, (
+            f"Expected ~0 violations; got {result['hard_subset_soft_violation_frac']:.4f}"
+        )
+
+    def test_hard_subset_soft_violation_detected(self) -> None:
+        """Hard TC voxels with soft_TC = 0.3 < 0.5 → violation_frac > 0."""
+        from vena.segmentation.metrics.visualize import check_mask_invariants
+
+        # Soft TC intentionally LOW (0.3) so hard TC voxels fall below the 0.5 threshold
+        result = check_mask_invariants(
+            _make_inv_soft_img(wt_val=0.3),
+            _make_inv_hard_label(),
+            _make_inv_latent_aligned(),
+            patient_id="SYN-VIOL",
+        )
+        assert result["hard_subset_soft_violation_frac"] > 0.0, (
+            "Expected >0 violations when soft_TC < 0.5 inside hard TC region"
+        )
+
+    def test_soft_continuous_nonzero(self) -> None:
+        """soft_intermediate_frac > 0 for a mask with values in (0.05, 0.95)."""
+        from vena.segmentation.metrics.visualize import check_mask_invariants
+
+        soft = _make_inv_soft_img(wt_val=0.6)
+        result = check_mask_invariants(
+            soft,
+            _make_inv_hard_label(),
+            _make_inv_latent_aligned(),
+            patient_id="SYN-CONT",
+        )
+        assert result["soft_intermediate_frac"] > 0.0, (
+            "soft_intermediate_frac must be > 0 for mask with values in (0.05, 0.95)"
+        )
+
+    def test_registration_iou_high_when_aligned(self) -> None:
+        """IoU ≳ 0.7 when latent upscaled ×4 substantially overlaps image-soft."""
+        from vena.segmentation.metrics.visualize import check_mask_invariants
+
+        result = check_mask_invariants(
+            _make_inv_soft_img(),
+            _make_inv_hard_label(),
+            _make_inv_latent_aligned(),
+            patient_id="SYN-IOUhi",
+        )
+        iou = result["latent_image_iou"]
+        assert iou > 0.70, f"Expected IoU > 0.70 for aligned masks; got {iou:.3f}"
+
+    def test_registration_iou_low_when_misaligned(self) -> None:
+        """IoU ≈ 0 when latent is placed far from the image-soft TC region."""
+        from vena.segmentation.metrics.visualize import check_mask_invariants
+
+        result = check_mask_invariants(
+            _make_inv_soft_img(),
+            _make_inv_hard_label(),
+            _make_inv_latent_misaligned(),
+            patient_id="SYN-IOUlo",
+        )
+        iou = result["latent_image_iou"]
+        assert iou < 0.30, (
+            f"Expected IoU < 0.30 for misaligned latent; got {iou:.3f} — "
+            "this simulates a pool/crop registration bug"
+        )
+        # invariant_ok must be False (registration check failed)
+        assert result["invariant_ok"] is False
+
+    def test_wrong_soft_img_shape_raises(self) -> None:
+        """SegMetricError raised when soft_img_crop has wrong shape."""
+        from vena.segmentation.exceptions import SegMetricError
+        from vena.segmentation.metrics.visualize import check_mask_invariants
+
+        with pytest.raises(SegMetricError, match="soft_img_crop"):
+            check_mask_invariants(
+                np.zeros((2, 10, 10, 10), dtype=np.float32),  # wrong shape
+                _make_inv_hard_label(),
+                _make_inv_latent_aligned(),
+                patient_id="SYN-BAD",
+            )
+
+    def test_wrong_latent_shape_raises(self) -> None:
+        """SegMetricError raised when soft_latent has wrong shape."""
+        from vena.segmentation.exceptions import SegMetricError
+        from vena.segmentation.metrics.visualize import check_mask_invariants
+
+        with pytest.raises(SegMetricError, match="soft_latent"):
+            check_mask_invariants(
+                _make_inv_soft_img(),
+                _make_inv_hard_label(),
+                np.zeros((2, 10, 10, 10), dtype=np.float32),  # wrong shape
+                patient_id="SYN-BAD2",
+            )
+
+    def test_empty_mask_passes_invariants(self) -> None:
+        """All-zero masks (no-TC patient) pass invariants — empty TC is valid.
+
+        When TC is entirely absent (e.g. edema-only patient), checks (b) and
+        (c) are gated by ``has_tc_region=False`` and trivially pass.  The
+        engine must not flag these patients as derivation failures.
+        """
+        from vena.segmentation.metrics.visualize import check_mask_invariants
+
+        result = check_mask_invariants(
+            np.zeros((2, 192, 224, 192), dtype=np.float32),
+            np.zeros((192, 224, 192), dtype=np.int32),
+            np.zeros((2, 48, 56, 48), dtype=np.float32),
+            patient_id="SYN-EMPTY",
+        )
+        assert result["has_tc_region"] is False
+        # Checks (b) and (c) are skipped → invariant_ok must be True
+        assert result["invariant_ok"] is True, (
+            "Empty-TC patients must pass invariants; got invariant_ok=False"
+        )
+        assert result["hard_subset_soft_violation_frac"] == pytest.approx(0.0)
+
+    def test_result_keys_present(self) -> None:
+        """Result dict contains all mandatory keys."""
+        from vena.segmentation.metrics.visualize import check_mask_invariants
+
+        result = check_mask_invariants(
+            _make_inv_soft_img(),
+            _make_inv_hard_label(),
+            _make_inv_latent_aligned(),
+            patient_id="SYN-KEYS",
+        )
+        required_keys = {
+            "patient_id",
+            "has_tc_region",
+            "hard_subset_soft_violation_frac",
+            "soft_intermediate_frac",
+            "latent_image_iou",
+            "latent_image_centroid_dist_vox",
+            "invariant_ok",
+        }
+        missing = required_keys - set(result.keys())
+        assert not missing, f"Missing keys in invariant result: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# render_mask_qc with crop_spec — consistent-slice crop-frame rendering
+# ---------------------------------------------------------------------------
+
+
+class TestRenderMaskQcCropSpec:
+    """Tests for render_mask_qc with crop_spec (crop-frame branch)."""
+
+    def _make_crop_spec(self, native_h: int = 200, native_w: int = 240, native_d: int = 200):
+        """Return a CropPadSpec that crops (192,224,192) from the centre."""
+        from vena.common import CropPadSpec
+
+        return CropPadSpec(
+            crop_origin=(4, 8, 4),
+            native_shape=(native_h, native_w, native_d),
+            target_shape=(192, 224, 192),
+        )
+
+    def test_writes_file_with_crop_spec(self, tmp_path: pytest.FixtureDef) -> None:
+        """render_mask_qc with crop_spec runs and writes a PNG."""
+        from vena.segmentation.metrics.visualize import render_mask_qc
+
+        h, w, d = 200, 240, 200
+        rng = np.random.default_rng(42)
+        image = rng.uniform(0, 1, (h, w, d)).astype(np.float32)
+
+        label = np.zeros((h, w, d), dtype=np.int32)
+        # TC region near crop origin so it appears in the crop frame
+        label[10:30, 20:50, 10:30] = 4  # ET
+        label[15:25, 28:42, 15:25] = 1  # NETC
+
+        soft_img = np.zeros((2, h, w, d), dtype=np.float32)
+        soft_img[0, 10:30, 20:50, 10:30] = 0.75  # TC channel
+        soft_img[1, 15:25, 28:42, 15:25] = 0.45  # NETC channel
+
+        crop_spec = self._make_crop_spec(h, w, d)
+        out = render_mask_qc(
+            image,
+            label,
+            soft_img,
+            _make_soft_mask_latent(),
+            patient_id="SYN-CROP-001",
+            path=tmp_path / "qc_crop.png",
+            roi_label="TC",
+            crop_spec=crop_spec,
+        )
+        assert out.exists(), "render_mask_qc with crop_spec must write the PNG"
+
+    def test_title_contains_crop_frame(self, tmp_path: pytest.FixtureDef) -> None:
+        """Suptitle contains 'crop frame' when crop_spec is provided."""
+        from unittest.mock import patch
+
+        import matplotlib.pyplot as plt
+
+        from vena.segmentation.metrics.visualize import render_mask_qc
+
+        h, w, d = 200, 240, 200
+        rng = np.random.default_rng(7)
+        image = rng.uniform(0, 1, (h, w, d)).astype(np.float32)
+        label = np.zeros((h, w, d), dtype=np.int32)
+        label[10:30, 20:50, 10:30] = 4
+        soft_img = np.zeros((2, h, w, d), dtype=np.float32)
+        soft_img[0, 10:30, 20:50, 10:30] = 0.75
+
+        captured_suptitles: list[str] = []
+        original = plt.Figure.suptitle
+
+        def mock_suptitle(self: plt.Figure, t: str, **kwargs: object) -> object:  # type: ignore[misc]
+            captured_suptitles.append(t)
+            return original(self, t, **kwargs)
+
+        crop_spec = self._make_crop_spec(h, w, d)
+        with patch.object(plt.Figure, "suptitle", mock_suptitle):
+            render_mask_qc(
+                image,
+                label,
+                soft_img,
+                _make_soft_mask_latent(),
+                patient_id="SYN-CROP-002",
+                path=tmp_path / "qc_crop2.png",
+                roi_label="TC",
+                crop_spec=crop_spec,
+            )
+
+        assert any("crop frame" in t for t in captured_suptitles), (
+            f"Expected 'crop frame' in suptitle; got: {captured_suptitles}"
+        )
+
+    def test_overlay_cmap_rgba_continuous(self) -> None:
+        """_overlay_cmap_rgba produces >2 distinct alpha values (continuous, not binary)."""
+        import matplotlib.pyplot as plt
+
+        from vena.segmentation.metrics.visualize import _overlay_cmap_rgba
+
+        prob = np.linspace(0.0, 1.0, 400).reshape(20, 20).astype(np.float32)
+        rgba = _overlay_cmap_rgba(prob, plt.cm.YlGn, alpha_max=0.75)
+
+        assert rgba.shape == (20, 20, 4), f"Expected (20,20,4); got {rgba.shape}"
+        n_distinct_alpha = len(np.unique(rgba[:, :, 3]))
+        assert n_distinct_alpha > 10, (
+            f"Expected >10 distinct alpha values (continuous overlay); got {n_distinct_alpha}"
+        )
+
+    def test_overlay_cmap_rgba_zero_prob_transparent(self) -> None:
+        """At probability 0, overlay alpha is 0 (fully transparent)."""
+        import matplotlib.pyplot as plt
+
+        from vena.segmentation.metrics.visualize import _overlay_cmap_rgba
+
+        prob = np.zeros((5, 5), dtype=np.float32)
+        rgba = _overlay_cmap_rgba(prob, plt.cm.RdPu, alpha_max=0.8)
+        np.testing.assert_allclose(
+            rgba[:, :, 3], 0.0, err_msg="Alpha must be 0 when probability is 0"
+        )
+
+    def test_overlay_cmap_rgba_max_prob_alpha(self) -> None:
+        """At probability 1.0, overlay alpha equals alpha_max."""
+        import matplotlib.pyplot as plt
+
+        from vena.segmentation.metrics.visualize import _overlay_cmap_rgba
+
+        prob = np.ones((5, 5), dtype=np.float32)
+        alpha_max = 0.75
+        rgba = _overlay_cmap_rgba(prob, plt.cm.YlGn, alpha_max=alpha_max)
+        np.testing.assert_allclose(
+            rgba[:, :, 3],
+            alpha_max,
+            rtol=1e-5,
+            err_msg=f"Alpha must equal alpha_max={alpha_max} when probability is 1.0",
+        )
