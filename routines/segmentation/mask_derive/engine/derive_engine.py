@@ -347,13 +347,16 @@ class MaskDeriveEngine:
             )
             # Self-describing attrs (h5-design-principles.md principle 4).
             dset.attrs["units"] = "dimensionless"
+            tumor_region = cfg.targets.tumor_region
             dset.attrs["description"] = (
-                "Soft [WT, NETC] tumour probability map in MAISI latent space; "
-                f"source='{cfg.source}'; channel 0 = WT, channel 1 = NETC; "
+                f"Soft [{tumor_region.upper()}, NETC] tumour probability map in MAISI latent space; "
+                f"source='{cfg.source}'; channel 0 = {tumor_region.upper()}, channel 1 = NETC; "
                 "SDT→sigmoid at image res, avg-pooled 4× to (2, 48, 56, 48)."
             )
             dset.attrs["dtype"] = "float32"
             dset.attrs["leading_dim"] = "n_scans"
+            # Record the channel-0 region so the cache is self-documenting.
+            dset.attrs["tumor_region"] = tumor_region
 
             # Bump root schema_version and stamp provenance.
             f_lat.attrs["schema_version"] = LATENT_SCHEMA_VERSION_SOFT

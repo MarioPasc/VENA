@@ -231,13 +231,14 @@ class ValidateMasksEngine:
             render_mask_qc(
                 image=pv.t1pre,
                 # Pass the true integer label so render_mask_qc's ndim==3 branch
-                # uses WT=(label>0) and NETC=(label==1) — not the WT binary
-                # (which would make label==1 select the entire WT region).
+                # uses TC=(label>0)&(label!=2) or WT=(label>0) for channel 0
+                # and NETC=(label==1) — not the channel-0 binary.
                 hard_mask=pv.hard_label,
                 soft_mask_img=pv.soft_mask,
                 soft_mask_latent=lat_mask,
                 patient_id=pv.patient_id,
                 path=fig_path,
+                roi_label=cfg.targets.tumor_region.upper(),
             )
             figure_paths.append(fig_path)
             logger.debug("wrote QC figure for %s", pv.patient_id)

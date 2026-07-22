@@ -118,6 +118,14 @@ class TargetConfig(BaseModel):
     clip_vox:
         Clip absolute SDT values to this radius (voxels) before softening.
         Prevents extreme gradient magnitudes from large background regions.
+    tumor_region:
+        Channel-0 conditioning region.  ``"tc"`` = tumour core (NETC + ET),
+        excludes non-enhancing edema — the corrected default for T1c
+        enhancement conditioning; 81% of WT is non-enhancing edema so WT
+        dilutes the enhancement signal.  ``"wt"`` = whole tumour (legacy,
+        ablation only).  TC is defined code-agnostically as
+        ``(label > 0) & (label != 2)`` which maps to NETC+ET in both
+        BraTS-2021 (ET=4) and BraTS-2023 (ET=3) conventions.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -126,6 +134,7 @@ class TargetConfig(BaseModel):
     sdt_sigma_vox: float = 3.0
     netc_operator: Literal["euclidean_percomponent", "geodesic"] = "euclidean_percomponent"
     clip_vox: float = 10.0
+    tumor_region: Literal["wt", "tc"] = "tc"
 
 
 class LossConfig(BaseModel):

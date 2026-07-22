@@ -1,16 +1,22 @@
-"""Soft target generation: hard BraTS labels → soft [WT, NETC] via SDT → sigmoid.
+"""Soft target generation: hard BraTS labels → soft [TC, NETC] via SDT → sigmoid.
 
 Pipeline (per class):
-1. ``harmonise_labels`` — integer label map → boolean WT and NETC masks.
+1. ``harmonise_labels`` — integer label map → boolean WT, TC, and NETC masks.
 2. ``signed_distance`` — per-class signed distance transform (SDT > 0 inside,
    < 0 outside, ≈ 0 at boundary, clipped to ±clip_vox).
 3. ``sigmoid(SDT / sigma_vox)`` — soft probability in [0, 1]; 0.5 at the
    boundary, ~0.95 at 3σ inside, ~0.05 at 3σ outside.
-4. Nesting enforcement: ``NETC_soft ≤ WT_soft`` elementwise (NETC ⊆ WT by
-   anatomy; clamp after softening as belt-and-suspenders for edge cases).
-5. Return float32 ``(2, H, W, D)`` with channel 0 = WT, channel 1 = NETC.
+4. Nesting enforcement: ``NETC_soft ≤ channel0_soft`` elementwise (NETC ⊆ TC
+   and NETC ⊆ WT by anatomy; clamp after softening as belt-and-suspenders).
+5. Return float32 ``(2, H, W, D)`` with channel 0 = ``cfg.tumor_region`` soft
+   mask (default TC = tumour core, excludes non-enhancing edema) and
+   channel 1 = NETC.
 
-Design authority: segmenter-conditioning design §B.c step 1, §B.d, §B.f-4.
+Default (``cfg.tumor_region == "tc"``): channel 0 = TC (NETC+ET, no edema).
+Legacy (``cfg.tumor_region == "wt"``): channel 0 = WT (whole tumour, ablation).
+
+Design authority: segmenter-conditioning design §B.c step 1, §B.d, §B.f-4,
+and the 2026-07-22 TC correction (81% of WT is non-enhancing edema on UCSF).
 """
 
 from __future__ import annotations
@@ -96,9 +102,10 @@ def make_soft_targets(
 ) -> NDArray:
     """Build a ``(2, H, W, D)`` soft-target tensor from a hard BraTS label map.
 
-    Channel order: channel 0 = WT (whole-tumour), channel 1 = NETC (necrotic
-    core).  Both channels are float32 in ``[0, 1]``.  Nesting is enforced
-    elementwise: ``channel1 ≤ channel0``.
+    Channel order: channel 0 = ``cfg.tumor_region`` soft mask (TC by default,
+    WT for ablation), channel 1 = NETC (necrotic core).  Both channels are
+    float32 in ``[0, 1]``.  Nesting is enforced elementwise:
+    ``channel1 ≤ channel0`` (holds for both TC and WT since NETC ⊆ TC ⊆ WT).
 
     Parameters
     ----------
@@ -113,7 +120,7 @@ def make_soft_targets(
         Both map to the same boolean regions via code-agnostic rules.
     cfg : TargetConfig
         Pydantic model with fields ``soft``, ``sdt_sigma_vox``,
-        ``netc_operator``, and ``clip_vox``.
+        ``netc_operator``, ``clip_vox``, and ``tumor_region``.
     image : NDArray or None
         Intensity volume of shape ``(H, W, D)``.  Required when
         ``cfg.netc_operator == "geodesic"``.
@@ -121,7 +128,8 @@ def make_soft_targets(
     Returns
     -------
     NDArray
-        Float32 array of shape ``(2, H, W, D)``: channel 0 = WT soft mask,
+        Float32 array of shape ``(2, H, W, D)``:
+        channel 0 = TC soft mask (default) or WT soft mask (ablation),
         channel 1 = NETC soft mask, with ``channel1 ≤ channel0`` guaranteed.
 
     Raises
@@ -139,12 +147,13 @@ def make_soft_targets(
         raise SegTargetError(f"label must be 3-D (H, W, D), got shape {label.shape}")
 
     regions = harmonise_labels(label)
-    wt_mask: NDArray = regions["wt"]
+    # Channel 0: TC (default) or WT (ablation) — selected by cfg.tumor_region
+    ch0_mask: NDArray = regions[cfg.tumor_region]
     netc_mask: NDArray = regions["netc"]
 
-    # WT: typically a single connected region; per-component is still correct
-    wt_soft = soft_target(
-        wt_mask,
+    # Channel 0: typically a single connected region; per-component is correct for both
+    ch0_soft = soft_target(
+        ch0_mask,
         sigma_vox=cfg.sdt_sigma_vox,
         mode="euclidean_percomponent",
         image=None,
@@ -160,7 +169,7 @@ def make_soft_targets(
         clip_vox=cfg.clip_vox,
     )
 
-    # Enforce anatomical nesting: NETC ⊆ WT (necrotic core is inside whole-tumour)
-    netc_soft = np.minimum(netc_soft, wt_soft)
+    # Enforce anatomical nesting: NETC ⊆ TC (and NETC ⊆ WT) by anatomy
+    netc_soft = np.minimum(netc_soft, ch0_soft)
 
-    return np.stack([wt_soft, netc_soft], axis=0).astype(np.float32)
+    return np.stack([ch0_soft, netc_soft], axis=0).astype(np.float32)

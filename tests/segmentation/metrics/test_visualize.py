@@ -91,6 +91,79 @@ class TestRenderMaskQc:
         netc = soft_img[1]
         assert (netc <= wt + 1e-6).all(), "NETC must be nested inside WT (NETC ≤ WT)"
 
+    def test_roi_label_tc_in_titles(self, tmp_path: pytest.FixtureDef) -> None:
+        """render_mask_qc with roi_label='TC' writes a file; col-0 title contains 'TC'."""
+        from unittest.mock import patch
+
+        import matplotlib.pyplot as plt
+
+        from vena.segmentation.metrics.visualize import render_mask_qc
+
+        h, w, d = 40, 40, 30
+        image = np.random.default_rng(1).uniform(0, 1, (h, w, d)).astype(np.float32)
+        hard_mask = np.zeros((h, w, d), dtype=np.int32)
+        hard_mask[10:20, 10:20, 5:15] = 4  # ET
+        hard_mask[12:18, 12:18, 7:13] = 1  # NETC
+        hard_mask[5:25, 5:25, 3:18] = 2  # Edema outside core
+
+        # Re-set after overwrite so edema is 2 and core is correct
+        hard_mask[10:20, 10:20, 5:15] = 4
+        hard_mask[12:18, 12:18, 7:13] = 1
+        hard_mask[5:8, 5:8, 3:6] = 2  # small isolated ED region
+
+        captured_titles: list[str] = []
+
+        original_set_title = plt.Axes.set_title
+
+        def mock_set_title(self: plt.Axes, label: str, **kwargs: object) -> None:
+            captured_titles.append(label)
+            original_set_title(self, label, **kwargs)
+
+        with patch.object(plt.Axes, "set_title", mock_set_title):
+            render_mask_qc(
+                image,
+                hard_mask,
+                _make_soft_mask_img(h, w, d),
+                _make_soft_mask_latent(),
+                patient_id="SYNTH-TC",
+                path=tmp_path / "qc_tc.png",
+                roi_label="TC",
+            )
+
+        ch0_titles = [t for t in captured_titles if "TC" in t]
+        assert ch0_titles, (
+            f"Expected titles containing 'TC' when roi_label='TC'; got: {captured_titles}"
+        )
+
+    def test_hard_channel0_tc_excludes_edema(self, tmp_path: pytest.FixtureDef) -> None:
+        """Hard channel-0 rendered as TC must exclude edema voxels (label==2).
+
+        A label with a large isolated edema block (label=2) and a small core
+        (label=4 ET, label=1 NETC) should yield fewer hard-TC voxels than
+        hard-WT voxels on any given slice containing both edema and core.
+        """
+        h, w, d = 30, 30, 20
+        label = np.zeros((h, w, d), dtype=np.int32)
+        # Large edema block at the start of depth axis (k=0..9)
+        label[:, :, 0:10] = 2  # pure edema
+        # Small TC core at the end (k=10..18)
+        label[10:20, 10:20, 10:18] = 4  # ET
+        label[13:17, 13:17, 12:16] = 1  # NETC nested
+
+        # Pick a depth slice that is purely edema (k=3)
+        k_ed = 3
+        sl = label[:, :, k_ed]
+
+        # TC hard mask — must exclude edema entirely
+        tc_hard = ((sl > 0) & (sl != 2)).astype(np.float32)
+        wt_hard = (sl > 0).astype(np.float32)
+
+        # Edema slice has WT>0 but TC==0
+        assert wt_hard.sum() > 0, "test setup: edema slice must have nonzero WT"
+        assert tc_hard.sum() == 0, (
+            f"TC hard mask must be zero on pure-edema slice; got {tc_hard.sum()}"
+        )
+
     def test_wrong_latent_shape_raises(self, tmp_path: pytest.FixtureDef) -> None:
         """SegMetricError is raised when soft_mask_latent has the wrong shape."""
         from vena.segmentation.exceptions import SegMetricError

@@ -1,6 +1,6 @@
 """Label harmonisation for BraTS-style segmentation masks.
 
-Converts multi-class integer labels to boolean WT and NETC masks using
+Converts multi-class integer labels to boolean WT, TC, and NETC masks using
 code-agnostic rules that cover both BraTS-2021 and BraTS-2023 label
 conventions without branching on the cohort name.
 
@@ -11,8 +11,16 @@ BraTS-2023 (BraTS-GLI/PED/Africa, LUMIERE):
     0 = background, 1 = NETC, 2 = ED, 3 = ET.
 
 Derived regions (code-agnostic across both conventions):
-    WT   = label > 0   (whole-tumour: any non-background label)
-    NETC = label == 1  (necrotic core: label 1 in both conventions)
+    WT   = label > 0              (whole-tumour: any non-background label)
+    TC   = (label > 0) & (label != 2)  (tumour core: NETC + ET, excludes edema=2)
+    NETC = label == 1             (necrotic core: label 1 in both conventions)
+
+TC is the corrected default for T1c enhancement conditioning: edema (label 2)
+does not enhance on T1c, so including it in channel 0 floods the conditioning
+signal with non-enhancing tissue (≈81% of WT on UCSF-PDGM).  With TC,
+``TC − NETC = ET`` = the true enhancing region; nesting ``NETC ⊆ TC`` holds
+by definition since label 2 (edema) is excluded from TC but NETC (label 1)
+is included.
 """
 
 from __future__ import annotations
@@ -41,8 +49,13 @@ def harmonise_labels(label: NDArray) -> dict[str, NDArray]:
     Returns
     -------
     dict[str, NDArray]
-        ``{"wt": ..., "netc": ...}`` where each value is a *bool* array of
-        the same shape as *label*.
+        ``{"wt": ..., "tc": ..., "netc": ...}`` where each value is a *bool*
+        array of the same shape as *label*:
+
+        * ``"wt"``   — whole tumour: ``label > 0``.
+        * ``"tc"``   — tumour core: ``(label > 0) & (label != 2)``.  Excludes
+          edema (label 2); maps to NETC+ET in both BraTS-2021 and BraTS-2023.
+        * ``"netc"`` — necrotic core: ``label == 1`` in both conventions.
 
     Raises
     ------
@@ -54,7 +67,9 @@ def harmonise_labels(label: NDArray) -> dict[str, NDArray]:
 
     # WT: any non-background label — code-agnostic across BraTS-2021 and 2023
     wt: NDArray = (label > 0).astype(bool)
+    # TC: tumour core = NETC + ET; excludes edema (label 2) in both conventions
+    tc: NDArray = ((label > 0) & (label != 2)).astype(bool)
     # NETC: label == 1 in both conventions (necrotic core / non-enhancing tumour core)
     netc: NDArray = (label == 1).astype(bool)
 
-    return {"wt": wt, "netc": netc}
+    return {"wt": wt, "tc": tc, "netc": netc}

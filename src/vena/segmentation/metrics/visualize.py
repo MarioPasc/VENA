@@ -73,7 +73,7 @@ def _axial_tumor_slices(soft_mask: np.ndarray, n_cols: int) -> np.ndarray:
     Parameters
     ----------
     soft_mask : np.ndarray
-        Shape ``(2, H, W, D)``.  Channel 0 = WT.
+        Shape ``(2, H, W, D)``.  Channel 0 = TC (default) or WT (ablation).
     n_cols : int
         Number of slices to return.
 
@@ -82,11 +82,11 @@ def _axial_tumor_slices(soft_mask: np.ndarray, n_cols: int) -> np.ndarray:
     np.ndarray
         1-D int array of length *n_cols*, depth indices into axis 2.
     """
-    wt = soft_mask[0]  # (H, W, D)
-    depth_presence = wt.sum(axis=(0, 1)) > 0  # area-based: any tumour-covered voxels
+    ch0 = soft_mask[0]  # (H, W, D) — TC or WT depending on cfg.tumor_region
+    depth_presence = ch0.sum(axis=(0, 1)) > 0  # area-based: any tumour-covered voxels
     z_tumour = np.where(depth_presence)[0]
     if len(z_tumour) == 0:
-        d = wt.shape[2]
+        d = ch0.shape[2]
         return np.linspace(0, d - 1, n_cols, dtype=int)
     return np.linspace(z_tumour[0], z_tumour[-1], n_cols, dtype=int)
 
@@ -158,7 +158,7 @@ class PatientView:
     t1pre : np.ndarray
         T1pre volume, shape ``(H, W, D)``, float in ``[0, 1]``.
     soft_mask : np.ndarray
-        Soft ``[WT, NETC]`` probability map at **image** resolution,
+        Soft ``[TC, NETC]`` (or ``[WT, NETC]`` for ablation) probability map at **image** resolution,
         shape ``(2, H, W, D)``, float in ``[0, 1]``.
     tumor_volume : float
         Tumour volume in voxels (WT channel sum); used for row ordering.
@@ -189,7 +189,7 @@ def compute_mask_stats(soft_masks: np.ndarray) -> dict[str, float | int]:
     ----------
     soft_masks : np.ndarray
         Float32 array of shape ``(N, 2, H, W, D)`` in ``[0, 1]``.
-        Channel 0 = WT, channel 1 = NETC.
+        Channel 0 = TC or WT (per cfg.tumor_region), channel 1 = NETC.
 
     Returns
     -------
@@ -287,28 +287,38 @@ def render_mask_qc(
     *,
     patient_id: str,
     path: Path,
+    roi_label: str = "TC",
 ) -> Path:
     """Produce a 3-row QC figure for a single patient.
 
-    Row 0: T1pre anatomy + hard-mask overlay (WT | NETC).
-    Row 1: T1pre anatomy + soft-mask overlay at image resolution (WT | NETC).
-    Row 2: soft-mask displayed on the ``(48, 56, 48)`` latent grid (WT | NETC).
+    Row 0: T1pre anatomy + hard-mask overlay (``roi_label`` | NETC).
+    Row 1: T1pre anatomy + soft-mask overlay at image resolution
+           (``roi_label`` | NETC).
+    Row 2: soft-mask displayed on the ``(48, 56, 48)`` latent grid
+           (``roi_label`` | NETC).
 
     Parameters
     ----------
     image : np.ndarray
         T1pre volume, shape ``(H, W, D)``, float in ``[0, 1]``.
     hard_mask : np.ndarray
-        Binary integer label map ``(H, W, D)`` (BraTS convention); or
+        Integer label map ``(H, W, D)`` (BraTS convention); or
         ``(2, H, W, D)`` pre-binarized per-channel.
     soft_mask_img : np.ndarray
-        Soft ``[WT, NETC]`` map at image resolution, shape ``(2, H, W, D)``.
+        Soft ``[roi_label, NETC]`` map at image resolution, shape
+        ``(2, H, W, D)``.
     soft_mask_latent : np.ndarray
-        Soft ``[WT, NETC]`` map at latent grid, shape ``(2, *LATENT_SPATIAL)``.
+        Soft ``[roi_label, NETC]`` map at latent grid, shape
+        ``(2, *LATENT_SPATIAL)``.
     patient_id : str
         Label used in the figure suptitle.
     path : Path
         Output PNG path; parent directories must exist or will be created.
+    roi_label : str
+        Human-readable name for channel 0 (default ``"TC"`` = tumour core).
+        Use ``"WT"`` for legacy whole-tumour ablation runs.  Affects panel
+        titles and hard-mask rendering: ``"TC"`` uses
+        ``(label > 0) & (label != 2)``; any other value uses ``label > 0``.
 
     Returns
     -------
@@ -326,15 +336,15 @@ def render_mask_qc(
             f"soft_mask_latent must be {expected_lat}; got {soft_mask_latent.shape}"
         )
 
-    # Pick the axial slice with the largest WT tumour area (sum over H, W)
-    wt_img = soft_mask_img[0]  # (H, W, D)
-    depth_sums_img = wt_img.sum(axis=(0, 1))
-    k_img = int(np.argmax(depth_sums_img)) if depth_sums_img.max() > 0 else wt_img.shape[2] // 2
+    # Pick the axial slice with the largest channel-0 tumour area (sum over H, W)
+    ch0_img = soft_mask_img[0]  # (H, W, D)
+    depth_sums_img = ch0_img.sum(axis=(0, 1))
+    k_img = int(np.argmax(depth_sums_img)) if depth_sums_img.max() > 0 else ch0_img.shape[2] // 2
 
     # Same area criterion for the latent-grid row (depth = axis 2 of LATENT_SPATIAL)
-    wt_lat = soft_mask_latent[0]  # (48, 56, 48)
-    depth_sums_lat = wt_lat.sum(axis=(0, 1))
-    k_lat = int(np.argmax(depth_sums_lat)) if depth_sums_lat.max() > 0 else wt_lat.shape[2] // 2
+    ch0_lat = soft_mask_latent[0]  # (48, 56, 48)
+    depth_sums_lat = ch0_lat.sum(axis=(0, 1))
+    k_lat = int(np.argmax(depth_sums_lat)) if depth_sums_lat.max() > 0 else ch0_lat.shape[2] // 2
 
     # Anatomy slice window
     anat_sl = image[:, :, k_img]
@@ -348,9 +358,9 @@ def render_mask_qc(
     fig.suptitle(f"Mask QC — {patient_id}", color="white", fontsize=11)
 
     col_labels = [
-        ["WT (hard)", "NETC (hard)"],
-        ["WT (soft, image res)", "NETC (soft, image res)"],
-        ["WT (latent grid)", "NETC (latent grid)"],
+        [f"{roi_label} (hard)", "NETC (hard)"],
+        [f"{roi_label} (soft, image res)", "NETC (soft, image res)"],
+        [f"{roi_label} (latent grid)", "NETC (latent grid)"],
     ]
 
     # Row 0: anatomy + hard mask (binary; high-contrast colours)
@@ -359,9 +369,15 @@ def render_mask_qc(
         ax.set_facecolor("black")
         ax.imshow(np.rot90(anat_sl), cmap="gray", vmin=v0, vmax=v1)
         if hard_mask.ndim == 3:
-            # BraTS integer label: WT = label ∈ {1,2,3,4}; NETC = label == 1
+            # BraTS integer label — derive hard mask for the appropriate region
             if col == 0:
-                hm_bin = (hard_mask[:, :, k_img] > 0).astype(np.float32)
+                # TC: NETC+ET, excludes edema (label==2); WT: any non-background
+                if roi_label.upper() == "TC":
+                    hm_bin = ((hard_mask[:, :, k_img] > 0) & (hard_mask[:, :, k_img] != 2)).astype(
+                        np.float32
+                    )
+                else:
+                    hm_bin = (hard_mask[:, :, k_img] > 0).astype(np.float32)
             else:
                 hm_bin = (hard_mask[:, :, k_img] == 1).astype(np.float32)
         else:
