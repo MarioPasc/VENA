@@ -219,9 +219,11 @@ class DerivationConfig(BaseModel):
         spatial compression (240→60, 240→60, 155→~40).
     latent_grid:
         Expected spatial dimensions of the output latent mask tensor
-        ``(H, W, D)``.  MUST be ``(60, 60, 40)`` — the MAISI-V2 4×
-        compression of the ~(240, 240, 155) brain box.  ``(48, 56, 48)`` is
-        STALE and must never appear here.
+        ``(H, W, D)``.  Single source of truth:
+        :data:`vena.data.h5.latent_domain.manifest.LATENT_SPATIAL` = ``(48, 56, 48)``,
+        derived from crop box ``(192, 224, 192)`` avg-pooled at stride 4.
+        Must match the served latent H5 and the v3a warm-start checkpoint
+        (``base_img_size_numel = 48*56*48 = 129024``).
     emit_variance:
         If True, also write the per-voxel predictive variance alongside the
         mean soft mask (requires MC-dropout or ensemble).
@@ -231,7 +233,7 @@ class DerivationConfig(BaseModel):
 
     temperature: Literal["per_class", "global", "none"] = "per_class"
     avg_pool_stride: int = 4
-    latent_grid: tuple[int, int, int] = (60, 60, 40)
+    latent_grid: tuple[int, int, int] = (48, 56, 48)
     emit_variance: bool = False
 
 

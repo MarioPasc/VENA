@@ -79,13 +79,13 @@ def test_from_yaml_overrides(tmp_path: Path) -> None:
         """\
         seed: 42
         derivation:
-          latent_grid: [60, 60, 40]
+          latent_grid: [48, 56, 48]
           avg_pool_stride: 4
         """
     )
     cfg = SegmentationConfig.from_yaml(_write_yaml(tmp_path, content))
     assert cfg.seed == 42
-    assert cfg.derivation.latent_grid == (60, 60, 40)
+    assert cfg.derivation.latent_grid == (48, 56, 48)
 
 
 def test_frozen_raises_on_assignment(tmp_path: Path) -> None:
@@ -119,7 +119,7 @@ def test_unknown_nested_key_raises(tmp_path: Path) -> None:
     bad = _MINIMAL_YAML + textwrap.dedent(
         """\
         derivation:
-          latent_grid: [60, 60, 40]
+          latent_grid: [48, 56, 48]
           not_a_real_field: 99
         """
     )
@@ -133,11 +133,11 @@ def test_unknown_nested_key_raises(tmp_path: Path) -> None:
 
 
 def test_default_latent_grid() -> None:
-    """DerivationConfig.latent_grid default is exactly (60, 60, 40)."""
+    """DerivationConfig.latent_grid default is exactly (48, 56, 48)."""
     d = DerivationConfig()
-    assert d.latent_grid == (60, 60, 40), (
+    assert d.latent_grid == (48, 56, 48), (
         f"latent_grid default drifted to {d.latent_grid}; "
-        "must be (60, 60, 40) — the MAISI-V2 4× brain-box compression"
+        "must be (48, 56, 48) — LATENT_SPATIAL from vena.data.h5.latent_domain.manifest"
     )
 
 
@@ -163,10 +163,17 @@ def test_default_selection_metric() -> None:
     )
 
 
-def test_latent_grid_never_48_56_48() -> None:
-    """The stale (48, 56, 48) grid must not appear as the default."""
+def test_latent_grid_matches_served_latents() -> None:
+    """DerivationConfig.latent_grid matches LATENT_SPATIAL (single source of truth).
+
+    If this test fails the config default and the H5 manifest have drifted —
+    fix DerivationConfig, not the manifest.
+    """
+    from vena.data.h5.latent_domain.manifest import LATENT_SPATIAL
+
     d = DerivationConfig()
-    assert d.latent_grid != (48, 56, 48), (
-        "latent_grid is (48, 56, 48) — this is the stale FM config value, "
-        "not the MAISI spatial compression of the brain box"
+    assert d.latent_grid == LATENT_SPATIAL == (48, 56, 48), (
+        f"DerivationConfig.latent_grid={d.latent_grid} "
+        f"!= LATENT_SPATIAL={LATENT_SPATIAL}; "
+        "derived mask will not voxel-register with the served latents"
     )
