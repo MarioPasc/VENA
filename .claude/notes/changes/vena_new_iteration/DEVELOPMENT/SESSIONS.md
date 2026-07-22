@@ -133,9 +133,21 @@ on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note bel
   NETC (magenta) nested inside WT (white); QC latent-grid row shows a smoothly GRADED (48,56,48) WT heatmap with a
   smaller nested NETC blob, correctly registered. Oracle derivation is correct on real data. `masks_look_valid=null`
   (awaiting HUMAN review — the gate is the user's to close).
-- **Picasso cache IN PROGRESS.** Code rsynced to `VENA-validation` (`3143c61`). `mask_derive gt` verified staging:
-  IvyGAP single-cohort run + write-verify first (oracle pre-hash `14077c4c`), then the full 9-cohort SLURM CPU job →
-  `masks/tumor_latent_soft (N,2,48,56,48)` into every latent H5 (exit-criterion-1). Then S1 row ticks.
+- **Picasso cache LAUNCHED — SLURM array `1629508` (9 tasks, one per cohort), RUNNING on `cpu_partition`.** Writes
+  `masks/tumor_latent_soft (N,2,48,56,48)` into each latent H5 (exit-criterion-1). Idempotent; monitor armed for the
+  terminal state. **Cost finding: the image-res SDT dominates at ~14 s/patient** → sequential would be ~14 h, so
+  sharded by cohort (wall-clock ≈ BraTS-GLI ~5 h; small cohorts finish in minutes). An interactive IvyGAP verify hit
+  the ssh timeout mid-derive but left the H5 byte-untouched (engine derives all-in-memory, writes at the end), so no
+  partial/corrupt state. `mask_derive` needs a MINIMAL registry (`{name,image_h5,latent_h5}`, extra=forbid) — the
+  standard corpus JSON won't parse. Cfgs + array worker in scratchpad + `~/execs/vena/mask_derive_cfg/`.
+- **Docs corrected (commit `9eed6c1`):** the stale `(60,60,40)` → `(48,56,48)` in `01_SHARED_CONTRACTS.md`
+  (§Geometry + erratum banner), `00_INDEX.md`, and `20_inject` (whose base_img_size_numel "mismatch" advice was
+  wrong — `129024=48×56×48` is CORRECT, no reconciliation). Completed-spec bodies (10/16/19/40) keep their historical
+  `(60,60,40)` — code + fact-sheet are canonical. Memory `reference_latent_grid_48_56_48` written.
+- **S1 status:** all 5 code tasks merged (suite 1282); oracle masks produced + visually verified (localised, nested,
+  graded); figures in the Sandisk GT dir awaiting **human review**; cache array running. S1 row ticks once the array
+  is terminal + all 9 H5s validated (`masks/tumor_latent_soft` present, oracle byte-identical) and the human closes
+  the mask-review gate.
 - **⚠ S2 note (deferred):** aug latent H5s `*_latents_aug.h5` are NOT in the registry list; if S2 trains with offline
   aug, the soft mask must be present+consistently-transformed there too (task-20/DataModule concern).
 
