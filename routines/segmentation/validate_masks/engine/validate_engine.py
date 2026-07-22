@@ -243,7 +243,7 @@ class ValidateMasksEngine:
 
         # Montage figure
         montage_path = figures_dir / "montage.png"
-        render_slice_montage(patient_views, n_cols=5, alpha=0.7, path=montage_path)
+        render_slice_montage(patient_views, n_cols=10, alpha=0.6, path=montage_path)
         figure_paths.append(montage_path)
 
         # Latent-embedding figure (only when >= 3 patients for PCA to be meaningful)
