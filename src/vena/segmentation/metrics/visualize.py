@@ -171,6 +171,10 @@ class PatientView:
     soft_mask: np.ndarray
     tumor_volume: float
     cohort: str = field(default="")
+    # Integer BraTS-style tumour label (H,W,D); used by render_mask_qc for the
+    # hard-mask row so WT=(label>0) and NETC=(label==1) render correctly.
+    # None is the legacy default — callers should always provide the true label.
+    hard_label: np.ndarray | None = field(default=None)
 
 
 # ---------------------------------------------------------------------------

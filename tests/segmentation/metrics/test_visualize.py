@@ -235,6 +235,48 @@ class TestSliceSelectionAndContinuity:
             f"got {len(distinct_alpha)}: {distinct_alpha}"
         )
 
+    def test_netc_hard_panel_uses_integer_label_not_wt_binary(self) -> None:
+        """NETC-hard panel must use label==1, not the WT binary (pre-existing bug guard).
+
+        The engine previously fabricated ``hard_mask = (soft_mask[0] > 0.5)``
+        (a WT binary 0/1) and passed that as ``hard_mask`` to ``render_mask_qc``.
+        Because ``render_mask_qc``'s ndim==3 branch uses ``hard_mask == 1`` for
+        NETC, the WT binary made NETC equal the ENTIRE WT region.
+
+        This test constructs a BraTS-style integer label where:
+        * WT bulk (label=2, edema) occupies a large 16×16×6 block;
+        * NETC core (label=1) occupies a small 4×4×2 nested block.
+
+        With the WT binary:  ``(label > 0) == 1`` selects 1536 voxels (entire WT).
+        With the true label:  ``label == 1`` selects only 32 voxels (NETC core).
+        """
+        h, w, d = 20, 20, 10
+        label = np.zeros((h, w, d), dtype=np.int32)
+        label[2:18, 2:18, 2:8] = 2  # WT bulk (edema/ET, NOT NETC): 16×16×6 = 1536 vox
+        label[8:12, 8:12, 4:6] = 1  # NETC core nested inside: 4×4×2 = 32 vox
+
+        wt_area = int((label > 0).sum())
+        netc_area = int((label == 1).sum())
+        assert netc_area < wt_area, "test setup: NETC core must be smaller than WT"
+
+        # True integer label → NETC panel covers only the small NETC core
+        netc_from_int_label = int((label == 1).sum())
+
+        # Buggy WT binary → NETC panel incorrectly covers the entire WT region
+        wt_binary = (label > 0).astype(np.int32)
+        netc_from_wt_binary = int((wt_binary == 1).sum())
+
+        assert netc_from_int_label == 32, (
+            f"label==1 should select 32-voxel NETC core; got {netc_from_int_label}"
+        )
+        assert netc_from_wt_binary == wt_area, (
+            f"WT-binary bug: (wt_binary==1) selects entire WT ({wt_area} vox), "
+            f"not the NETC core; got {netc_from_wt_binary}"
+        )
+        assert netc_from_int_label < netc_from_wt_binary, (
+            "Integer-label NETC must be strictly smaller than WT-binary NETC"
+        )
+
     def test_overlay_rgb_channels_match_color(self) -> None:
         """RGB channels of the overlay are set to the requested colour."""
         from vena.segmentation.metrics.visualize import _overlay_rgba
