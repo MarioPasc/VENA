@@ -124,9 +124,18 @@ on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note bel
 - **Suite green at 1263** (1176→1194→+33→+28→+8); nothing deleted/skipped; new files ruff-clean.
 - **Data-flow verified for 19/40:** rows align **by id** (image H5 `ids` ↔ latent H5 `ids`); `crop/origin (N,3)` lives
   only in the image H5; image H5s LOCAL (MeningD2), latent H5s PICASSO-only. `umap` absent → task 40 uses PCA (sklearn).
-- **Task 40 (validate_masks) RUNNING.** After merge: (a) run local figures over `corpus_local.json` → Sandisk GT dir
-  (also validates `derive` on real UCSF data before any Picasso write); (b) surface `report.md` for **human mask
-  review**; (c) run the Picasso cache (`mask_derive` gt over `corpus_picasso.json`, CPU) → exit-criterion-1. Then S1 row ticks.
+- **Task 40 (validate_masks) MERGED** (`3143c61`). QC 3-row + pinned montage + PCA embedding (umap absent → PCA) +
+  `render_injection_sanity` (unit-tested on synthetic residuals; real panel = S2). +19 tests. **Suite green at 1282.**
+- **Local figure pass DONE + orchestrator-verified** (UCSF-PDGM, 12 patients, random spread) →
+  `/media/.../results/prior/tumor/gt/2026-07-22T14-34-14Z/` (montage.png, embedding.png, 12 qc_*.png, report.md,
+  decision.json). Machine stats: `netc_violation_count=0`, `empty_mask_count=0`, `soft_mass_fraction_in_wt=0.148`.
+  **Visual check (I viewed the PNGs):** montage masks localised on focal lesions, ordered by ascending tumour volume,
+  NETC (magenta) nested inside WT (white); QC latent-grid row shows a smoothly GRADED (48,56,48) WT heatmap with a
+  smaller nested NETC blob, correctly registered. Oracle derivation is correct on real data. `masks_look_valid=null`
+  (awaiting HUMAN review — the gate is the user's to close).
+- **Picasso cache IN PROGRESS.** Code rsynced to `VENA-validation` (`3143c61`). `mask_derive gt` verified staging:
+  IvyGAP single-cohort run + write-verify first (oracle pre-hash `14077c4c`), then the full 9-cohort SLURM CPU job →
+  `masks/tumor_latent_soft (N,2,48,56,48)` into every latent H5 (exit-criterion-1). Then S1 row ticks.
 - **⚠ S2 note (deferred):** aug latent H5s `*_latents_aug.h5` are NOT in the registry list; if S2 trains with offline
   aug, the soft mask must be present+consistently-transformed there too (task-20/DataModule concern).
 
