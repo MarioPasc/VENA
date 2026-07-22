@@ -1,0 +1,30 @@
+# validate_masks — default configuration
+# Override corpus_registry and output_root for your environment.
+#
+# The routine reads the LOCAL image H5s (via corpus_registry) for anatomy
+# (T1pre) and GT labels, recomputes the soft [WT,NETC] mask on-the-fly via
+# derive_latent_soft_mask(source="gt"), and writes QC figures.
+# It does NOT require the Picasso latent cache.
+
+corpus_registry: routines/segmentation/validate_masks/configs/corpus/corpus_local.json
+
+output_root: artifacts/segmentation/validate_masks
+
+# Patient selection from the corpus.
+# policy: "random" | "best" (largest tumour) | "worst" (smallest non-empty)
+patient_selection: random
+n_patients: 10
+
+targets:
+  soft: true
+  sdt_sigma_vox: 3.0
+  netc_operator: euclidean_percomponent
+  clip_vox: 10.0
+
+derivation:
+  temperature: per_class
+  avg_pool_stride: 4
+  latent_grid: [48, 56, 48]
+  emit_variance: false
+
+log_level: INFO

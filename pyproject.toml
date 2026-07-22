@@ -183,6 +183,7 @@ vena-validation-paired-fidelity  = "routines.validation.paired_fidelity.cli:main
 vena-validation-spatial-residual = "routines.validation.spatial_residual.cli:main"
 vena-validation-downstream-seg   = "routines.validation.downstream_seg.cli:main"
 vena-segmentation-mask-derive    = "routines.segmentation.mask_derive.cli:main"
+vena-segmentation-validate-masks = "routines.segmentation.validate_masks.cli:main"
 
 # ----------------------------------------------------------------------------
 # Setuptools layout — src/-layout for the library, flat-layout for routines/
