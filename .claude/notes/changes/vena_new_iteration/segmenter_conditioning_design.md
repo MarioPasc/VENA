@@ -1,5 +1,11 @@
 # Mask injection into v3a — second-stage refinement design
 
+> **🔴 ERRATUM (2026-07-22): channel 0 = TC (tumour core = NETC+ET), NOT WT.** Verified during S1 that ~81% of WT is
+> non-enhancing edema; conditioning on WT told the model to enhance mostly-edema. Throughout this doc, read every
+> `[WT, NETC]` as `[TC, NETC]` with channel 0 = tumour core (edema excluded); `TC − NETC = ET` = the enhancing region.
+> Config-driven (`TargetConfig.tumor_region="tc"`, wt kept for the S7 ablation); Phase-2 segmenter target = TC.
+> See `[[project_channel0_tumor_core_not_wt]]` and `DEVELOPMENT/01_SHARED_CONTRACTS.md`.
+
 > **Purpose (this iteration = iter 6).** The decision is locked: **second-stage refinement of the
 > v3a checkpoint by injecting a soft `[WT, NETC]` map via ControlNet**, to add tumour enhancement
 > **without losing v3a's (already-competitive) whole-brain fidelity.** This iteration answers ONE

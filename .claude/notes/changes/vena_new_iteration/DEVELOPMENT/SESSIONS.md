@@ -163,6 +163,17 @@ on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note bel
     **WT=green (0.1,0.9,0.2) / NETC=magenta (1.0,0.1,0.6)** (retired white-ish `hot`/`cool`); montage α=0.6, 10 cols.
   - Re-rendered + I viewed: all 3 QC rows (hard/soft/latent) now agree; NETC nested; gradation explicit. Authoritative
     UCSF figures re-run into a fresh GT-dir timestamp; the buggy `2026-07-22T14-34-14Z` set is superseded.
+- **🔴 CHANNEL-0 = TC, not WT (2026-07-22, Opus-4.8, merged `447e416`; full suite 1298).** Scientist caught (via
+  `qc_0159`) that WT includes non-enhancing edema. Verified: **81% of WT is edema** (0159 74%, 0290 96%, 0533 77%),
+  so `channel0−NETC = WT−NETC = ET+ED` was edema-dominated → the model was told to enhance mostly-edema (a driver of
+  S1 tumour-skip). **Fix: channel 0 = TC (tumour core = NETC+ET = `(label>0)&(label!=2)`), excludes edema;
+  `TC−NETC = ET` = true enhancing region.** Config-driven `TargetConfig.tumor_region: {wt,tc}="tc"` (wt kept for S7
+  ablation). Files: config/harmonise/soft_targets + viz labels (WT→TC, hard-panel excludes edema) + `mask_derive`
+  records a `tumor_region` attr. WT cache (job 1629508) **cancelled + superseded**; **re-cached all 9 with TC = job
+  1630643** (monitor armed). Figures re-rendered (TC) → `2026-07-22T20-40-15Z` (verified on 0290: 96%-edema tumour now
+  a tiny TC core, not the WT blob; hard TC == soft TC>0.5 exactly). Docs: fact-sheet erratum banner + this note +
+  memory `[[project_channel0_tumor_core_not_wt]]`. **S2 carries this:** `m_wt_soft`→`m_tc_soft`, `[WT,NETC]`→`[TC,NETC]`,
+  region-loss WT→TC, **Phase-2 segmenter target = TC** (G-SEG WT-Dice gate must become a TC-Dice gate). **Use PSNR_ET.**
 - **⚠ S2 note (deferred):** aug latent H5s `*_latents_aug.h5` are NOT in the registry list; if S2 trains with offline
   aug, the soft mask must be present+consistently-transformed there too (task-20/DataModule concern).
 

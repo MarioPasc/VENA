@@ -1,4 +1,10 @@
-# 20 — Inject: serve cached soft masks + 2-ch [WT,NETC] wiring + v3a-resume T-13 oracle run
+# 20 — Inject: serve cached soft masks + 2-ch [TC,NETC] wiring + v3a-resume T-13 oracle run
+
+> **🔴 ERRATUM (2026-07-22): channel 0 is TC (tumour core = NETC+ET), NOT WT.** WT is ~81% non-enhancing edema — the
+> enhancement prior must exclude it. Everywhere below reads `[WT,NETC]`/`m_wt_soft`/`mask:wt_soft:identity` — implement
+> them as `[TC,NETC]`/`m_tc_soft`/`mask:tc_soft:identity` (channel 0 of the cache = TC; `TC−NETC = ET`). Region-weighted
+> CFM region `WT`→`TC`. The cache group `masks/tumor_latent_soft` channel 0 is already TC (attr `tumor_region=tc`).
+> See the fact-sheet banner + `[[project_channel0_tumor_core_not_wt]]`.
 
 **Track/Wave/Deps.** INJECT · **Phase-1** · deps: 19 (the cached `masks/tumor_latent_soft`; may be developed in
 parallel and integrated at the run step). Owns the DataModule mask-serving + a conditioning-spec wiring block + a

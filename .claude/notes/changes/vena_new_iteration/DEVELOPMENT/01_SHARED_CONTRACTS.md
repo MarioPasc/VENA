@@ -10,6 +10,13 @@
 > `(2,48,56,48)`. Any `(60,60,40)` / `144000` in older revisions of this file or the task specs is stale; the code
 > is correct. See §Geometry below.
 
+> **🔴 ERRATUM (2026-07-22) — conditioning channel 0 = TUMOUR CORE (TC = NETC+ET), NOT whole-tumour (WT).** WT is
+> ~81% non-enhancing edema (verified UCSF), which was diluting the enhancement signal. `TargetConfig.tumor_region`
+> defaults to `"tc"` (`(label>0)&(label!=2)`; `"wt"` kept for the S7 ablation). Everywhere the specs say `[WT,NETC]`
+> / `m_wt_soft`, read `[TC,NETC]` / `m_tc_soft` (channel 0 = tumour core, edema excluded); `TC−NETC = ET` = the true
+> enhancing region. Segmenter target (Phase 2) is TC, so the G-SEG WT-Dice gate must be re-set to a TC-Dice gate.
+> See `[[project_channel0_tumor_core_not_wt]]`.
+
 ## Environment, paths, commands
 
 | What | Value |
