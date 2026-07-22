@@ -76,6 +76,49 @@ class TestHarmoniseLabels:
         np.testing.assert_array_equal(out["wt"], expected_wt)
         np.testing.assert_array_equal(out["netc"], expected_netc)
 
+    def test_tc_brats2021_excludes_edema(self) -> None:
+        """BraTS-2021: {0,1,2,4} — TC=(label==1)|(label==4), excludes ED=2."""
+        label = np.array([[[0, 1, 2, 4]]], dtype=np.int16)
+        out = harmonise_labels(label)
+
+        # TC: NETC(1) + ET(4), NOT edema(2)
+        expected_tc = np.array([[[False, True, False, True]]])
+        np.testing.assert_array_equal(out["tc"], expected_tc)
+        # Edema voxel (index 2, label=2) must NOT be in TC
+        assert not out["tc"].flat[2], "edema (label=2) must be excluded from TC"
+
+    def test_tc_brats2023_excludes_edema(self) -> None:
+        """BraTS-2023: {0,1,2,3} — TC=(label==1)|(label==3), excludes ED=2."""
+        label = np.array([[[0, 1, 2, 3]]], dtype=np.int16)
+        out = harmonise_labels(label)
+
+        # TC: NETC(1) + ET(3), NOT edema(2)
+        expected_tc = np.array([[[False, True, False, True]]])
+        np.testing.assert_array_equal(out["tc"], expected_tc)
+        assert not out["tc"].flat[2], "edema (label=2) must be excluded from TC"
+
+    def test_tc_dict_has_tc_key(self) -> None:
+        """harmonise_labels returns a dict with a 'tc' key."""
+        label = np.array([[[0, 1, 2, 4]]], dtype=np.int16)
+        out = harmonise_labels(label)
+        assert "tc" in out, "harmonise_labels must return a 'tc' key"
+
+    def test_netc_subset_of_tc(self) -> None:
+        """By construction NETC ⊆ TC (NETC = label==1 ⊆ (label>0)&(label!=2))."""
+        rng = np.random.default_rng(0)
+        label = rng.choice([0, 1, 2, 4], size=(10, 10, 10)).astype(np.int16)
+        out = harmonise_labels(label)
+        # Every NETC voxel must also be TC (label==1 implies label!=2 and label>0)
+        assert np.all(out["tc"] | ~out["netc"]), "NETC must be a subset of TC"
+
+    def test_tc_subset_of_wt(self) -> None:
+        """TC ⊆ WT (TC excludes edema, but WT includes it)."""
+        rng = np.random.default_rng(1)
+        label = rng.choice([0, 1, 2, 4], size=(10, 10, 10)).astype(np.int16)
+        out = harmonise_labels(label)
+        # Every TC voxel is also WT
+        assert np.all(out["wt"] | ~out["tc"]), "TC must be a subset of WT"
+
     def test_both_conventions_agree_on_wt_and_netc(self) -> None:
         """WT and NETC rules are identical for shared label values {0,1,2}."""
         label_2021 = np.array([[[0, 1, 2, 4]]], dtype=np.uint8)
@@ -90,16 +133,18 @@ class TestHarmoniseLabels:
         assert out_2021["netc"].sum() == out_2023["netc"].sum() == 1
 
     def test_all_background(self) -> None:
-        """All-zero label: WT and NETC are all False."""
+        """All-zero label: WT, TC, and NETC are all False."""
         label = np.zeros((4, 4, 4), dtype=np.int32)
         out = harmonise_labels(label)
         assert not out["wt"].any()
+        assert not out["tc"].any()
         assert not out["netc"].any()
 
     def test_return_dtype_is_bool(self) -> None:
         label = np.array([[[1, 2]]], dtype=np.int32)
         out = harmonise_labels(label)
         assert out["wt"].dtype == bool
+        assert out["tc"].dtype == bool
         assert out["netc"].dtype == bool
 
     def test_empty_label_raises(self) -> None:
@@ -393,6 +438,57 @@ class TestMakeSoftTargets:
         # Interior voxels have no foreground → all clipped to -clip_vox → sigmoid ≈ 0
         # At least the centre should be well below 0.5
         assert float(out[:, 10, 10, 10].max()) < 0.5
+
+    def test_default_tumor_region_is_tc(self) -> None:
+        """TargetConfig default produces TC (not WT) in channel 0."""
+        cfg_default = TargetConfig()
+        assert cfg_default.tumor_region == "tc", (
+            f"TargetConfig.tumor_region default must be 'tc'; got {cfg_default.tumor_region!r}"
+        )
+
+    def test_tc_channel0_excludes_edema(self) -> None:
+        """With tumor_region='tc' (default), channel-0 soft is ~0 over ED-only voxels.
+
+        Layout: a large ED-only block far from the core; a small NETC+ET core.
+        TC excludes edema → channel-0 soft ≈ 0 (≤ 0.5) in the ED region.
+        """
+        cfg_tc = TargetConfig(soft=True, sdt_sigma_vox=2.0, clip_vox=10.0, tumor_region="tc")
+        # (40, 20, 20) volume
+        label = np.zeros((40, 20, 20), dtype=np.int16)
+        # Large ED-only block at x=[0:15] — no NETC or ET here
+        label[0:15, :, :] = 2
+        # Small TC core at x=[30:38] — NETC+ET only, no edema
+        label[30:38, 6:14, 6:14] = 4  # ET
+        label[32:36, 8:12, 8:12] = 1  # NETC nested
+
+        out = make_soft_targets(label, cfg_tc)
+        # Centre of the ED-only region — should have low channel-0 with TC
+        ed_center_val = float(out[0, 7, 10, 10])
+        assert ed_center_val < 0.5, (
+            f"TC channel-0 must be < 0.5 in edema-only region; got {ed_center_val:.4f}"
+        )
+
+    def test_wt_channel0_includes_edema(self) -> None:
+        """With tumor_region='wt', channel-0 soft is high over the same ED region."""
+        cfg_wt = TargetConfig(soft=True, sdt_sigma_vox=2.0, clip_vox=10.0, tumor_region="wt")
+        label = np.zeros((40, 20, 20), dtype=np.int16)
+        label[0:15, :, :] = 2  # large ED block
+        label[30:38, 6:14, 6:14] = 4
+        label[32:36, 8:12, 8:12] = 1
+
+        out = make_soft_targets(label, cfg_wt)
+        # Centre of ED region — should be high with WT
+        ed_center_val = float(out[0, 7, 10, 10])
+        assert ed_center_val > 0.5, (
+            f"WT channel-0 must be > 0.5 in edema region; got {ed_center_val:.4f}"
+        )
+
+    def test_nesting_holds_for_tc(self) -> None:
+        """NETC ≤ channel-0 everywhere with tumor_region='tc'."""
+        cfg_tc = TargetConfig(soft=True, sdt_sigma_vox=2.0, clip_vox=10.0, tumor_region="tc")
+        label = self._simple_label()
+        out = make_soft_targets(label, cfg_tc)
+        assert np.all(out[1] <= out[0] + 1e-6), "NETC must not exceed TC channel anywhere"
 
     def test_hard_target_mode_raises(self) -> None:
         cfg_hard = TargetConfig(soft=False)

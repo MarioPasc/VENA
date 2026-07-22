@@ -155,6 +155,19 @@ def test_default_netc_operator() -> None:
     )
 
 
+def test_default_tumor_region() -> None:
+    """TargetConfig.tumor_region default is 'tc' (tumour core, not whole tumour).
+
+    Guard against regression to 'wt': 81% of WT is non-enhancing edema on
+    UCSF-PDGM; TC (NETC+ET) is the correct channel-0 for T1c conditioning.
+    """
+    t = TargetConfig()
+    assert t.tumor_region == "tc", (
+        f"tumor_region default drifted to {t.tumor_region!r}; "
+        "must remain 'tc' — see design correction 2026-07-22"
+    )
+
+
 def test_default_selection_metric() -> None:
     """MetricsConfig.selection_metric default is 'dual'."""
     m = MetricsConfig()
