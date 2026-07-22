@@ -1,0 +1,379 @@
+"""Tests for vena.segmentation.metrics.visualize.
+
+All tests are synthetic — no real cohort H5 or checkpoints required.
+Matplotlib is forced to Agg (headless) by the visualize module itself.
+
+Markers
+-------
+All tests carry the ``segmentation`` marker so they appear in the
+``-m segmentation`` suite and are excluded from unrelated marker sweeps.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+pytestmark = pytest.mark.segmentation
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_soft_mask_img(
+    h: int = 40,
+    w: int = 40,
+    d: int = 30,
+    *,
+    wt_val: float = 0.8,
+    netc_val: float = 0.4,
+) -> np.ndarray:
+    """Build a (2, H, W, D) synthetic soft mask with WT and nested NETC."""
+    mask = np.zeros((2, h, w, d), dtype=np.float32)
+    # WT in the centre third
+    mask[0, h // 4 : 3 * h // 4, w // 4 : 3 * w // 4, d // 4 : 3 * d // 4] = wt_val
+    # NETC nested inside WT
+    mask[1, h // 3 : 2 * h // 3, w // 3 : 2 * w // 3, d // 3 : 2 * d // 3] = netc_val
+    return mask
+
+
+def _make_soft_mask_latent() -> np.ndarray:
+    """Build a (2, 48, 56, 48) synthetic soft mask at the MAISI latent grid."""
+    mask = np.zeros((2, 48, 56, 48), dtype=np.float32)
+    mask[0, 10:30, 15:35, 10:30] = 0.75
+    mask[1, 15:25, 20:30, 15:25] = 0.45
+    return mask
+
+
+# ---------------------------------------------------------------------------
+# render_mask_qc
+# ---------------------------------------------------------------------------
+
+
+class TestRenderMaskQc:
+    def test_writes_file(self, tmp_path: pytest.FixtureDef) -> None:
+        """QC figure is written to disk for a synthetic case."""
+        from vena.segmentation.metrics.visualize import render_mask_qc
+
+        h, w, d = 40, 40, 30
+        image = np.random.default_rng(0).uniform(0, 1, (h, w, d)).astype(np.float32)
+        hard_mask = np.zeros((h, w, d), dtype=np.int32)
+        hard_mask[10:20, 10:20, 5:15] = 1
+        soft_img = _make_soft_mask_img(h, w, d)
+        soft_lat = _make_soft_mask_latent()
+
+        out = render_mask_qc(
+            image,
+            hard_mask,
+            soft_img,
+            soft_lat,
+            patient_id="SYNTH-001",
+            path=tmp_path / "qc_test.png",
+        )
+        assert out.exists(), "render_mask_qc must write the PNG"
+
+    def test_soft_mask_graded(self) -> None:
+        """Soft mask has values strictly in (0, 1) — not binary."""
+        soft_img = _make_soft_mask_img()
+        wt = soft_img[0]
+        # The mask has values at wt_val=0.8 inside and 0 outside
+        assert wt.max() < 1.0, "WT soft mask should not reach 1.0"
+        assert wt.min() >= 0.0, "WT soft mask must be non-negative"
+        # At least some voxels are strictly between 0 and 1
+        assert ((wt > 0.0) & (wt < 1.0)).any(), "Mask must have graded (non-binary) values"
+
+    def test_soft_mask_nested(self) -> None:
+        """NETC values are always ≤ WT values (nesting guarantee)."""
+        soft_img = _make_soft_mask_img()
+        wt = soft_img[0]
+        netc = soft_img[1]
+        assert (netc <= wt + 1e-6).all(), "NETC must be nested inside WT (NETC ≤ WT)"
+
+    def test_wrong_latent_shape_raises(self, tmp_path: pytest.FixtureDef) -> None:
+        """SegMetricError is raised when soft_mask_latent has the wrong shape."""
+        from vena.segmentation.exceptions import SegMetricError
+        from vena.segmentation.metrics.visualize import render_mask_qc
+
+        image = np.zeros((40, 40, 30), dtype=np.float32)
+        with pytest.raises(SegMetricError, match="soft_mask_latent"):
+            render_mask_qc(
+                image,
+                np.zeros((40, 40, 30), dtype=np.int32),
+                _make_soft_mask_img(),
+                np.zeros((2, 60, 60, 40), dtype=np.float32),  # wrong shape
+                patient_id="bad",
+                path=tmp_path / "bad.png",
+            )
+
+
+# ---------------------------------------------------------------------------
+# render_slice_montage — pinned layout
+# ---------------------------------------------------------------------------
+
+
+class TestRenderSliceMontage:
+    def _make_patients(self, n: int = 4) -> list:
+        from vena.segmentation.metrics.visualize import PatientView
+
+        rng = np.random.default_rng(42)
+        patients = []
+        # tumour volumes: 1000, 500, 200, 800 → ascending order: 200, 500, 800, 1000
+        volumes = [1000.0, 500.0, 200.0, 800.0][:n]
+        for i, vol in enumerate(volumes):
+            soft = _make_soft_mask_img(wt_val=0.6, netc_val=0.3)
+            # Scale the mask so the tumour volume proxy matches vol
+            patients.append(
+                PatientView(
+                    patient_id=f"PAT-{i:03d}",
+                    t1pre=rng.uniform(0, 1, (40, 40, 30)).astype(np.float32),
+                    soft_mask=soft,
+                    tumor_volume=vol,
+                    cohort="synthetic",
+                )
+            )
+        return patients
+
+    def test_writes_file(self, tmp_path: pytest.FixtureDef) -> None:
+        """Montage PNG is written to disk."""
+        from vena.segmentation.metrics.visualize import render_slice_montage
+
+        out = render_slice_montage(
+            self._make_patients(),
+            n_cols=5,
+            alpha=0.7,
+            path=tmp_path / "montage.png",
+        )
+        assert out.exists()
+
+    def test_rows_ordered_ascending_tumor_volume(self) -> None:
+        """Patients are sorted by ascending tumour volume."""
+
+        patients = self._make_patients(4)
+        ordered = sorted(patients, key=lambda p: p.tumor_volume)
+        for i in range(len(ordered) - 1):
+            assert ordered[i].tumor_volume <= ordered[i + 1].tumor_volume, (
+                "Rows must be ordered ascending by tumour volume; "
+                f"got {ordered[i].tumor_volume} > {ordered[i + 1].tumor_volume}"
+            )
+
+    def test_column_count(self, tmp_path: pytest.FixtureDef) -> None:
+        """Exactly n_cols tumour-bearing slice columns per row."""
+        from vena.segmentation.metrics.visualize import _axial_tumor_slices
+
+        soft = _make_soft_mask_img()
+        n_cols = 5
+        z_indices = _axial_tumor_slices(soft, n_cols=n_cols)
+        assert len(z_indices) == n_cols, f"Expected {n_cols} columns; got {len(z_indices)}"
+
+    def test_empty_patients_raises(self, tmp_path: pytest.FixtureDef) -> None:
+        """SegMetricError is raised when the patients list is empty."""
+        from vena.segmentation.exceptions import SegMetricError
+        from vena.segmentation.metrics.visualize import render_slice_montage
+
+        with pytest.raises(SegMetricError, match="empty"):
+            render_slice_montage([], n_cols=5, alpha=0.7, path=tmp_path / "empty.png")
+
+
+# ---------------------------------------------------------------------------
+# render_latent_embedding — PCA fallback (umap absent)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderLatentEmbedding:
+    def _make_latents(self, n: int = 8) -> dict[str, np.ndarray]:
+        rng = np.random.default_rng(7)
+        return {
+            f"PAT-{i:03d}": rng.standard_normal((2, 48, 56, 48)).astype(np.float32)
+            for i in range(n)
+        }
+
+    def _make_meta(self, pids: list[str]) -> pd.DataFrame:
+        rng = np.random.default_rng(7)
+        cohorts = ["A", "B"] * (len(pids) // 2 + 1)
+        return pd.DataFrame(
+            {
+                "patient_id": pids,
+                "tumor_volume": rng.uniform(100, 5000, len(pids)),
+                "cohort": cohorts[: len(pids)],
+            }
+        ).set_index("patient_id")
+
+    def test_pca_produces_2d_embedding(self, tmp_path: pytest.FixtureDef) -> None:
+        """PCA embedding runs and produces a 2-D figure without UMAP."""
+        from vena.segmentation.metrics.visualize import render_latent_embedding
+
+        latents = self._make_latents(n=6)
+        meta = self._make_meta(list(latents.keys()))
+        out = render_latent_embedding(
+            latents,
+            meta,
+            method="pca_umap_perpatient",  # UMAP absent → falls back to PCA
+            color_by=("tumor_volume", "cohort"),
+            path=tmp_path / "embedding.png",
+        )
+        assert out.exists()
+
+    def test_correct_number_of_points(self) -> None:
+        """PCA embedding has one point per patient."""
+
+        from sklearn.decomposition import PCA
+
+        n = 6
+        latents = self._make_latents(n=n)
+        feat_mat = np.stack([v.ravel() for v in latents.values()])
+        embedding = PCA(n_components=2, random_state=42).fit_transform(feat_mat)
+        assert embedding.shape == (n, 2), f"Expected ({n}, 2); got {embedding.shape}"
+
+    def test_empty_latents_raises(self, tmp_path: pytest.FixtureDef) -> None:
+        """SegMetricError raised when mask_latents is empty."""
+        from vena.segmentation.exceptions import SegMetricError
+        from vena.segmentation.metrics.visualize import render_latent_embedding
+
+        with pytest.raises(SegMetricError, match="empty"):
+            render_latent_embedding(
+                {},
+                pd.DataFrame(),
+                path=tmp_path / "empty.png",
+            )
+
+
+# ---------------------------------------------------------------------------
+# render_injection_sanity — injection locality
+# ---------------------------------------------------------------------------
+
+
+class TestRenderInjectionSanity:
+    """Synthetic-residual tests for the S2 injection-sanity figure."""
+
+    _H, _W, _D = 20, 20, 16
+
+    def _make_wt_mask(self) -> np.ndarray:
+        """Binary WT box in the centre of the volume."""
+        mask = np.zeros((self._H, self._W, self._D), dtype=np.float32)
+        mask[5:15, 5:15, 4:12] = 1.0
+        return mask
+
+    def test_step0_residual_is_zero(self, tmp_path: pytest.FixtureDef) -> None:
+        """Step-0 residual is identically zero; the figure must write."""
+        from vena.segmentation.metrics.visualize import render_injection_sanity
+
+        wt = self._make_wt_mask()
+        res_zero = np.zeros((self._H, self._W, self._D), dtype=np.float32)
+        res_scale = np.zeros_like(res_zero)
+        res_scale[5:15, 5:15, 4:12] = 1.5  # energy concentrated in WT
+
+        out = render_injection_sanity(
+            None,
+            {
+                "wt_mask": wt,
+                "residuals_zero": res_zero,
+                "residuals_scale": res_scale,
+            },
+            path=tmp_path / "injection.png",
+        )
+        assert out.exists()
+        assert float(res_zero.max()) == pytest.approx(0.0), "Step-0 residual must be zero"
+
+    def test_in_wt_out_wt_ratio_greater_than_one(self) -> None:
+        """In-WT energy / out-of-WT energy > 1 for residuals concentrated in WT."""
+        from vena.segmentation.metrics.visualize import compute_residual_energy_ratio
+
+        wt = self._make_wt_mask()
+        # Build residuals that are ONLY nonzero inside WT
+        residuals = np.zeros((self._H, self._W, self._D), dtype=np.float32)
+        residuals[5:15, 5:15, 4:12] = 1.0  # inside WT box
+
+        ratio = compute_residual_energy_ratio(residuals, wt)
+        assert ratio > 1.0, f"Expected in-WT/out-WT ratio > 1; got {ratio:.3f}"
+
+    def test_ratio_less_than_one_when_outside_wt(self) -> None:
+        """In-WT/out-WT ratio < 1 when residuals concentrated outside WT."""
+        from vena.segmentation.metrics.visualize import compute_residual_energy_ratio
+
+        wt = self._make_wt_mask()
+        residuals = np.zeros((self._H, self._W, self._D), dtype=np.float32)
+        # Energy only OUTSIDE the WT box
+        residuals[0:4, :, :] = 1.0
+
+        ratio = compute_residual_energy_ratio(residuals, wt)
+        assert ratio < 1.0, f"Expected ratio < 1 when residuals outside WT; got {ratio:.3f}"
+
+    def test_missing_batch_key_raises(self, tmp_path: pytest.FixtureDef) -> None:
+        """SegMetricError raised when batch is missing required keys."""
+        from vena.segmentation.exceptions import SegMetricError
+        from vena.segmentation.metrics.visualize import render_injection_sanity
+
+        with pytest.raises(SegMetricError, match="missing"):
+            render_injection_sanity(
+                None,
+                {"wt_mask": np.zeros((5, 5, 5))},  # missing residuals_zero, residuals_scale
+                path=tmp_path / "bad.png",
+            )
+
+
+# ---------------------------------------------------------------------------
+# compute_mask_stats — machine stats on a constructed case
+# ---------------------------------------------------------------------------
+
+
+class TestComputeMaskStats:
+    def _make_stats_case(self) -> np.ndarray:
+        """Build a (3, 2, 10, 10, 10) array with known stats.
+
+        Patient 0: valid WT + nested NETC (no violations).
+        Patient 1: 8 voxels where NETC > WT (violations).
+        Patient 2: empty WT (empty_mask_count += 1).
+        """
+        masks = np.zeros((3, 2, 10, 10, 10), dtype=np.float32)
+
+        # Patient 0: WT=0.8 in centre, NETC=0.4 nested inside (no violations)
+        masks[0, 0, 3:7, 3:7, 3:7] = 0.8
+        masks[0, 1, 4:6, 4:6, 4:6] = 0.4
+
+        # Patient 1: WT=0.3 everywhere, NETC=0.9 in a 2×2×2 sub-box (8 violations)
+        masks[1, 0, 3:7, 3:7, 3:7] = 0.3
+        masks[1, 1, 3:5, 3:5, 3:5] = 0.9  # 0.9 > 0.3 + epsilon → violation
+
+        # Patient 2: everything zero → empty WT
+
+        return masks
+
+    def test_empty_mask_count(self) -> None:
+        """One patient with empty WT is counted."""
+        from vena.segmentation.metrics.visualize import compute_mask_stats
+
+        masks = self._make_stats_case()
+        stats = compute_mask_stats(masks)
+        assert stats["empty_mask_count"] == 1, (
+            f"Expected 1 empty mask; got {stats['empty_mask_count']}"
+        )
+
+    def test_netc_violation_count(self) -> None:
+        """Patient 1 has exactly 8 voxels where NETC > WT."""
+        from vena.segmentation.metrics.visualize import compute_mask_stats
+
+        masks = self._make_stats_case()
+        stats = compute_mask_stats(masks)
+        # 2×2×2 = 8 voxels with NETC=0.9 > WT=0.3
+        assert stats["netc_violation_count"] == 8, (
+            f"Expected 8 NETC violations; got {stats['netc_violation_count']}"
+        )
+
+    def test_soft_mass_fraction_in_wt_range(self) -> None:
+        """Soft-mass fraction in WT is in [0, 1]."""
+        from vena.segmentation.metrics.visualize import compute_mask_stats
+
+        masks = self._make_stats_case()
+        stats = compute_mask_stats(masks)
+        frac = stats["soft_mass_fraction_in_wt"]
+        assert 0.0 <= frac <= 1.0, f"Fraction out of [0, 1]: {frac}"
+
+    def test_wrong_ndim_raises(self) -> None:
+        """SegMetricError raised for non-5-D input."""
+        from vena.segmentation.exceptions import SegMetricError
+        from vena.segmentation.metrics.visualize import compute_mask_stats
+
+        with pytest.raises(SegMetricError):
+            compute_mask_stats(np.zeros((4, 10, 10), dtype=np.float32))
