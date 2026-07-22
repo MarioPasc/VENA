@@ -272,6 +272,7 @@ markers = [
     "fm: flow-matching training/inference components",
     "repa: REPA loss / projection-head components",
     "validation: Phase-2 benchmark analysis components",
+    "segmentation: segmentation submodule (config, registry, targets, data, metrics)",
     "gpu: requires CUDA",
     "slow: wall-clock > 30 s",
 ]
