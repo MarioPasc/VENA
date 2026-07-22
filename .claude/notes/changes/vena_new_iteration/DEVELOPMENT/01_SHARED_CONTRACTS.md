@@ -1,0 +1,155 @@
+# 01 — SHARED CONTRACTS (fact sheet for every agent)
+
+> Give this file to **every** agent alongside its task spec. These are the stable, verified facts (audited
+> 2026-07-22). Line numbers are deliberately omitted — **read the named file and verify the current code**;
+> `/orchestrate` §3 warns that transcribed stale numbers are the most dangerous kind. If a fact here is
+> contradicted by the code, **stop and report it**.
+
+## Environment, paths, commands
+
+| What | Value |
+|---|---|
+| Repo (local dev) | `/home/mpascual/research/code/VENA` |
+| Python (local) | `~/.conda/envs/vena/bin/python` (conda env `vena`, ≥3.11) |
+| Fast test suite | `~/.conda/envs/vena/bin/python -m pytest -m "not slow and not gpu" -q --basetemp=/home/mpascual/.pytest-tmp-<slug>` |
+| Lint / format | `~/.conda/envs/vena/bin/python -m ruff check <files>` / `ruff format <files>` |
+| Picasso repo to RUN from | `fscratch/repos/VENA-validation` (real git repo) — **not** `fscratch/repos/VENA` |
+| Picasso python | `fscratch/conda_envs/vena/bin/python` |
+| MAISI VAE / trunk ckpts | see `src/external/LINKS.md` (immutable; never write there) |
+| Design authority | `../segmenter_conditioning_design.md` (Part A = injection, Part B = segmenter, A.8/B.f = iter-8) |
+
+**Import isolation (worktree agents MUST paste this proof):**
+```bash
+cd $WORKTREE && PYTHONPATH=$WORKTREE/src ~/.conda/envs/vena/bin/python -c "
+import pathlib, vena, routines
+wt = pathlib.Path('$WORKTREE').resolve()
+for m in (vena, routines):
+    p = pathlib.Path(m.__file__).resolve()
+    assert p.is_relative_to(wt), f'LEAK: {m.__name__} -> {p}'
+print('import isolation OK')"
+```
+Never `pip install -e .` from a worktree; the env is shared read-only.
+
+## Project rules that bind every task
+
+- **Routine pattern** (`.claude/rules/preflight-pattern.md`): `cli.py` takes **one positional YAML arg**; engine
+  exports a **frozen Pydantic `<Name>RoutineConfig`** with `from_yaml(path)` + an `<Name>Engine.run() -> Path`;
+  **no heavy work at import time**; register a console script `vena-<bucket>-<name>` in `pyproject.toml`; persist
+  resolved YAML + ISO-8601 timestamp + git SHA + checkpoint paths into the artifact; validate deliverables before
+  returning.
+- **H5 principles** (`.claude/rules/h5-design-principles.md`): root attrs `schema_version`, `created_at`,
+  `producer`, `config_json`, `git_sha`; **self-describing datasets** (`units`, `description`, `dtype`); paired
+  `validate_<artifact>(path)->list[str]` + `assert_<artifact>_valid(path)`; gzip-4 + chunk `(1, …)` on bulky
+  arrays; **validate-before-return**.
+- **Coding standards** (`.claude/rules/coding-standards.md`, `model-coding-standards.md`): `from __future__ import
+  annotations` everywhere; type hints on every signature; Google/NumPy docstrings; **no bare `except Exception`**
+  (narrow or log-and-reraise); **no magic numbers** (everything via the Pydantic config); **custom exception per
+  module**; **3D throughout** (no 2D ops outside clearly-labelled eval utils); logging via `logging`, never
+  `print()` in library code; **MAISI primitives import only from `vena.common`**.
+- **Tests** (`.claude/rules/model-coding-standards.md` §25-27): co-locate `tests/<area>/test_<name>.py`; **every
+  test file declares a marker** (`pytestmark = pytest.mark.<marker>`); pure math/CSV/H5 tests need no checkpoint;
+  mark GPU/checkpoint paths `gpu`/`slow`. **Add a `segmentation` marker** to `pyproject.toml` `[tool.pytest.ini_options].markers`.
+
+## Geometry & normalization (LOAD-BEARING — audited)
+
+- **Served latent grid = `(60, 60, 40)`**, 4 channels (MAISI 4× spatial compression of ~`(240,240,155)`). Every
+  mask target, avg-pool output, and cached predicted mask is **`(2, 60, 60, 40)` float32**. The `(48,56,48)` /
+  `129024` figures in `../model_redesign_2026-07-21.md` (T-04) are **stale** — do not use them.
+- `rflow.base_img_size_numel = 129024 = 48×56×48 ≠ 60×60×40 = 144000` in the v3a config — a **timestep-transform
+  reference mismatch** to reconcile (task 20 flags it; only scales SD3 timestep weighting, effect ~1.12×).
+- **Intensity norm is 99.95 canonical** for the VAE/latent path (`percentile_normalise(lower=0, upper=99.95,
+  foreground_only=True)` on skull-stripped brain foreground). The **segmenter** is a separate world: it works in
+  **image space** with **z-score-on-brain** (nonzero, channel-wise; the `downstream_seg` convention) and never
+  touches the VAE. Its soft output is avg-pooled to the latent grid afterward.
+
+## Cohorts & splits
+
+- **CV (trainable) cohorts:** UCSF-PDGM (202), BraTS-GLI (1133), IvyGAP (34), LUMIERE (91), REMBRANDT (63),
+  UPENN-GBM (164). **Ring B `test_only` (OOD, never trained on):** BraTS-Africa (Glioma/Other), BraTS-PED (260).
+- **Segmenter K-fold splits MUST be a subset of the FM train split** — the segmenter must be **out-of-fold** w.r.t.
+  the FM val/test (leakage vector L2). Read the FM split source (`splits/{train,val,test}` in the latent/image H5
+  and the corpus registry `routines/fm/train/configs/corpus/corpus_*.json`) before building folds. No independent
+  segmenter partition.
+
+## Latent H5 schema (what the generator DataModule consumes) — verify in `src/vena/data/h5/`
+
+- Per-cohort latent H5 groups today: `latents/*` (per modality), `masks/tumor_latent` **`(N, 3, 60, 60, 40)`
+  float32 = soft `[NETC, ED, ET]`**, `masks/brain_latent` `(N, 1, …)` int8 (when encoded). Root attrs incl.
+  `vae_checkpoint_sha256`. The image-domain H5 carries `images/*`, `masks/{tumor,brain}`, `splits/*`, `metadata/*`.
+- **New group to add (task 18):** `masks/tumor_latent_pred` **`(N, 2, 60, 60, 40)`** float32 = soft `[WT, NETC]`
+  predicted, + a `predicted_mask_seg_sha256` root attr, + a `schema_version` bump. Written **beside**
+  `masks/tumor_latent` (oracle), never replacing it. Reuse the shared writer/validator under
+  `src/vena/data/h5/shared/` and the augmented latent path `src/vena/data/h5/augmented/latent_domain.py`.
+
+## DataModule batch keys (verify in `src/vena/model/fm/lightning/data.py`)
+
+`patient_id`; `z_t1pre, z_t2, z_flair, z_t1c` `(4,60,60,40)`; `m_wt` `(1,…)` **binary** (0.5-threshold of the soft
+union); `m_tumor` `(3,…)` soft `[NETC,ED,ET]`; `m_netc/m_ed/m_et` `(1,…)` views; `m_brain` `(1,…)` when present.
+**`m_wt_soft` does NOT exist yet — task 20 adds it** = `clip(Σ m_tumor, 0, 1)` (the pre-threshold soft union).
+
+## ControlNet conditioning contract (verify in `src/vena/model/fm/controlnet/` + `…/maisi/`)
+
+- **Spec string = `"<kind>:<key>:<downsampler>"`**, `kind ∈ {latent, mask, prior}`; `ConditioningSpec.batch_key()`
+  → `z_<key>` / `m_<key>` / `prior_<key>`. Downsamplers: `identity, nearest, avg_pool, trilinear, zero_out`
+  (stateless, `out_channels=None`) and `lift_to_4ch` (override `out_channels=4`, needs `in_channels=k`).
+- `ConditioningAssembler.channels_per_spec` uses the **`mask_channels` constructor default (=1)**, NOT the runtime
+  tensor shape. **⇒ a 2-ch `[WT,NETC]` mask MUST be two 1-ch specs** `mask:wt:identity` + `mask:netc:identity`
+  (keys `m_wt_soft`, `m_netc`), else `total_channels` under-counts silently and the hint-net first conv is built wrong.
+- **`MaisiControlNet`**: mask enters a **separate `controlnet_cond_embedding` hint net** (`[64]` = zero spatial
+  downsampling), **added** to the CN `conv_in` output — **not** concatenated to the noisy latent. Residuals are
+  emitted at conv_in + every down resblock + mid, added into the trunk **out-of-place** by `maisi/grad_safe.py`
+  when the trunk is trainable, reaching the decoder via skips. `output_scale` is a **`persistent=False` buffer**
+  multiplied into **every** residual; `OutputScaleRampCallback` fills it from `global_step`
+  (`sigmoid(steepness·(step/ramp_steps−0.5))`). `init_from_trunk` copies the trunk down+mid into the CN encoder;
+  the hint net + zero-init output convs stay fresh. The wrapper never passes MONAI `conditioning_scale` (stays 1.0).
+
+## v3a checkpoint (the warm-start source) — verify `routines/fm/train/configs/runs/picasso_s1_v3a_concat_only_fft.yaml`
+
+- v3a = **concat-only, NO ControlNet** (`controlnet.enabled: false`). Trunk `conv_in.in_channels = 16` (4 MAISI +
+  3×4 zero-init concat channels for `[t1pre,t2,flair]` latents via `input_concat`). Trunk `trainable: true`,
+  `regime: fft`. Loss = **L1 velocity CFM, reduction mean** (no region weights). `rflow.use_timestep_transform:
+  true`, `base_img_size_numel: 129024`. EMA 0.9999. Run id `2026-06-24_16-00-46_s1_v3a_concat_only_fft_ef000c9f`.
+- **Canonical Picasso location — READ-ONLY, NEVER ALTER** (`external-deps.md`):
+  `/mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/2026-06-24_16-00-46_s1_v3a_concat_only_fft_ef000c9f/`
+  holds `ema_best.ckpt` (all jobs) + `trunk_ema_snapshot.pt` (joint jobs). Every T-13/T-06 YAML sets
+  `run.resume_from` to the **absolute `ema_best.ckpt` path**; WARM_START opens it read-only. **New runs write to
+  `/mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments/<run_id>/`** — never the v3a source dir. Any tool that
+  would write under the checkpoint path is a BLOCKED/PREMISE-FALSE report, not an action.
+- **Warm-start:** `run.resume_from: <v3a_run_id>` → `WARM_START` (weights-only; optimiser/EMA/RNG fresh), handled
+  by `_WarmStartCallback` (`routines/fm/train/engine.py`). **⚠ trainable-trunk warm-start is single-shot / not
+  resume-safe** — `trunk_ema` is built in `setup()` after the ckpt load and needs a `trunk_ema_snapshot.pt`
+  sibling. **`trunk.trainable: false` (freeze-trunk) sidesteps this** and is the recommended de-risking first run.
+- **`decision.json` schema is `0.10.0`** (`routines.fm.train`), already carries `controlnet_enabled`,
+  `controlnet_conditioning_inputs`, `input_concat`, `loss_cfm_*`, `region_weights`. Bump on any new field.
+
+## Segmentation submodule layout (target — task 10 creates the skeleton)
+
+```
+src/vena/segmentation/
+├── __init__.py        # public API + __all__:  SegmentationConfig, get_segmentation_model, ...
+├── config.py          # Pydantic: SegmentationConfig ⊃ {Model,Data,Loss,Train,Derivation,Metrics}Config
+├── exceptions.py      # SegmentationError, SegModelError, SegDataError, SegLossError, ...
+├── models/            # 11  registry + bsf_swinunetr.py (Arm A/B) + segresnet.py (Arm C, fork downstream_seg)
+├── targets/           # 12  sdt.py (per-component/geodesic) + soft_targets.py + harmonise.py
+├── data/              # 14  kfold.py + dataset.py + augment.py
+├── engine/            # 13 loss.py ; 17 train.py + predict.py
+├── derivation/        # 16  temperature.py + pool.py + ensemble.py
+└── metrics/           # 15  overlap.py + calibration.py + gate.py
+```
+Routines (task 18): `routines/segmentation/train/` (segmenter training) + `routines/segmentation/mask_predict/`
+(T-04 latent-H5 write). Console scripts `vena-segmentation-train`, `vena-segmentation-mask-predict`.
+
+## Model checkpoints for BrainSegFounder (needs a path — `[verify]` before task 11)
+
+BSF = **SwinUNETR `feature_size=48`**, two **encoder-only** SSL checkpoints: **BraTS-SSL** (4-ch, tumour-aware —
+drop the T1ce slice, feed `[FLAIR,T1pre,T2]`, load `strict=False`) and **UKB-SSL** (T1-only, leak-free). Neither
+is a segmenter (decoder is trained from scratch). **Locate the checkpoint files** via `src/external/LINKS.md` or
+the BrainSegFounder release before task 11; if absent locally, task 11 reports the missing path as a BLOCKED
+premise rather than guessing. MONAI `SwinUNETR` + `SegResNet` are the library backbones (MONAI, Apache-2.0).
+
+## Region semantics for the generator loss (task 21) — verify in `controlnet/losses/` + `lightning/module.py`
+
+Regions for the region-weighted CFM: **`BG`** (outside brain, from `m_brain`), **`WT`** (from the mask), **`Brain
+= NOT-BG ∩ NOT-WT`** (brain tissue minus tumour). Iter-8 default weights `{brain: 1.0, wt: 1.0}` (BG excluded or
+weight-0 per the existing `region_weights` semantics — **verify which**) → **numerically identical** to the current
+unweighted L1 velocity loss. That equivalence is a required test (task 21).

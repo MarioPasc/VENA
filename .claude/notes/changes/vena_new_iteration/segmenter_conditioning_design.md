@@ -43,15 +43,29 @@ SPADE-primary. The *why* is Part C (the iter-5 reviews).
 | **PART C** | why-the-mask evidence + leakage taxonomy | defending the design |
 | **Change log** | iteration trail (iters 1–7) = the reasoning history | understanding *why* a decision was made |
 
-**Locked decisions.** bet = ControlNet mask-injection refinement of v3a · fusion = **ControlNet primary /
-SPADE = T-07 ablation** (FiLM & CA rejected) · mask = soft `[WT,NETC]` (WT-only = fallback) · backbone =
-**BSF-SwinUNETR** (Arm A BraTS-SSL / Arm B UKB-SSL leak-free / Arm C SegResNet baseline) · loss = **DML+CE
-on SDT-soft targets** (Dice = eval gate only) · splits = **K-fold OOF** (the K fold-models double as a free
-calibration ensemble) · generator training masks = OOF **predicted** · intensity norm = **99.95** canonical.
+**Locked decisions.** bet = ControlNet mask-injection refinement of **v3a** (warm-start
+`…_s1_v3a_concat_only_fft_ef000c9f`, add a **fresh** `[WT,NETC]` ControlNet — **confirmed iter-8;
+supersedes `model_redesign` T-06/T-13's v3b source, which becomes the T-10 warm-start-source ablation**) ·
+fusion = **ControlNet primary / SPADE = T-07 ablation** (FiLM & CA rejected) · mask = soft `[WT,NETC]`
+(WT-only = fallback) · **generator grid = `(60,60,40)`** (resolved iter-8 — the *served* latent grid; every
+`(48,56,48)`/`129024` reference is stale, see A.8-§6) · generator loss = **region-weighted CFM with
+`{Brain, WT}` weights EQUAL initially (numerically ≡ unweighted L1); WT up-weight = deferred ablation**
+(mechanism coded now, cf. Ibarra MICCAI 2025 — see A.8-§2) · segmenter backbone = **BSF-SwinUNETR**
+(Arm A BraTS-SSL / Arm B UKB-SSL leak-free / Arm C SegResNet baseline, forkable from
+`src/vena/validation/downstream_seg.py` — **supersedes `model_redesign` §16.6's SegResNet-primary**) ·
+segmenter loss = **DML+CE on SDT-soft targets** (Dice = eval gate only) · splits = **K-fold OOF** (fold-models
+double as a calibration ensemble — but **k-fold ≠ true deep ensemble for uncertainty**, arXiv:2605.18329: the
+*mean* calibrates/smooths, the *variance* is confounded, see B.f-§3) · calibration = **per-class temperature
+`T_WT`, `T_NETC`** (not one global T, see B.f-§2) · generator training masks = **clean GT for T-13 (oracle
+ceiling)** / OOF **predicted + mask-perturbation aug for T-06 (deployable)** (see A.8-§7) · intensity norm =
+**99.95** canonical.
 
 **Open decisions.** **D-d:** add BraTS-MEN? (gated on the Málaga pathology mix — glioma-only vs
 +meningioma). **Soft-target path:** SDT+DML from the start vs free-only (ensemble+temp+avg-pool) then
-upgrade. **Latent mask shape** (48,56,48) vs (60,60,40) — `[verify]` against the generator grid.
+upgrade. **NETC SDT operator:** per-connected-component Euclidean vs signed-normalised geodesic (SiNGR,
+arXiv:2405.16813) — NETC is often multifocal (see B.f-§4). **Deferred-ablation levers (coded-but-off this
+iteration):** CFG-at-inference (FP-gated), noise-level-dependent `output_scale`, ensemble-variance
+conditioning channel (see A.8-§8, B.f-§5).
 
 **Task-graph anchors** (defined in `model_redesign` §15/§16): **T-06** = deployable arm (predicted mask);
 **T-13** = fair oracle (GT `[WT,NETC]`) = *this iteration's Part-A validation vehicle*; **T-14** =
@@ -167,20 +181,37 @@ point, the ramp controls the approach.
 5. **Mask channel layout.** 2-ch `[WT,NETC]`, or 3-ch `[WT,NETC,zero_out]` (via `ZeroOutDownsampler`) to
    keep a byte-compatible slot for a future warm-start. Independent sigmoids, `NETC ⊆ WT`.
 
-## A.5 Concrete recipe
+## A.5 Concrete recipe  (updated iter-8 — A.8 holds the validated code fact behind each annotated line)
 ```
-resume_from      : v3a ema_best.ckpt (pin the Picasso path)
-mask input       : GT [WT,NETC] soft, latent grid (oracle → this iter = T-13)
-fusion           : MaisiControlNet, init_from_trunk (copy v3a down+mid), inject at all down+mid levels
+resume_from      : v3a ema_best.ckpt  (run 2026-06-24_16-00-46_s1_v3a_concat_only_fft_ef000c9f; pin Picasso path)
+                   run.resume_from: <v3a run_id>  → WARM_START (weights-only; optimiser/EMA/RNG fresh)
+mask input       : GT [WT,NETC] SOFT, latent grid (60,60,40) (oracle → this iter = T-13)
+                   served as batch["m_wt_soft"] (NEW — pre-threshold union) + batch["m_netc"] (already served)
+fusion           : MaisiControlNet, init_from_trunk (copies v3a down+mid into the CN encoder). Conditioning
+                   enters the SEPARATE controlnet_cond_embedding hint net ([64] → zero spatial downsampling,
+                   mask already at latent grid) and is ADDED to the CN conv_in output — NOT concatenated (A.8-§1)
+cond specs       : TWO specs  mask:wt:identity + mask:netc:identity  (NOT one 2-ch key — the assembler
+                   under-counts channels silently, A.8-§4).  MASK-ONLY controlnet_cond (no anatomy latents →
+                   homogeneous [0,1] hint-net input; mixing latents needs per-channel norm, A.8-§3)
 output proj      : zero-init (zero-conv)         # P1
-output_scale     : sigmoid ramp 0→1 over 5000 steps (OutputScaleRampCallback)   # P1
-trunk update     : PRIMARY joint low-LR + trunk-EMA;  ABLATION freeze-trunk (adapter-only)
-loss             : L1 velocity CFM  (+ optional whole-brain anchor A.4.4;  T-09 rim loss is a later stage)
-rflow            : use_timestep_transform=true, base_img_size_numel=129024, plumb input_img_size_numel to sampler
-EMA              : 0.9999 ; EarlyStopping patience 250
+output_scale     : sigmoid ramp 0→1 over 5000 steps (OutputScaleRampCallback; buffer persistent=False,
+                   recomputed from global_step on resume; applied to every down+mid residual)   # P1
+trunk update     : PRIMARY joint low-LR + trunk-EMA;  ABLATION freeze-trunk (adapter-only).
+                   ⚠ trainable-trunk warm-start is single-shot / not resume-safe — trunk_ema is built in
+                   setup() after the ckpt load, so it needs v3a's trunk_ema_snapshot.pt (A.8-§5).
+                   freeze-trunk sidesteps this entirely and gives the strongest P1/P4 guarantee.
+loss             : region-weighted CFM, regions {Brain = NOT-BG ∩ NOT-WT, WT}, EQUAL weights initially
+                   ({brain:1.0, wt:1.0} ≡ unweighted L1 velocity — mechanism coded, WT up-weight is a
+                   deferred ablation axis, A.8-§2) (+ optional whole-brain anchor A.4.4; T-09 rim loss later)
+rflow            : use_timestep_transform=true.  ⚠ base_img_size_numel is currently 129024=(48×56×48) but the
+                   served grid is (60,60,40)=144000 — [verify]/reconcile (A.8-§6). Plumb input_img_size_numel
+                   to the EulerSampler or every per-patient val silently fails (feedback_euler_sampler_timestep_transform).
+EMA              : 0.9999 ; EarlyStopping patience 250 ; monitor train/total_epoch
 run family       : picasso_ref_v1_v3a+cn[WT,NETC]_fft.yaml  (loginexa smoke first)
-decision.json    : add fusion=controlnet, mask_repr=[WT,NETC], mask_source=oracle(GT), warm_start_source=v3a,
-                   trunk_update={joint_lowlr|frozen}, output_scale_ramp_steps
+decision.json    : schema 0.10.0. Set controlnet_enabled=true,
+                   controlnet_conditioning_inputs=[mask:wt:identity, mask:netc:identity], mask_repr=[WT,NETC],
+                   mask_source=oracle(GT), warm_start_source=v3a, trunk_update={joint_lowlr|frozen},
+                   output_scale_ramp_steps, region_weights={brain:1.0, wt:1.0}
 ```
 
 ## A.6 How we know it worked (validation gate for this iteration)
@@ -200,6 +231,98 @@ masks **out-of-fold too** (k-fold *within* the train set) so this refinement see
 masks during training and does not learn to over-trust an optimistic in-fold mask. This is the §C.2 L2
 discipline; **full segmenter treatment is deferred to the next iteration.** (Note: this iteration uses the
 GT oracle mask, so segmenter leakage does not even arise yet.)
+
+---
+
+## A.8 — Iter-8 refinements: validated injection-code facts, normalization, loss, mask-perturbation
+
+> Iter-8 audited the actual ControlNet code (`src/vena/model/fm/controlnet/`, `…/maisi/`, `…/lightning/`)
+> and the v3a run config against Part A's claims, then closed the four Q1–Q4 decisions of 2026-07-22. The
+> injection **levels** are confirmed correct; the fixes below are precision, normalization, plumbing, and
+> the loss/robustness/oracle decisions. Each `A.8-§n` is referenced from A.5.
+
+**§1 — Injection levels & mask-input path (CONFIRMED, with one precision fix).** The MAISI trunk is a 3D
+U-Net and the ControlNet is a trainable copy of its **down-blocks + mid-block**. Residuals are emitted and
+added back at **`conv_in` + every down-block resblock output (channels 64→128→256→512) + the mid-block**;
+they reach the decoder **only through the residual-augmented skip connections** (no separate up-block
+injection). This matches A.2 exactly. When the trunk is trainable, the two residual adds are rebound
+**out-of-place** by `maisi/grad_safe.py` (numerics unchanged). **Precision fix to A.2:** the mask does **not**
+concatenate to the noisy latent at `conv_in`. It enters a **separate `controlnet_cond_embedding` hint
+network** (configured `[64]` → **zero** spatial downsampling, because the mask already lives on the 4×
+latent grid) and is **added** to the ControlNet's `conv_in` output at full latent resolution. The trunk's
+own `conv_in` is untouched by the mask.
+
+**§2 — Generator loss (Q_B resolved: region-weighted CFM, equal weights first).** Do **not** run pure L1 vs
+WT-weighted as a two-arm sweep yet — that would open an untuned paper axis prematurely. Instead **code the
+region-weighted CFM mechanism** with regions `{Brain = NOT-BG ∩ NOT-WT, WT}` and run it at **equal weights
+`{brain:1.0, wt:1.0}`, which is numerically identical to the current unweighted L1 velocity loss** (assert
+this equivalence in a test — A.5). The `region_weights` infrastructure already exists (the retired v3b_rw
+arm; `decision.json` 0.10.0 carries `region_weights`). **WT up-weighting (`{5,10,20}`) is then a single,
+deliberate, later ablation axis** — motivated by the <0.1 %-voxel ET imbalance and by ROI-weighted CE-MRI
+synthesis (Ibarra et al., *Comparing Conditional Diffusion Models for CE Breast MRI*, MICCAI 2025,
+arXiv:2508.13776, which shows ROI-loss and mask-conditioning are **complementary**), and gated on **PSNR_ET
+AND** the §6.5 false-positive-enhancement rate (over-weighting hallucinates enhancement into any mask-overlap).
+Rationale for min-SNR-style imbalance concern: Hang et al., ICCV 2023, arXiv:2303.09556.
+
+**§3 — Mask normalization (the "correctly normalized" audit answer).** Masks are fed at their **native range**
+(soft `[0,1]`; the legacy binary WT is `{0,1}`) with **no `latent_scale`** applied, through a hint net that is
+**always freshly initialised** (`controlnet_cond_embedding` is CN-only and never copied by `init_from_trunk`)
+→ **no warm-start normalization mismatch** for the mask path. This is clean **iff the conditioning is
+mask-only**. If anatomy latents are mixed into `controlnet_cond` (the A.4.2 "mask + context" option), the hint
+net sees `[0,1]` mask channels alongside `~±several-unit` latent channels — a real scale disparity. **Decision:
+default to MASK-ONLY** `controlnet_cond` (also the strongest P2 locality); if context is ever added, apply
+explicit per-channel normalisation before assembly. (The trunk-input concat path — v3a's `[t1pre,t2,flair]`
+latents into the trunk's 16-ch `conv_in` — is unrelated and unchanged.)
+
+**§4 — Two-channel `[WT,NETC]` plumbing (DEFECT to avoid).** `ConditioningAssembler.channels_per_spec` reads
+the `mask_channels` **constructor default (=1)**, not the runtime tensor shape. A single `mask:wt:identity`
+spec fed a `(B,2,…)` tensor silently **under-counts** `total_channels`, builds the hint net's first conv with
+the wrong `in_channels`, and only errors at the first forward. **Fix: declare TWO specs**
+`mask:wt:identity` + `mask:netc:identity`, each a 1-ch batch key (`m_wt_soft`, `m_netc`). (`lift_to_4ch`
+similarly needs `in_channels=2` if ever used on a 2-ch mask.) The wrapper never passes MONAI's
+`conditioning_scale` (stays 1.0) and relies on `output_scale` alone — do not set both.
+
+**§5 — Warm-start mechanics (v3a) & the trunk-EMA landmine.** `run.resume_from: <v3a_run_id>` classifies as
+**WARM_START**: a `_WarmStartCallback` loads v3a weights only (optimiser / EMA / RNG start fresh); the fresh
+ControlNet's down+mid blocks are seeded from v3a's trunk via `init_from_trunk`; the hint net + zero-init
+output convs are fresh (correct by design). **Landmine:** with a **trainable trunk**, `self.trunk_ema` is
+built in `setup()` *after* Lightning's checkpoint restore, so trainable-trunk warm-start is **single-shot,
+not resume-safe** and depends on v3a having emitted a `trunk_ema_snapshot.pt` sibling for
+`_maybe_load_trunk_ema_snapshot()`. **The freeze-trunk ablation (adapter-only) sidesteps this entirely** and
+gives the strongest P1/P4 guarantee — run it first to de-risk, then the joint-low-LR primary.
+
+**§6 — Grid `(60,60,40)` (resolves the doc's open `[verify]`).** The DataModule serves latents and masks at
+**`(4|1, 60, 60, 40)`** (= 240/4 × 240/4 × ⌈155/4⌉ full-volume MAISI latent), confirmed from
+`lightning/data.py`. Every mask target, avg-pool output, and `masks/tumor_latent_pred` cache must be
+`(2, 60, 60, 40)` — **not** the `(…,48,56,48)` written in `model_redesign` T-04. Separately, `rflow.base_img_size_numel`
+is pinned to `129024 = 48×56×48 ≠ 144000` — a **timestep-transform reference mismatch** to [verify]; it only
+scales SD3-style timestep weighting, so the effect is mild (ratio 1.12×), but it should be reconciled to the
+true grid or explained. **Also new:** expose **soft-WT** as `batch["m_wt_soft"]` (the pre-threshold union
+`clip(Σ tumor_latent, 0, 1)`) — currently only the 0.5-thresholded binary `m_wt` is served, but the oracle
+`[WT,NETC]` must be **soft**.
+
+**§7 — Oracle → predicted gap & mask-perturbation (Q_C resolved: clean T-13, perturb T-06).** **T-13 uses the
+clean GT `[WT,NETC]`** (no perturbation) so it measures the true injection **ceiling**. The deployable **T-06**
+then adds **mask-perturbation augmentation** to close the train-on-GT → deploy-on-predicted distribution gap,
+which is otherwise real (Ko et al., *Stochastic Conditional Diffusion Models*, ICML 2024, arXiv:2402.16506;
+Ho et al. *Noise-Conditioning-Augmentation*, arXiv:2106.15282; Imagen, arXiv:2205.11487). Perturbation recipe
+(latent grid): random **dilation/erosion ±3 vox**, **additive soft-prob Gaussian noise σ ∼ U[0, 0.15]**, and
+**whole-map dropout p ≈ 0.15** (dual-purpose: enables optional CFG, §8). Preserve `NETC ⊆ WT` after
+perturbation. **Report the oracle-vs-predicted PSNR_ET gap as a first-class table column** — TA-ViT (Eidex
+2025, arXiv:2409.01622) does not report it, so it is a clean VENA contribution. This also updates A.6: the
+no-regression gate is evaluated on the clean oracle (T-13), and the same gate + the T-14 FP study on the
+predicted mask (T-06).
+
+**§8 — Deferred-ablation levers (coded-but-OFF this iteration).** Two levers are documented for later, gated
+behind flags, not run in the T-13/T-06 headline: **(a) CFG-at-inference** (currently *not implemented* — only
+training-time conditioning dropout exists). Guidance would amplify enhancement but is **FP-risk-double-edged**
+for a Gd replacement; if trialed, restrict guidance to a **middle noise interval** (Kynkäänniemi et al.,
+NeurIPS 2024, arXiv:2404.07724) and suppress saturation with **APG** (Sadat et al., arXiv:2410.02416), or use
+**autoguidance** (Karras et al., NeurIPS 2024, arXiv:2406.02507); sweep `guidance_scale ∈ {1.0,1.5,2.0}`
+against PSNR_ET **and** §6.5 FP rate; reject if `1.0` already maximises PSNR_ET. **(b) Noise-level-dependent
+`output_scale`** — gate the ramp scalar at inference by a `sigmoid` window peaking at α ∈ [0.3,0.7]
+(complementary to the already-on `use_timestep_transform`, SD3 Esser et al. arXiv:2403.03206); a ~3-line
+change to `MaisiControlNet.forward`. Include only if it beats constant `output_scale=1.0`.
 
 ---
 
@@ -293,6 +416,83 @@ MedIA 2021) · DSC++ (2111.00528) · temp scaling (Guo 2017) · SSN (2006.06015)
 evidential (Sensoy 2018). Soft pipeline: **SoftSeg** (2011.09041). Soft-conditioning-helps-generator:
 **density-conditioned synthesis** (2510.09365) · **SPADE** (1903.07291) · **seg-guided diffusion** (2402.05210).
 
+**Iter-8 additions (all verified 2026-07-22).** Injection/robustness (Part A / A.8): oracle→predicted &
+condition-noise-aug = **SCDM/label-diffusion** (Ko, ICML 2024, 2402.16506) · **NCA** (Ho cascaded, 2106.15282;
+Imagen, 2205.11487) · **TA-ViT/T1C-RFlow** unreported oracle gap (Eidex, Med. Phys. 2025, 2409.01622);
+ROI-weighted CE-MRI synthesis = **Ibarra** (MICCAI 2025, 2508.13776) · min-SNR imbalance (Hang, ICCV 2023,
+2303.09556) · lesion-weighted 3D synth (2606.15457, *preprint*); guidance = **guidance-interval**
+(Kynkäänniemi, NeurIPS 2024, 2404.07724) · **APG** (Sadat, 2410.02416, *preprint*) · **autoguidance**
+(Karras, NeurIPS 2024, 2406.02507) · **SD3 timestep-transform** (Esser, 2403.03206). Segmenter (Part B /
+B.f): per-class/Dirichlet calibration = **Kull** (NeurIPS 2019) · ensemble-still-needs-TS = **Buddenkotte**
+(CBM 2023, 2209.09563) · **LTS** (Ding, ICCV 2021, 2008.05105) · **focal-calibration** (Mukhoti, NeurIPS 2020,
+2002.09437); ensemble uncertainty = **deep ensembles** (Lakshminarayanan, NeurIPS 2017, 1612.01474) ·
+**under-shift** (Ovadia, NeurIPS 2019, 1906.02530) · **k-fold≠deep-ensemble** (2605.18329, *preprint*) ·
+**DGRNet** (2603.21086, *preprint*); SDT = **SiNGR** (Juanola, MICCAI 2024, 2405.16813) · **Ma DT study**
+(MIDL 2020) · **GeoLS** (Vasudeva, MIDL 2024) · **skeleton-aware DT** (2310.05262); TTA = **Wang**
+(Neurocomputing 2019, 10.1016/j.neucom.2019.01.103).
+
+## B.f — Iter-8 segmenter refinements (calibration, ensemble, SDT, selection)
+
+> A verified segmenter/soft-map literature sweep (2026-07-22) added five refinements to Part B. None change
+> the locked backbone/loss/splits; they correct calibration and SDT details and add honest caveats.
+
+**§1 — Backbone confirmed; SegResNet demoted to a *forkable* baseline.** **BSF-SwinUNETR (fs=48) is the
+primary** (Arm A BraTS-SSL, Arm B UKB-SSL). **Arm C = SegResNet-from-scratch** is the pretraining-gain
+baseline and should be **forked from the existing 4-input `src/vena/validation/downstream_seg.py`** (drop the
+T1c input → 3-input `{T1pre,T2,FLAIR}`). This **supersedes `model_redesign` §16.6**, which named SegResNet as
+*primary* — that predated the iter-3 BrainSegFounder probe.
+
+**§2 — Calibration: per-class temperature, and don't skip it after ensembling.** Fit **two independent
+temperatures `T_WT`, `T_NETC`** on the OOF calibration split, not one global scalar — a global T is strictly
+suboptimal for multi-region outputs (Kull et al., *Dirichlet calibration*, NeurIPS 2019; global TS is its
+equal-off-diagonal special case). Crucially, **ensemble averaging does NOT make temperature scaling
+redundant** for medical segmentation — residual miscalibration remains in the mean and TS on top gives a
+significant further ECE reduction (Buddenkotte et al., *Calibrating ensembles…*, Comput. Biol. Med. 2023,
+arXiv:2209.09563). Spatial **Local Temperature Scaling** (Ding et al., ICCV 2021, arXiv:2008.05105) is the
+ceiling but is **not worth it here** — its boundary-calibration gain is washed out by the subsequent 4×
+avg-pool to the latent grid. Optional training-time alternative to post-hoc TS: **focal-CE** produces
+inherently better-calibrated models (Mukhoti et al., NeurIPS 2020, arXiv:2002.09437) — ablate against DML+CE.
+
+**§3 — "Free deep ensemble" caveat: k-fold ≠ deep ensemble for uncertainty.** The K fold-models still give a
+useful **ensemble mean** (calibration/smoothing) and are needed anyway for leak-free OOF masks. But k-fold
+members train on **different data subsets**, so their per-voxel disagreement **conflates data-exposure with
+seed variability** and over-estimates boundary uncertainty — it is *not* pure epistemic uncertainty (*Lost in
+the Folds*, 2025, arXiv:2605.18329). Under distribution shift (the Málaga OOD cohort) true random-init deep
+ensembles are the only method that stays calibrated (Ovadia et al., NeurIPS 2019, arXiv:1906.02530).
+**Actionable:** keep k-fold OOF for the masks; use the mean as the soft map; **do not sell k-fold variance as
+epistemic uncertainty** in the paper. If a clean uncertainty signal is later required, add a small
+**random-init deep ensemble on the all-FM-train model** (same data, different seeds).
+
+**§4 — SDT correctness for multifocal NETC + pooling order.** NETC is frequently **disconnected** in GBM
+(satellite nodules / necrotic components, ~20–30 % of cases). **Naive Euclidean SDT mishandles the
+inter-component gap** (assigns positive "interior" scores between lobes; He et al., MICCAI 2023,
+arXiv:2310.05262). **Fix for the NETC channel:** per-connected-component Euclidean SDT (union) **or** a
+signed **normalised geodesic** transform routed through image intensity (SiNGR, Juanola et al., MICCAI 2024,
+arXiv:2405.16813; GeoLS, Vasudeva et al., MIDL 2024) — the segmenter sees `{FLAIR,T1pre,T2}` so geodesic is
+available. Follow the DT best-practices: **per-class**, **normalised**, **clipped** (Ma et al., MIDL 2020).
+**Pooling order is `SDT → sigmoid → avg-pool`** (the doc's B.c order is already correct); never avg-pool raw
+signed SDT (small lesions get a confusing negative mean at the latent scale).
+
+**§5 — Ensemble-variance conditioning channel = ablation-only.** The per-voxel STD across fold-models can be
+added as an **optional 3rd conditioning channel** (precedent: DGRNet uses disagreement→spatial-gating for
+BraTS, 2026, arXiv:2603.21086). Gate it behind an **ablation flag**; do not put it in the headline, and label
+it "k-fold disagreement", not epistemic uncertainty (§3).
+
+**§6 — Inference: k-fold mean primary; TTA optional on Málaga; no MC-dropout.** The K-fold ensemble mean is
+the pick. Add **test-time augmentation** (flip + small rotation over the fold-models) **only on the external
+Málaga cohort**, where it captures a complementary aleatoric axis (Wang et al., Neurocomputing 2019,
+DOI:10.1016/j.neucom.2019.01.103). **Skip MC-dropout** — dominated by both TTA and ensembles on every
+calibration metric under shift (Ovadia 2019).
+
+**§7 — Segmenter selection: dual DSC + calibration, because the generator eats soft probs.** Dice measures
+*where the boundary is*; the generator consumes the **real-valued probability**, so its **calibration**
+(Brier / classwise-ECE) is at least as load-bearing — a sharp-but-overconfident mask can be a *worse*
+conditioner than a slightly blurrier well-calibrated one, and mask quality propagates into synthesis quality
+(Konz et al., *segmentation-guided diffusion*, MICCAI 2024, arXiv:2402.05210). No study directly ranks
+Dice-vs-calibration for a downstream *generator* (an open gap → a small VENA methodological note). **Actionable:**
+report **both DSC and Brier/classwise-ECE** per fold-model and per cohort; when within ~1 % DSC, prefer the
+better-Brier model; run a 2-point ablation (Dice-best vs Brier-best ensemble → generated-image PSNR_ET).
+
 ---
 
 # PART C — WHY THE MASK ROUTE (evidence from the iter-5 reviews) + leakage
@@ -352,3 +552,23 @@ VENA's training corpus is **untouched**; the segmenter is an add-on that emits m
   scaling + **avg-pool partial-volume** (the key free one) + free K-fold ensemble. B.d preprocessing/aug/
   nesting/harmonisation. Soft>hard for conditioning: density-conditioned synthesis (2510.09365), SPADE,
   seg-guided diffusion (2402.05210).
+- 2026-07-22 (iter 8) — **code-validated + four Q1–Q4 decisions locked + literature-hardened**, ahead of the
+  v3a-resume implementation. Audited `controlnet/`, `maisi/grad_safe`, `lightning/{module,data}`, and the v3a
+  run config against Part A. **Injection levels CONFIRMED correct** (conv_in + all down resblocks + mid,
+  decoder via skips); added **A.8** with the precision fixes: mask enters a **separate `controlnet_cond_embedding`
+  hint net (added, not concatenated)**; **mask-only normalisation** is clean, mask+context needs per-channel
+  norm; **2-ch `[WT,NETC]` = TWO specs** (assembler under-counts a single 2-ch key); `output_scale` correct;
+  **trunk-EMA warm-start is single-shot/not-resume-safe** (freeze-trunk sidesteps). **Grid resolved to
+  `(60,60,40)`** (served) — every `(48,56,48)`/`129024` reference is stale; expose **soft-WT** `m_wt_soft`.
+  **Q_A → warm-start v3a + fresh ControlNet** (v3b → T-10 ablation; supersedes redesign T-06/T-13 source).
+  **Q_B → region-weighted CFM coded but run at EQUAL `{brain,wt}` weights first** (≡ L1; WT up-weight =
+  deferred ablation, Ibarra 2508.13776). **Q_C → clean-oracle T-13 ceiling; mask-perturbation aug only on
+  T-06** (Ko 2402.16506, Ho NCA) + **report oracle-vs-predicted gap** (unreported in TA-ViT). **Q_D → seg
+  module derives soft masks; a thin routine writes `masks/tumor_latent_pred (2,60,60,40)` to the latent H5.**
+  CFG-at-inference (not implemented) + noise-level `output_scale` = **deferred FP-gated levers** (Kynkäänniemi
+  2404.07724, Sadat 2410.02416). **B.f** segmenter refinements: **per-class `T_WT`/`T_NETC`** + TS-still-needed
+  post-ensemble (Buddenkotte 2209.09563); **k-fold ≠ deep ensemble for uncertainty** (2605.18329) — mean OK,
+  variance confounded; **geodesic/per-component SDT for multifocal NETC** (SiNGR 2405.16813); variance channel
+  = ablation-only; optional TTA on Málaga, no MC-dropout; **dual DSC+Brier selection**. SegResNet demoted to
+  Arm-C baseline (fork `downstream_seg`) — supersedes redesign §16.6. Implementation task-graph:
+  `.claude/notes/changes/vena_new_iteration/DEVELOPMENT/`.
