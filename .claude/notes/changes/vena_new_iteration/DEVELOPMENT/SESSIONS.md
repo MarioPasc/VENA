@@ -112,12 +112,23 @@ on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note bel
   miscalibration: `T_WT=1.42`, `T_NETC=0.68`, NLL down, argmax-preserving — the reported `T≈1301` was a pathological
   50%-error synthetic, correct); `pool_to_latent`→`(2,48,56,48)` reusing the exact `masks/tumor_latent` crop-then-pool
   (`apply_crop_pad` via `vena.common` + `avg_pool3d(k=4)`), registration exact; K-fold `ensemble_soft`. +28 tests.
-- **Suite green at 1255** (1176→1194→+33→+28); nothing deleted/skipped; ruff clean on all touched files.
+- **Task 19 (mask_derive routine) MERGED** (`3b8ce78`). `derive_latent_soft_mask(source=gt|predicted)` — one code
+  path, GT & predicted both `(2,48,56,48)` (the swap guarantee). Additive latent-H5 schema **2.1.0**
+  (`masks/tumor_latent_soft`/`_pred` optional-but-validated groups; un-processed 2.0.0 H5s still validate). +8 tests
+  (swap-invariance, H5 write+validate, idempotency, oracle byte-identical, registration centroid). **Out-of-lane but
+  CORRECT:** de-exported the heavy `LatentH5Converter` from `data/h5/latent_domain/__init__` (was pulling MAISI model
+  code into every importer, breaking the "no heavy import" rule); both real callers (`encode`, `offline_aug`) already
+  use `.convert`. Verified: all affected modules import; the one data/h5 failure was a PRE-EXISTING `@slow` broken test
+  (`test_ucsf_image_convert_smoke`, fails on main too, deselected from the fast suite); the 2 ruff F841 in
+  `encode/maisi/engine.py` are pre-existing on main.
+- **Suite green at 1263** (1176→1194→+33→+28→+8); nothing deleted/skipped; new files ruff-clean.
 - **Data-flow verified for 19/40:** rows align **by id** (image H5 `ids` ↔ latent H5 `ids`); `crop/origin (N,3)` lives
-  only in the image H5; image H5s LOCAL (MeningD2), latent H5s PICASSO-only. ⇒ cache (19) = Picasso CPU; figures (40)
-  = local (recompute from image H5, deterministic == cache) → `/media/.../results/prior/tumor/gt`.
-- **REMAINING:** task 19 (derive+cache `source:gt`) → task 40 (QC + pinned montage + PCA/UMAP embedding) → real
-  Picasso cache + local figures → **human mask review gate** (surface `report.md`). Then S1 row ticks.
+  only in the image H5; image H5s LOCAL (MeningD2), latent H5s PICASSO-only. `umap` absent → task 40 uses PCA (sklearn).
+- **Task 40 (validate_masks) RUNNING.** After merge: (a) run local figures over `corpus_local.json` → Sandisk GT dir
+  (also validates `derive` on real UCSF data before any Picasso write); (b) surface `report.md` for **human mask
+  review**; (c) run the Picasso cache (`mask_derive` gt over `corpus_picasso.json`, CPU) → exit-criterion-1. Then S1 row ticks.
+- **⚠ S2 note (deferred):** aug latent H5s `*_latents_aug.h5` are NOT in the registry list; if S2 trains with offline
+  aug, the soft mask must be present+consistently-transformed there too (task-20/DataModule concern).
 
 ---
 
