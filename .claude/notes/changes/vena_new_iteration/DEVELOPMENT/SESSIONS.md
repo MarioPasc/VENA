@@ -148,6 +148,21 @@ on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note bel
   graded); figures in the Sandisk GT dir awaiting **human review**; cache array running. S1 row ticks once the array
   is terminal + all 9 H5s validated (`masks/tumor_latent_soft` present, oracle byte-identical) and the human closes
   the mask-review gate.
+- **Viz feedback round (2026-07-22, Opus-4.8 agent, merged `8ffd858`, seg suite 110).** Scientist review of the QC
+  figures surfaced issues; root-caused + fixed (VIZ only — derivation untouched):
+  - **Calibration is CORRECT, not a derivation problem** — verified `soft@0.5 volume / hard-tumour volume = 1.000`
+    (globally + at max-area slice; UCSF 0290 max slice: hard NETC=34, soft NETC>0.5=34). The "prob where no tumour"
+    was a slice-selection artifact + the graded halo rendered by the heatmap.
+  - **Slice-selection bug:** `render_mask_qc` picked the peak-VALUE slice (`argmax(wt.max(axis=(0,1)))`, ~32-way tie
+    → arbitrary) and argmaxed image vs latent INDEPENDENTLY → different z-levels. Fixed → tumour-AREA
+    (`sum(axis=(0,1))`) for both, so anatomy + latent rows show the same widest slice.
+  - **NETC-hard bug (pre-existing engine):** `hard_mask = (soft[0]>0.5)` passed a WT BINARY; `render_mask_qc` did
+    `==1` → whole WT (3136 vox) as "NETC hard" instead of the true necrotic core (34). Fixed → thread the true
+    integer BraTS label via `PatientView.hard_label`.
+  - **Rendering:** continuous soft overlay (opacity ∝ prob) + contour rings at 0.25/0.5/0.75; high-contrast colors
+    **WT=green (0.1,0.9,0.2) / NETC=magenta (1.0,0.1,0.6)** (retired white-ish `hot`/`cool`); montage α=0.6, 10 cols.
+  - Re-rendered + I viewed: all 3 QC rows (hard/soft/latent) now agree; NETC nested; gradation explicit. Authoritative
+    UCSF figures re-run into a fresh GT-dir timestamp; the buggy `2026-07-22T14-34-14Z` set is superseded.
 - **⚠ S2 note (deferred):** aug latent H5s `*_latents_aug.h5` are NOT in the registry list; if S2 trains with offline
   aug, the soft mask must be present+consistently-transformed there too (task-20/DataModule concern).
 
