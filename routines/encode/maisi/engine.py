@@ -28,7 +28,7 @@ import torch
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from vena.data.h5.latent_domain import LatentH5Config, LatentH5Converter
+from vena.data.h5.latent_domain.convert import LatentH5Config, LatentH5Converter
 from vena.data.h5.shared import now_iso_utc, resolve_git_sha
 from vena.model.autoencoder.maisi import load_autoencoder
 from vena.model.autoencoder.maisi.decode import MaisiDecoder

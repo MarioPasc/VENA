@@ -22,6 +22,8 @@ datasets. Pass ``metadata_fields=[]`` for those cohorts.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from vena.data.h5.shared import DatasetSpec, H5Manifest
 
 LATENT_SCHEMA_VERSION: str = "2.0.0"
@@ -73,9 +75,7 @@ def _build_manifest(
     """
     unknown = [m for m in modalities if m not in LATENT_SEQUENCE_MAP]
     if unknown:
-        raise ValueError(
-            f"unknown modalities {unknown}; available: {sorted(LATENT_SEQUENCE_MAP)}"
-        )
+        raise ValueError(f"unknown modalities {unknown}; available: {sorted(LATENT_SEQUENCE_MAP)}")
     if not modalities:
         raise ValueError("at least one modality must be requested")
 
@@ -145,7 +145,7 @@ def _build_manifest(
     )
 
     # Cohort-specific metadata (may be empty for BraTS-GLI etc.).
-    for field in (metadata_fields or []):
+    for field in metadata_fields or []:
         datasets.append(
             DatasetSpec(
                 path=field["path"],
@@ -213,3 +213,168 @@ def build_latent_manifest(
         mask_output_channels=mask_output_channels,
         metadata_fields=metadata_fields,
     )
+
+
+# ---------------------------------------------------------------------------
+# Additive soft-mask group (schema 2.1.0)
+# ---------------------------------------------------------------------------
+
+LATENT_SCHEMA_VERSION_SOFT: str = "2.1.0"
+"""Schema version stamped on the root attr after writing the soft-mask group.
+
+This is additive: latent H5 files that have NOT been processed by the
+``mask_derive`` routine retain ``schema_version = "2.0.0"`` and continue to
+validate against :func:`build_latent_manifest`.  Only once the group
+``masks/tumor_latent_soft`` (or ``masks/tumor_latent_pred``) is written does
+the root ``schema_version`` advance to ``"2.1.0"``.
+"""
+
+# Canonical group names for the two derivation paths.
+SOFT_MASK_GROUP: str = "masks/tumor_latent_soft"
+PRED_MASK_GROUP: str = "masks/tumor_latent_pred"
+
+# Expected spatial dimensions of one row in the group (channels, H, W, D).
+_SOFT_MASK_CHANNELS: int = 2
+_SOFT_MASK_ROW_SHAPE: tuple[int, int, int, int] = (_SOFT_MASK_CHANNELS, *LATENT_SPATIAL)
+
+# Required self-describing attrs per principle 4.
+_REQUIRED_DATASET_ATTRS: tuple[str, ...] = ("units", "description", "dtype", "leading_dim")
+
+
+def validate_latent_soft_mask_group(
+    path: str | Path,
+    *,
+    group: str = SOFT_MASK_GROUP,
+) -> list[str]:
+    """Validate the additive soft-mask group in a latent H5 (checked-if-present).
+
+    This validator is separate from :func:`~vena.data.h5.shared.validator.validate_h5`
+    so that un-processed 2.0.0 latent H5s (which lack this group) continue to
+    pass their own manifest check unchanged.  Only call this function *after*
+    the group has been written.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to a latent H5 file (schema ``"2.0.0"`` or ``"2.1.0"``).
+    group : str
+        Dataset path to validate; defaults to
+        :data:`SOFT_MASK_GROUP` (``"masks/tumor_latent_soft"``).
+        Pass :data:`PRED_MASK_GROUP` for the predicted-path group.
+
+    Returns
+    -------
+    list[str]
+        Empty list when the group is valid; non-empty on violations.
+    """
+    import h5py
+    import numpy as np
+
+    path = Path(path)
+    violations: list[str] = []
+
+    if not path.exists():
+        return [f"file does not exist: {path}"]
+
+    with h5py.File(path, "r") as f:
+        # schema_version must be one of the two supported values.
+        sv = str(f.attrs.get("schema_version", ""))
+        if sv not in {LATENT_SCHEMA_VERSION, LATENT_SCHEMA_VERSION_SOFT}:
+            violations.append(
+                f"schema_version {sv!r} not in "
+                f"{{{LATENT_SCHEMA_VERSION!r}, {LATENT_SCHEMA_VERSION_SOFT!r}}}"
+            )
+
+        # mask_source root attr must be present.
+        if "mask_source" not in f.attrs:
+            violations.append("missing root attr: mask_source")
+
+        # The group itself must exist.
+        if group not in f:
+            violations.append(f"missing group/dataset: {group!r}")
+            return violations  # no further checks are possible
+
+        dset = f[group]
+        if not isinstance(dset, h5py.Dataset):
+            violations.append(f"{group}: expected Dataset, got {type(dset).__name__}")
+            return violations
+
+        # Shape: (N, 2, 48, 56, 48) — N inferred from ids when present.
+        if dset.ndim != 5:
+            violations.append(f"{group}: expected 5-D (N,2,H,W,D), got ndim={dset.ndim}")
+        else:
+            row_shape = tuple(dset.shape[1:])
+            if row_shape != _SOFT_MASK_ROW_SHAPE:
+                violations.append(
+                    f"{group}: row shape {row_shape} != expected {_SOFT_MASK_ROW_SHAPE}"
+                )
+            # Leading dim must match ids when present.
+            if "ids" in f:
+                n_ids = int(f["ids"].shape[0])
+                n_rows = int(dset.shape[0])
+                if n_rows != n_ids:
+                    violations.append(f"{group}: n_rows={n_rows} does not match ids n={n_ids}")
+
+        # Dtype must be float32.
+        if dset.dtype != np.dtype("float32"):
+            violations.append(f"{group}: dtype {dset.dtype} != float32")
+
+        # Self-describing attrs (principle 4).
+        for attr in _REQUIRED_DATASET_ATTRS:
+            if attr not in dset.attrs:
+                violations.append(f"{group}: missing attr {attr!r}")
+
+        # Values must be in [0, 1] — spot-check first row only (cheap).
+        if dset.shape[0] > 0 and dset.ndim == 5:
+            first_row = dset[0]
+            if float(first_row.min()) < -1e-4 or float(first_row.max()) > 1.0 + 1e-4:
+                violations.append(
+                    f"{group}: row 0 values outside [0, 1] "
+                    f"(min={first_row.min():.4f}, max={first_row.max():.4f})"
+                )
+
+    return violations
+
+
+def assert_latent_soft_mask_group_valid(
+    path: str | Path,
+    *,
+    group: str = SOFT_MASK_GROUP,
+) -> None:
+    """Raise :class:`~vena.data.h5.shared.exceptions.H5ValidationError` listing all violations; succeed silently.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to a latent H5 file.
+    group : str
+        Dataset path to validate; see :func:`validate_latent_soft_mask_group`.
+    """
+    from vena.data.h5.shared.exceptions import H5ValidationError
+
+    violations = validate_latent_soft_mask_group(path, group=group)
+    if violations:
+        joined = "\n  - ".join(violations)
+        raise H5ValidationError(
+            f"Soft-mask group {group!r} failed validation in {path}:\n  - {joined}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+__all__ = [
+    "LATENT_CHANNELS",
+    "LATENT_CROP_BOX",
+    "LATENT_SCHEMA_VERSION",
+    "LATENT_SCHEMA_VERSION_SOFT",
+    "LATENT_SEQUENCE_MAP",
+    "LATENT_SPATIAL",
+    "PRED_MASK_GROUP",
+    "SOFT_MASK_GROUP",
+    "assert_latent_soft_mask_group_valid",
+    "build_latent_manifest",
+    "validate_latent_soft_mask_group",
+]

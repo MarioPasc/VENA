@@ -1,0 +1,38 @@
+# Predicted soft-mask derivation — Phase-2 placeholder.
+#
+# Applies a trained K-fold segmenter (BSF-SwinUNETR) to derive calibrated
+# [WT, NETC] soft masks.  Requires:
+#   1. A trained segmenter run under routines/segmentation/train/.
+#   2. K checkpoint paths listed under segmenter_checkpoints.
+#
+# This config is a Phase-2 placeholder: the segmenter module (task 17) does
+# not exist yet.  Running with source: predicted will raise SegDerivationError
+# with a clear "Phase-2 not available" message.
+
+source: predicted
+
+corpus_registry: routines/segmentation/mask_derive/configs/corpus/corpus_local.json
+
+targets:
+  soft: true
+  sdt_sigma_vox: 3.0
+  netc_operator: euclidean_percomponent
+  clip_vox: 10.0
+
+derivation:
+  temperature: per_class
+  avg_pool_stride: 4
+  latent_grid: [48, 56, 48]
+  emit_variance: false
+
+artifact_dir: artifacts/segmentation/mask_derive
+
+log_level: INFO
+
+# Fill in K checkpoint paths after segmenter training completes (task 17).
+segmenter_checkpoints:
+  - /path/to/fold_0/best.ckpt
+  - /path/to/fold_1/best.ckpt
+  - /path/to/fold_2/best.ckpt
+  - /path/to/fold_3/best.ckpt
+  - /path/to/fold_4/best.ckpt

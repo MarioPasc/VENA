@@ -24,13 +24,21 @@ voxels, breaking the enclosed-lesion-fraction interpretation).
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
 
-from vena.common import CropPadSpec, apply_crop_pad
 from vena.data.h5.latent_domain.manifest import LATENT_CROP_BOX, LATENT_SPATIAL
 from vena.segmentation.config import DerivationConfig
 from vena.segmentation.exceptions import SegDerivationError
+
+if TYPE_CHECKING:
+    # CropPadSpec lives in vena.common (MAISI adapter layer).  Importing it at
+    # module level would load all MAISI model code eagerly and break import
+    # isolation.  The annotation is a string at runtime due to
+    # `from __future__ import annotations`, so no runtime import is needed here.
+    from vena.common import CropPadSpec
 
 # Depth-pad base = spatial_compression * _DEPTH_PAD_MULTIPLIER, matching
 # PerClassAvgPoolDownsampler (depth_pad_base = 4 * 2 = 8).
@@ -96,7 +104,10 @@ def pool_to_latent(
 
     # Step 1: crop to the brain-centred box when a native-space volume is given.
     # apply_crop_pad requires exactly 5-D (B, C, H, W, D); expand and squeeze.
+    # Lazy import: vena.common loads MAISI model code; defer until actually needed.
     if crop_spec is not None:
+        from vena.common import apply_crop_pad
+
         x = x.unsqueeze(0)  # (1, 2, H, W, D)
         x = apply_crop_pad(x, crop_spec)  # (1, 2, 192, 224, 192)
         x = x.squeeze(0)  # (2, 192, 224, 192)

@@ -1,0 +1,30 @@
+# GT (oracle) soft-mask derivation — Phase-1, no segmenter required.
+#
+# Reads integer BraTS labels from image_h5 and crop origins from crop/origin,
+# applies SDT → sigmoid at image resolution, then avg-pools to the MAISI
+# latent grid (48, 56, 48).  Written to masks/tumor_latent_soft.
+#
+# Override corpus_registry and artifact_dir for your environment.
+
+source: gt
+
+corpus_registry: routines/segmentation/mask_derive/configs/corpus/corpus_local.json
+
+targets:
+  soft: true
+  sdt_sigma_vox: 3.0
+  netc_operator: euclidean_percomponent
+  clip_vox: 10.0
+
+derivation:
+  temperature: per_class
+  avg_pool_stride: 4
+  latent_grid: [48, 56, 48]
+  emit_variance: false
+
+artifact_dir: artifacts/segmentation/mask_derive
+
+log_level: INFO
+
+# predicted path only (unused for source: gt)
+segmenter_checkpoints: []

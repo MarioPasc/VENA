@@ -1,0 +1,34 @@
+# Smoke config for mask-derive.
+#
+# Points at synthetic H5 fixtures created by the pytest fixture in
+# tests/routines/segmentation/test_mask_derive.py.  Run the full smoke
+# manually only after generating the fixtures:
+#
+#   pytest tests/routines/segmentation/ -k build_smoke_fixtures
+#   vena-segmentation-mask-derive \
+#       routines/segmentation/mask_derive/configs/smoke.yaml
+#
+# In CI the engine is exercised directly (without the CLI) by the test suite.
+
+source: gt
+
+# Synthetic H5 pair written by the test fixture to a deterministic tmp path.
+corpus_registry: /tmp/vena-smoke/mask_derive/corpus.json
+
+targets:
+  soft: true
+  sdt_sigma_vox: 3.0
+  netc_operator: euclidean_percomponent
+  clip_vox: 10.0
+
+derivation:
+  temperature: per_class
+  avg_pool_stride: 4
+  latent_grid: [48, 56, 48]
+  emit_variance: false
+
+artifact_dir: /tmp/vena-smoke/mask_derive/artifacts
+
+log_level: DEBUG
+
+segmenter_checkpoints: []
