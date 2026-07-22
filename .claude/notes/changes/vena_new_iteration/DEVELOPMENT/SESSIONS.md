@@ -86,13 +86,38 @@ gap. **Phase 3:** deferred ablations (CFG, WT up-weight sweep, SPADE).
 `masks/tumor_latent` is confirmed (task 19 read-and-verify). **Q1 resolved: SDT-graded oracle** (SDT→sigmoid→avg-pool
 of GT — task 19 as specced).
 
-**Exit criteria.** `masks/tumor_latent_soft (N,2,60,60,40)` present + `assert_*_valid` green in every cohort latent
+**Exit criteria.** `masks/tumor_latent_soft (N,2,48,56,48)` present + `assert_*_valid` green in every cohort latent
 H5, oracle `masks/tumor_latent` byte-untouched; `NETC_soft ≤ WT_soft`; the QC + embedding figures render and the
 human review says the masks are localised and graded; `segmentation` marker registered; fast suite green, ruff clean
-on touched files.
+on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note below.)*
 
 **Orchestrator notes (append-only).**
-- _(empty)_
+- **2026-07-22 — S1 in progress (`/orchestrate`, Opus 4.8 @ xhigh).** Base commit `9c90f78`. Baseline pytest
+  1176 passed / 1 skipped; ruff 478 pre-existing (not ours).
+- **🔴 GRID ERRATUM (LOAD-BEARING).** The served latent grid is **`(48,56,48)`, NOT `(60,60,40)`**. Verified vs
+  Picasso disk (`latents/* (N,4,48,56,48)`, `masks/tumor_latent (N,3,48,56,48)`), the producer
+  (`data/h5/latent_domain/manifest.py`: `LATENT_SPATIAL=(48,56,48)`, crop `(192,224,192)`, avg-pool stride 4),
+  and the v3a warm-start config (`base_img_size_numel=129024=48×56×48`). `01_SHARED_CONTRACTS.md` §Geometry + every
+  `NN_*.md` spec say `(60,60,40)` — WRONG (the fact sheet even flags the v3a 129024 contradiction but mislabels
+  `(48,56,48)` "stale"). `(60,60,40)` survives only in a stale `data/h5/lightning/data.py` docstring. Every mask =
+  `(2,48,56,48)`. Erratum handed to every downstream agent. **`01_SHARED_CONTRACTS.md` + the other specs still carry
+  the wrong number — fix at session close.**
+- **Task 10 (scaffold) MERGED** (`82d4675`, grid fix `bf78004`). Frozen `SegmentationConfig` + all sub-configs +
+  decorator model registry + `segmentation` marker; `latent_grid` default corrected to `(48,56,48)` with a live
+  drift-guard test vs `LATENT_SPATIAL`. +18 tests. Verified: import resolves, defaults exact, marker registered.
+- **Task 12 (targets/) MERGED** (`d0ec86a`). SDT→sigmoid soft `[WT,NETC]`; per-component euclidean NETC does NOT
+  bridge disjoint lesions (independently re-derived: mid-gap 0.065 < 0.5 vs naive 0.5; interior 0.79); harmonise
+  BraTS2021 `{0,1,2,4}` + BraTS2023 `{0,1,2,3}`; nesting `NETC≤WT`. +33 tests. `scipy`/`scikit-image` already deps.
+- **Task 16 (derivation/) MERGED** (`1e38a10`). Per-class temperature (independently re-derived on realistic
+  miscalibration: `T_WT=1.42`, `T_NETC=0.68`, NLL down, argmax-preserving — the reported `T≈1301` was a pathological
+  50%-error synthetic, correct); `pool_to_latent`→`(2,48,56,48)` reusing the exact `masks/tumor_latent` crop-then-pool
+  (`apply_crop_pad` via `vena.common` + `avg_pool3d(k=4)`), registration exact; K-fold `ensemble_soft`. +28 tests.
+- **Suite green at 1255** (1176→1194→+33→+28); nothing deleted/skipped; ruff clean on all touched files.
+- **Data-flow verified for 19/40:** rows align **by id** (image H5 `ids` ↔ latent H5 `ids`); `crop/origin (N,3)` lives
+  only in the image H5; image H5s LOCAL (MeningD2), latent H5s PICASSO-only. ⇒ cache (19) = Picasso CPU; figures (40)
+  = local (recompute from image H5, deterministic == cache) → `/media/.../results/prior/tumor/gt`.
+- **REMAINING:** task 19 (derive+cache `source:gt`) → task 40 (QC + pinned montage + PCA/UMAP embedding) → real
+  Picasso cache + local figures → **human mask review gate** (surface `report.md`). Then S1 row ticks.
 
 ---
 
