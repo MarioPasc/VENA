@@ -38,10 +38,11 @@ gap. **Phase 3:** deferred ablations (CFG, WT up-weight sweep, SPADE).
 > **"S4 gate = S3 verdict GO" is REMOVED** — it was a strategic risk-gate, not a code dependency; the segmenter is
 > needed for the deployable arm AND for the Q6 OOD-coupling contribution regardless of the oracle verdict, and the
 > `[TC,NETC]` mask semantics are LOCKED so S3 cannot invalidate the segmenter target.
-> **The ONE hard S4 blocker is the BSF checkpoints** (verified 2026-07-23: **absent** from `src/external/LINKS.md`
-> and the repo) — **Arm C (SegResNet-from-scratch) can start immediately; Arms A/B wait on the BrainSegFounder SSL
-> weights.** **GPU note:** S2's 5 oracle jobs + S5's K+1 SwinUNETR jobs run concurrently — size the Picasso
-> allocation for both (the SwinUNETR jobs are smaller: 3-ch image-res, ~K+1≈6 models).
+> **~~The ONE hard S4 blocker is the BSF checkpoints~~ RESOLVED — BSF ckpts are present + pinned** (`src/external/LINKS.md`,
+> local + Picasso). **S4 is DONE (2026-07-23, commits `eab69b8`+`6f281db`):** all three arms green, Arm B UKB loads
+> 125/142 = 0.880, Arm A BraTS 182/198 = 0.919 (after matching `depths=(2,2,6,2)`). **GPU note:** S2's 5 oracle jobs +
+> S5's K+1 SwinUNETR jobs run concurrently — size the Picasso allocation for both (the SwinUNETR jobs are smaller:
+> 3-ch image-res, ~K+1≈6 models).
 
 ## Canonical Picasso paths & immutability (LOAD-BEARING — read before S2 / S5 / S6)
 

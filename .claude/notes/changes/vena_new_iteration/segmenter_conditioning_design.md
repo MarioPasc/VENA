@@ -6,6 +6,15 @@
 > Config-driven (`TargetConfig.tumor_region="tc"`, wt kept for the S7 ablation); Phase-2 segmenter target = TC.
 > See `[[project_channel0_tumor_core_not_wt]]` and `DEVELOPMENT/01_SHARED_CONTRACTS.md`.
 
+> **🔴 ERRATUM (2026-07-23): the served latent grid is `(48,56,48)`, NOT `(60,60,40)`.** Verified against the
+> producer (`data/h5/latent_domain/manifest.py`: `LATENT_SPATIAL=(48,56,48)`, `LATENT_CROP_BOX=(192,224,192)`,
+> avg-pool stride 4), the v3a config (`base_img_size_numel=129024=48×56×48`), and Picasso disk. **The
+> Locked-decisions line, the A.5 recipe, and A.8-§6 below have it BACKWARDS** — they call `(48,56,48)` "stale"
+> and `129024` a "mismatch"; both are FALSE. `129024` is correct and needs NO reconciliation (`(60,60,40)`
+> assumed the *uncropped* `240×240×155` volume and ignored the `(192,224,192)` crop). Every mask/cache is
+> `(2,48,56,48)`. `01_SHARED_CONTRACTS.md` + `SESSIONS.md` were corrected in commit `9eed6c1`; the corrected
+> spots below are annotated inline. See `[[reference_latent_grid_48_56_48]]`.
+
 > **Purpose (this iteration = iter 6).** The decision is locked: **second-stage refinement of the
 > v3a checkpoint by injecting a soft `[WT, NETC]` map via ControlNet**, to add tumour enhancement
 > **without losing v3a's (already-competitive) whole-brain fidelity.** This iteration answers ONE
@@ -53,8 +62,8 @@ SPADE-primary. The *why* is Part C (the iter-5 reviews).
 `…_s1_v3a_concat_only_fft_ef000c9f`, add a **fresh** `[WT,NETC]` ControlNet — **confirmed iter-8;
 supersedes `model_redesign` T-06/T-13's v3b source, which becomes the T-10 warm-start-source ablation**) ·
 fusion = **ControlNet primary / SPADE = T-07 ablation** (FiLM & CA rejected) · mask = soft `[WT,NETC]`
-(WT-only = fallback) · **generator grid = `(60,60,40)`** (resolved iter-8 — the *served* latent grid; every
-`(48,56,48)`/`129024` reference is stale, see A.8-§6) · generator loss = **region-weighted CFM with
+(WT-only = fallback) · **generator grid = `(48,56,48)`** (the *served* latent grid; the iter-8 `(60,60,40)` was a transcription
+error — see the grid erratum above and A.8-§6; `129024=48×56×48` is correct) · generator loss = **region-weighted CFM with
 `{Brain, WT}` weights EQUAL initially (numerically ≡ unweighted L1); WT up-weight = deferred ablation**
 (mechanism coded now, cf. Ibarra MICCAI 2025 — see A.8-§2) · segmenter backbone = **BSF-SwinUNETR**
 (Arm A BraTS-SSL / Arm B UKB-SSL leak-free / Arm C SegResNet baseline, forkable from
@@ -191,7 +200,7 @@ point, the ramp controls the approach.
 ```
 resume_from      : v3a ema_best.ckpt  (run 2026-06-24_16-00-46_s1_v3a_concat_only_fft_ef000c9f; pin Picasso path)
                    run.resume_from: <v3a run_id>  → WARM_START (weights-only; optimiser/EMA/RNG fresh)
-mask input       : GT [WT,NETC] SOFT, latent grid (60,60,40) (oracle → this iter = T-13)
+mask input       : GT [WT,NETC] SOFT, latent grid (48,56,48) (oracle → this iter = T-13)
                    served as batch["m_wt_soft"] (NEW — pre-threshold union) + batch["m_netc"] (already served)
 fusion           : MaisiControlNet, init_from_trunk (copies v3a down+mid into the CN encoder). Conditioning
                    enters the SEPARATE controlnet_cond_embedding hint net ([64] → zero spatial downsampling,
@@ -209,9 +218,10 @@ trunk update     : PRIMARY joint low-LR + trunk-EMA;  ABLATION freeze-trunk (ada
 loss             : region-weighted CFM, regions {Brain = NOT-BG ∩ NOT-WT, WT}, EQUAL weights initially
                    ({brain:1.0, wt:1.0} ≡ unweighted L1 velocity — mechanism coded, WT up-weight is a
                    deferred ablation axis, A.8-§2) (+ optional whole-brain anchor A.4.4; T-09 rim loss later)
-rflow            : use_timestep_transform=true.  ⚠ base_img_size_numel is currently 129024=(48×56×48) but the
-                   served grid is (60,60,40)=144000 — [verify]/reconcile (A.8-§6). Plumb input_img_size_numel
-                   to the EulerSampler or every per-patient val silently fails (feedback_euler_sampler_timestep_transform).
+rflow            : use_timestep_transform=true.  base_img_size_numel=129024=(48×56×48) MATCHES the served grid
+                   (48,56,48) — no reconciliation needed (the (60,60,40)=144000 "mismatch" was the grid error).
+                   Plumb input_img_size_numel to the EulerSampler or every per-patient val silently fails
+                   (feedback_euler_sampler_timestep_transform).
 EMA              : 0.9999 ; EarlyStopping patience 250 ; monitor train/total_epoch
 run family       : picasso_ref_v1_v3a+cn[WT,NETC]_fft.yaml  (loginexa smoke first)
 decision.json    : schema 0.10.0. Set controlnet_enabled=true,
@@ -297,15 +307,15 @@ not resume-safe** and depends on v3a having emitted a `trunk_ema_snapshot.pt` si
 `_maybe_load_trunk_ema_snapshot()`. **The freeze-trunk ablation (adapter-only) sidesteps this entirely** and
 gives the strongest P1/P4 guarantee — run it first to de-risk, then the joint-low-LR primary.
 
-**§6 — Grid `(60,60,40)` (resolves the doc's open `[verify]`).** The DataModule serves latents and masks at
-**`(4|1, 60, 60, 40)`** (= 240/4 × 240/4 × ⌈155/4⌉ full-volume MAISI latent), confirmed from
-`lightning/data.py`. Every mask target, avg-pool output, and `masks/tumor_latent_pred` cache must be
-`(2, 60, 60, 40)` — **not** the `(…,48,56,48)` written in `model_redesign` T-04. Separately, `rflow.base_img_size_numel`
-is pinned to `129024 = 48×56×48 ≠ 144000` — a **timestep-transform reference mismatch** to [verify]; it only
-scales SD3-style timestep weighting, so the effect is mild (ratio 1.12×), but it should be reconciled to the
-true grid or explained. **Also new:** expose **soft-WT** as `batch["m_wt_soft"]` (the pre-threshold union
-`clip(Σ tumor_latent, 0, 1)`) — currently only the 0.5-thresholded binary `m_wt` is served, but the oracle
-`[WT,NETC]` must be **soft**.
+**§6 — Grid `(48,56,48)` [CORRECTED 2026-07-23 — the iter-8 `(60,60,40)` claim in this section was WRONG].** The
+DataModule serves latents and masks at **`(4|1, 48, 56, 48)`** — the MAISI 4× latent of the **`(192,224,192)` crop**
+of ~`(240,240,155)`, NOT the uncropped full volume (the `240/4 × 240/4 × ⌈155/4⌉ = (60,60,40)` reasoning ignored the
+crop). Verified from `data/h5/latent_domain/manifest.py` (`LATENT_SPATIAL=(48,56,48)`, `LATENT_CROP_BOX=(192,224,192)`)
+and Picasso disk. Every mask target, avg-pool output, and `masks/tumor_latent_pred` cache is `(2, 48, 56, 48)` —
+matching `model_redesign` T-04. `rflow.base_img_size_numel = 129024 = 48×56×48` **matches** the grid: there is NO
+mismatch to reconcile (the `≠144000` claim was the error). **Also (still valid):** expose the soft tumour-core union
+as `batch["m_tc_soft"]` (channel 0 of the cached `masks/tumor_latent_soft`; per the TC erratum) — the oracle
+`[TC,NETC]` must be **soft**, not the 0.5-thresholded binary `m_wt`.
 
 **§7 — Oracle → predicted gap & mask-perturbation (Q_C resolved: clean T-13, perturb T-06).** **T-13 uses the
 clean GT `[WT,NETC]`** (no perturbation) so it measures the true injection **ceiling**. The deployable **T-06**
@@ -319,6 +329,19 @@ perturbation. **Report the oracle-vs-predicted PSNR_ET gap as a first-class tabl
 no-regression gate is evaluated on the clean oracle (T-13), and the same gate + the T-14 FP study on the
 predicted mask (T-06).
 
+> **🔴 ITER-9 ADDITION (2026-07-23) — the oracle→predicted gap is a FIRST-CLASS OOD CONTRIBUTION, reported PER
+> RING.** The deployable arm's OOD ceiling is the *segmenter*, which fails under the same shifts §4.4 measures —
+> a coupled segmenter+generator OOD failure that is a **confirmed open problem** (no prior work; arXiv:2508.16650,
+> N=11,089 across 10 cohorts, quantifies OOD segmenter degradation; Ko's condition-robustness is in-distribution
+> only, with **no structured-error regime**). Actions: **(a)** report `PSNR_ET(oracle T-13) − PSNR_ET(predicted
+> T-06)` **stratified by ring** (Ring A vs Ring B), never as one pooled number — see
+> `../../article/03_generalization_ood.md` T3.6; **(b)** measure the segmenter's **Ring-B TC/NETC error
+> distribution** (Ring-B cohorts carry GT) so the *structured* OOD failure modes are characterised — the
+> dilation/erosion+Gaussian perturbation aug above does **not** reproduce them; **(c)** frame the honest
+> **decomposition = localisation (segmenter) + intensity (generator)**: T-13's oracle mask *leaks post-contrast*
+> (GT ET is defined by the real T1c), so it is a legitimate ceiling but NEVER the deployable method — the
+> oracle→predicted gap *is* the price of localising enhancement without contrast.
+
 **§8 — Deferred-ablation levers (coded-but-OFF this iteration).** Two levers are documented for later, gated
 behind flags, not run in the T-13/T-06 headline: **(a) CFG-at-inference** (currently *not implemented* — only
 training-time conditioning dropout exists). Guidance would amplify enhancement but is **FP-risk-double-edged**
@@ -330,6 +353,29 @@ against PSNR_ET **and** §6.5 FP rate; reject if `1.0` already maximises PSNR_ET
 (complementary to the already-on `use_timestep_transform`, SD3 Esser et al. arXiv:2403.03206); a ~3-line
 change to `MaisiControlNet.forward`. Include only if it beats constant `output_scale=1.0`.
 
+## A.9 — Normal-enhancement evaluation (iter-9, Q3 = evaluate-only)
+
+> Gd enhances **normal** structures too — intracranial vessels, dural venous sinuses, choroid plexus,
+> pituitary/infundibulum — but the tumour-core ControlNet conditions **none** of them, and (Q3 decision) **no
+> conditioning channel is reserved**. The generator must reproduce normal enhancement from v3a's learned prior
+> alone; this evaluation checks whether it does. **Evaluation only — the 2-ch `[TC,NETC]` layout is unchanged.**
+
+- **Why (open gap + contribution + safety).** Normal-enhancement fidelity is the field's **named #1 open gap**
+  (Moya-Sáez et al., *Front. Neuroimaging* 2023, DOI:10.3389/fnimg.2023.1055463); the SOTA baseline TA-ViT
+  (Eidex 2025, arXiv:2409.01622) *structurally ignores* non-tumour enhancement; the only work that evaluates it
+  used a **mask-free** model (choroid-plexus SynCE, *Radiology Advances* 2025, DOI:10.1093/radadv/umaf042) —
+  evidence that ROI-only conditioning risks *losing* what whole-image models retain. Reporting it is a clean
+  VENA contribution and a **safety signal** feeding the §6.5 false-enhancement study.
+- **Regions.** Reuse existing machinery — the Frangi vessel prior (`src/vena/prior_maps/`) and the
+  `venous_atlas_build` preflight — for normal-vessel / dural-sinus masks; add choroid-plexus + pituitary ROIs
+  where an atlas/segmenter is available. Evaluate on **healthy-appearing** brain (exclude the tumour
+  neighbourhood) so tumour enhancement doesn't confound.
+- **Metric.** In-ROI fidelity of the *synthetic* T1c vs real T1c inside each normal-enhancing ROI (matched
+  99.95 norm): MAE / PSNR in-ROI + a **normal-enhancement recall** (does the synth reproduce the real
+  enhancement present in that ROI?). **Report per ring** (does normal enhancement degrade OOD?).
+- **If the generator systematically misses normal enhancement**, that is the evidence-based motivation for a
+  deferred vessel/SWAN conditioning channel (future iteration) — the decision waits on this measurement, per Q3.
+
 ---
 
 # PART B — THE SEGMENTER (detailed: model+loss / data / soft-derivation / rest)
@@ -340,11 +386,22 @@ change to `MaisiControlNet.forward`. Include only if it beats constant `output_s
 > the generator resolves the enhancing subset of `WT∖NETC`.
 
 ## B.a — Model + loss (and the soft-Dice correction)
-- **Model (D-a locked): SwinUNETR (feature_size=48) init from BrainSegFounder** (MONAI, Apache-2.0).
-  Arm A = **BraTS-SSL** encoder (multimodal+tumour-aware; drop the T1ce slice, feed `[FLAIR,T1pre,T2]`,
-  `strict=False`) — primary; Arm B = **UKB-SSL** (T1-only, leak-free) — headline if L3 purity demanded;
-  Arm C = **SegResNet-from-scratch** — baseline that quantifies the pretraining gain. Bench alternatives:
-  MedNeXt (stronger CNN), nnU-Net (augmentation reference).
+- **Model (D-a locked; arm priority updated iter-9 2026-07-23): SwinUNETR (feature_size=48) init from
+  BrainSegFounder** (MONAI, Apache-2.0). Checkpoints LOCATED + pinned in `src/external/LINKS.md`.
+  **Arm B = UKB-SSL** (`64-gpu-model_bestValRMSE.pt`; healthy UK Biobank, **no BraTS patients, no T1ce**) — **now the
+  leak-free PRIMARY/HEADLINE** (L3 purity demanded: BraTS-SSL's patient-overlap + T1ce leak is **unfixable by OOF**
+  because it happens at the SSL stage). Likely T1-focused → the 3-ch input stem may not transfer (`strict=False`, stem
+  in `skipped`); deep blocks do. **Arm A = BraTS-SSL** (`model_bestValRMSE-fold*.pt`, multimodal+tumour-aware; drop the
+  T1ce slice, feed `[FLAIR,T1pre,T2]`, `strict=False`) — **now the domain-matched COMPARATOR** (higher tumour match but
+  leaks; run it to quantify the leakage↔Dice trade-off). Arm C = **SegResNet-from-scratch** — the no-pretraining floor.
+  **NEVER the finetuned BraTS ckpt** (supervised = L1+L2+L3 leak). Bench alternatives: MedNeXt, nnU-Net.
+  - **Arch / load-coverage measured (S5, 2026-07-23):** the two SSL ckpts are the **same Swin-UNETR family at
+    different scales** — UKB is the MONAI default `depths=(2,2,2,2)` (loads **125/142 = 0.880**; 1-ch stem + 16 SSL
+    heads skipped), BraTS is the Swin-T `depths=(2,2,6,2)` (6 stage-3 blocks; loads **182/198 = 0.919** once the
+    depth is matched — only the 16 SSL pretext heads `rotation/contrastive/conv.*` drop, **0 encoder keys**). Per-arm
+    `depths`/`num_heads` are pinned as module constants (`_BSF_BRATS_SWIN_KW` / `_BSF_UKB_SWIN_KW`) in
+    `bsf_swinunetr.py`; the initial 0.636 was a construction-config mismatch (we defaulted to `(2,2,2,2)`), **not** a
+    deeper-than-standard architecture. Stem-adaptation options in `bsf_stem_t1ce_removal.md` (drop-slice `[0,1,3]` chosen).
 - **Loss principle — overlap in the loss, softness in the derivation (B.c).** We do **not** optimise hard
   voxel accuracy — **Dice is the eval gate only** (G-SEG). The loss just has to place the region right,
   tolerant of boundary voxels (a Dice-family loss). But **standard soft-Dice pushes the output to
@@ -374,23 +431,45 @@ change to `MaisiControlNet.forward`. Include only if it beats constant `output_s
   Ring B. **G-SEG:** WT ≥0.80, NETC ≥0.50 per cohort incl. Ring B; healthy → ~empty.
 
 ## B.c — Soft-probability derivation (verified 4-step recipe; the "free" mass distribution)
-The soft `[WT,NETC]` map is **derived**, not read off the overconfident sigmoid. Four steps, each
-independently beneficial, **all cheap/free**, and they **compound**:
+The soft `[WT,NETC]` map is **derived**, not read off the overconfident sigmoid.
+
+> **🔴 ITER-9 DECISION (2026-07-23) — σ-only; temperature DROPPED.** An audit reframed the "4 compounding
+> softeners": avg-pool (the **mandatory** image→latent bridge — kernel fixed by the 4× compression), DML+CE
+> (the soft-target **loss**, not a softener), and the K-fold mean (**mandatory** for leak-free OOF masks) are
+> infrastructure with **no tunable knob**. **SDT-σ is the ONE discretionary knob**, and it is load-bearing
+> because it makes the oracle and predicted maps *match* (a segmenter trained toward SDT-σ targets emits
+> SDT-σ-shaped softness ≈ the oracle's SDT-σ→pool). **Temperature (old step 3) is DROPPED from the pipeline** —
+> soft-target+DML+CE already curbs overconfidence (label-smoothing→calibration, Müller et al. NeurIPS 2019,
+> arXiv:1906.02629); post-hoc TS only adds a *segmentation*-ECE gain (Buddenkotte), and whether that helps
+> *conditioning* (PSNR_ET) is the unproven Q3 open problem — not a knob to carry in the headline. **Calibration
+> is MEASURED (report ECE/Brier per G-SEG), NOT corrected.** The pipeline is now **SDT-σ → DML+CE → K-fold OOF
+> mean → avg-pool** (one knob). `temperature.py` stays as an unused utility (coding-agent hygiene: delete when
+> no live caller remains). See `SESSIONS.md` planning-decision Q5.
+
+The surviving mechanisms (each cheap/free) and they **compound**:
 1. **(target) SDT → sigmoid soft targets.** From each hard label compute the normalised **signed distance
    transform**, map `y_soft = sigmoid(SDT/σ)` (σ≈3 vox): 0.5 at the boundary, ~0.95 at 3σ inside, ~0.05 at
    3σ outside (Ma MIDL 2020; Kervadec boundary loss arXiv:1812.07032; **SVLS** = the Gaussian special case,
    Islam & Glocker IPMI 2021). Distributes mass by distance-to-boundary *by construction*.
 2. **(loss) DML + CE on the soft targets** (B.a) — proper soft-label Dice (Wang 2023), **not** standard soft-Dice.
-3. **(post-hoc) temperature scaling** — one scalar T fit on val by NLL (typ. 1.5–3.0); free, argmax-preserving,
-   moves overconfident mass toward the simplex interior (Guo ICML 2017).
+3. ~~**(post-hoc) temperature scaling**~~ — **DROPPED (iter-9, see banner above).** Calibration is *measured*
+   (ECE/Brier), not corrected; no `T_TC`/`T_NETC` in the pipeline. (Guo ICML 2017 retained as the reference for
+   the *measured* ECE only.)
 4. **(pool) average-pool to the latent grid** — `AvgPool3d(stride=4)` = **partial-volume integration**: a
    boundary latent voxel gets 0.25–0.75 by enclosed-lesion fraction. **Free, differentiable — the single most
    important "free" spatial-mass mechanism** ("no additional mechanism required").
 - **Plus the free K-fold ensemble mean** (B.b) — further calibrates/smooths at no extra training cost.
-- **Minimal free-only path** (if simplicity wins): hard-target soft-Dice+CE → **ensemble mean → temp →
-  avg-pool**. Add Steps 1–2 (SDT+DML) only if the map is still too binary.
-- **Tuning caveat:** Step-1 σ and Step-4 avg-pool both soften — tune σ so the *post-pool* latent map is
-  graded, not mush (over-softening loses localisation).
+- **Minimal free-only path** (superseded by the iter-9 σ-only decision): there is now one headline path —
+  SDT-σ + DML+CE + K-fold mean + avg-pool, **no temperature**.
+- **Tuning caveat (now the ONLY knob):** σ is the single free parameter. Tune it *once* by a post-pool grading
+  criterion — e.g. the boundary-transition width in latent voxels, or the fraction of soft-mass inside hard-TC
+  landing in a target band — and **share the same σ between the oracle target and the segmenter target** so the
+  two maps match by construction. avg-pool has no knob (kernel fixed by the 4× compression); over-softening is
+  controlled by σ alone.
+- **ET = TC−NETC is a reported diagnostic, not a gate (iter-9).** Report ET-Dice + mean soft-value in the ET
+  shell alongside TC/NETC so NETC miscalibration that corrupts the *enhancing* region is visible — ET is the
+  load-bearing derived quantity the generator must enhance. (Gating stays on TC/NETC per G-SEG; ET is
+  reported-for-visibility.)
 - **Why soft > hard for the conditioner:** a continuous spatial prior carries strictly more information than
   a binary mask; a continuous tumour-density map conditions a latent-diffusion synthesiser *more precisely*
   than a binary ROI (biophysically-conditioned synthesis, **MICCAI 2025**, arXiv:2510.09365); SPADE-style
@@ -412,8 +491,8 @@ independently beneficial, **all cheap/free**, and they **compound**:
 - **Feasibility (de-risked):** WT Dice ~0.90 without T1c (Ruffle 2023); no-T1c TC drop is **ET-driven, not
   NETC** (necrosis is T1pre-dark) → NETC≥0.50 realistic; non-contrast enhancement predictable at 91.5 % sens
   (arXiv:2508.16650).
-- **Output → T-04 cache** `masks/tumor_latent_pred (2,·,·,·)`; **`[verify]`** latent shape (48,56,48) vs
-  (60,60,40) — match the generator grid.
+- **Output → T-04 cache** `masks/tumor_latent_pred (2,48,56,48)` — matches the generator grid (resolved: the
+  served grid is (48,56,48), not (60,60,40); see the grid erratum at the top).
 
 ## B.e — Verified references (parts c/d)
 Soft-from-hard: Xue AAAI 2020 (SDM) · Ma MIDL 2020 · Kervadec boundary loss (1812.07032) · **SVLS**
@@ -448,7 +527,11 @@ baseline and should be **forked from the existing 4-input `src/vena/validation/d
 T1c input → 3-input `{T1pre,T2,FLAIR}`). This **supersedes `model_redesign` §16.6**, which named SegResNet as
 *primary* — that predated the iter-3 BrainSegFounder probe.
 
-**§2 — Calibration: per-class temperature, and don't skip it after ensembling.** Fit **two independent
+**§2 — Calibration.** **🔴 SUPERSEDED by the iter-9 σ-only decision (2026-07-23): temperature is DROPPED —
+calibration is MEASURED (ECE/Brier), NOT corrected.** The reasoning below (per-class TS, TS-after-ensemble) is
+retained for provenance and for the *measurement* references, but no `T_TC`/`T_NETC` are fitted in the
+pipeline; whether post-hoc calibration would improve *conditioning* (not just segmentation-ECE) is the Q3 open
+problem, deliberately left unbet in the headline. Original reasoning: Fit **two independent
 temperatures `T_WT`, `T_NETC`** on the OOF calibration split, not one global scalar — a global T is strictly
 suboptimal for multi-region outputs (Kull et al., *Dirichlet calibration*, NeurIPS 2019; global TS is its
 equal-off-diagonal special case). Crucially, **ensemble averaging does NOT make temperature scaling
@@ -525,7 +608,7 @@ Two verified literature sweeps + the frozen v3a/v3b metrics settled it:
 |---|---|---|---|
 | L1 | BSF SSL saw masks/labels | **No** — unsupervised | premise false |
 | L2 | segmenter trained on VENA-eval patients | **Yes** (the real one) | **out-of-fold** prediction (A.7) — not a corpus change |
-| L3 | BSF-BraTS encoder saw BraTS images incl. T1ce (unsupervised) | mild | UKB-SSL init (leak-free) OR disclose + non-BraTS test headline |
+| L3 | BSF-BraTS encoder saw BraTS-GLI (a VENA CV cohort) images incl. T1ce (unsupervised) — **not "mild": OOF cannot fix an SSL-stage representation leak** | real | **RESOLVED iter-9: UKB-SSL is the headline** (healthy UKB, no BraTS patients, no T1ce → leak-free); BraTS-SSL kept only as a leaky comparator that quantifies the trade-off |
 
 VENA's training corpus is **untouched**; the segmenter is an add-on that emits masks. The 3-arm backbone
 (B) measures the L3 trade-off empirically.
@@ -565,7 +648,8 @@ VENA's training corpus is **untouched**; the segmenter is an add-on that emits m
   hint net (added, not concatenated)**; **mask-only normalisation** is clean, mask+context needs per-channel
   norm; **2-ch `[WT,NETC]` = TWO specs** (assembler under-counts a single 2-ch key); `output_scale` correct;
   **trunk-EMA warm-start is single-shot/not-resume-safe** (freeze-trunk sidesteps). **Grid resolved to
-  `(60,60,40)`** (served) — every `(48,56,48)`/`129024` reference is stale; expose **soft-WT** `m_wt_soft`.
+  `(60,60,40)`** [❌ CORRECTED iter-9 — BACKWARDS; served grid is `(48,56,48)`, `129024=48×56×48` is correct,
+  see grid erratum] (served) — every `(48,56,48)`/`129024` reference is stale; expose **soft-WT** `m_wt_soft`.
   **Q_A → warm-start v3a + fresh ControlNet** (v3b → T-10 ablation; supersedes redesign T-06/T-13 source).
   **Q_B → region-weighted CFM coded but run at EQUAL `{brain,wt}` weights first** (≡ L1; WT up-weight =
   deferred ablation, Ibarra 2508.13776). **Q_C → clean-oracle T-13 ceiling; mask-perturbation aug only on
@@ -578,3 +662,31 @@ VENA's training corpus is **untouched**; the segmenter is an add-on that emits m
   = ablation-only; optional TTA on Málaga, no MC-dropout; **dual DSC+Brier selection**. SegResNet demoted to
   Arm-C baseline (fork `downstream_seg`) — supersedes redesign §16.6. Implementation task-graph:
   `.claude/notes/changes/vena_new_iteration/DEVELOPMENT/`.
+- 2026-07-23 (iter 9) — **scientist audit + 3 locked decisions + grid-doc fix.** Audited the injection mechanism
+  (ENDORSED: ControlNet + zero-init + ramp is right; FiLM/CA rejections correct; DML+CE / oracle-split /
+  channel-0=TC are sound; code review of `src/vena/segmentation/` = all invariants satisfied) and surfaced three
+  blind spots, each a *confirmed open problem* (verified lit sweep). **(Q1) Soft-map = σ-only, temperature
+  DROPPED** — most "softeners" are mandatory infrastructure (avg-pool / DML+CE / K-fold-mean); σ is the one knob
+  (and makes oracle≈predicted match); calibration is MEASURED not corrected; ET=TC−NETC is a reported diagnostic
+  (B.c banner; B.f-§2 superseded; `SESSIONS.md` Q5). **(Q2) Coupled segmenter+generator OOD failure = first-class
+  contribution** — oracle→predicted gap reported PER RING + Ring-B segmenter-error distribution + honest
+  localisation/intensity decomposition (A.8-§7 addition; `03_generalization_ood.md` T3.6; `SESSIONS.md` Q6).
+  **(Q3) Normal-enhancement = evaluate-only** — new **A.9**: evaluate vessel/sinus/choroid/pituitary enhancement
+  fidelity of the synth T1c (reuse Frangi / `venous_atlas_build`), **NO reserved channel** (Moya-Sáez 2023 open
+  gap; TA-ViT ignores it; mask-free SynCE evidence; `SESSIONS.md` Q7). **Grid corrected:** this doc's
+  `(60,60,40)` / `129024`-"mismatch" claims were BACKWARDS — served grid is `(48,56,48)`, `129024=48×56×48` is
+  correct (grid erratum + fixes to Locked-decisions, A.5, A.8-§6, B.d). **Coding-agent notes:** `pool.py:141`
+  bare-`assert` (rule-15) → raise `SegDerivationError`; `config.py:228` `avg_pool_stride` docstring still carries
+  the grid bug (says 240→60…155→~40; should be 192→48, 224→56, 192→48 after crop); WT→TC docstring drift across
+  `derivation/` (rule-17); the injection-sanity panel (task 40) must measure **image-space** residual locality
+  *after decode* (latent-locality ≠ image-locality — VAE decoder spread + stochastic encoder weaken P2); verify
+  the segmenter K-fold OOF respects the FM **cross-cohort dedup** (else a held-out FM-test patient leaks via its
+  duplicate in a segmenter training cohort).
+- 2026-07-23 (S4 built + pushed) — `vena.segmentation` library shipped (models/loss/data/metrics; 1313→1453 fast
+  tests; commits `eab69b8` + `6f281db`). **BSF-SwinUNETR architecture measured + resolved:** the two SSL ckpts are
+  the same Swin-UNETR family at different scales — **UKB = `depths=(2,2,2,2)`** (MONAI default; 125/142 = 0.880),
+  **BraTS = `depths=(2,2,6,2)`** (Swin-T, 6 stage-3 blocks; **182/198 = 0.919** once matched — only the 16 SSL
+  pretext heads drop). Initial 0.636 was a config mismatch, not a deeper-than-standard arch; per-arm `depths`/
+  `num_heads` pinned as constants in `bsf_swinunetr.py` (no `ModelConfig` field). T1ce-stem-removal strategies
+  documented (`bsf_stem_t1ce_removal.md`; **drop-slice `[0,1,3]` chosen**). Cross-cohort dedup leakage guard
+  implemented (direct + transitive). See [[project_s4_segmenter_library]] + `SESSIONS.md` §S4/§S5.
