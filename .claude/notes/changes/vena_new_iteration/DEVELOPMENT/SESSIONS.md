@@ -29,6 +29,20 @@ the injection mechanism is good enough. **Phase 2 (deployable):** build + train 
 masks (a one-line `mask_source` swap from the oracle), train the deployable T-06 arm, report the oracle→predicted
 gap. **Phase 3:** deferred ablations (CFG, WT up-weight sweep, SPADE).
 
+> **🔧 ITER-9 PARALLELISATION (2026-07-23).** The SEG track (segmenter: **S4** build → **S5** train) is
+> **code-independent** of the INJECT/oracle track (S1→S2→S3) — `00_INDEX.md` states the two tracks "share nothing
+> at code level and can run fully in parallel," and the code confirms it (S4 tasks 11/13/14/15 depend only on task
+> 10, **merged**). **S4/S5 may therefore launch NOW, concurrent with the oracle** (S1 cache + S2 oracle matrix), so
+> Picasso trains the oracle *and* the K+1 segmenter models at the same time. The two tracks only **meet at S6**
+> (predicted-mask cache + deployable T-06), which needs BOTH S3 (recipe) and S5 (trained segmenter). The old
+> **"S4 gate = S3 verdict GO" is REMOVED** — it was a strategic risk-gate, not a code dependency; the segmenter is
+> needed for the deployable arm AND for the Q6 OOD-coupling contribution regardless of the oracle verdict, and the
+> `[TC,NETC]` mask semantics are LOCKED so S3 cannot invalidate the segmenter target.
+> **The ONE hard S4 blocker is the BSF checkpoints** (verified 2026-07-23: **absent** from `src/external/LINKS.md`
+> and the repo) — **Arm C (SegResNet-from-scratch) can start immediately; Arms A/B wait on the BrainSegFounder SSL
+> weights.** **GPU note:** S2's 5 oracle jobs + S5's K+1 SwinUNETR jobs run concurrently — size the Picasso
+> allocation for both (the SwinUNETR jobs are smaller: 3-ch image-res, ~K+1≈6 models).
+
 ## Canonical Picasso paths & immutability (LOAD-BEARING — read before S2 / S5 / S6)
 
 **v3a warm-start source — READ-ONLY, NEVER ALTER:**
@@ -58,8 +72,8 @@ gap. **Phase 3:** deferred ablations (CFG, WT up-weight sweep, SPADE).
 | ☐ | **S1 — Oracle soft-mask + validation** | SDT-soft GT `[WT,NETC]` cached in every latent H5, visually + latent-embedding validated | `[O]` preflight → **10** → { **12** ∥ **16** } → **19**(source:gt) → **40**(mask QC + latent embedding) → `(gate)` human mask review | latent H5s writable; scaffold decision |
 | ☐ | **S2 — Injection + launch oracle** | v3a + fresh 2-ch ControlNet wired; **5 oracle runs** launched + monitored | { **20** ∥ **21** } → **40**(injection sanity) → `[O]` loginexa smoke → `[O]` launch the 5-job matrix + Monitor | S1 masks cached+validated; v3a ckpt (+`trunk_ema_snapshot.pt` for J1–J4) on Picasso |
 | ☐ | **S3 — Oracle verdict** | Injection-sufficiency verdict + region-weight/trunk pick + go/no-go for the segmenter | `[O]` harvest → `[O]` analysis (PSNR_ET / no-regression / FP-safety) → `[O]` verdict | S2 jobs terminal |
-| ☐ | **S4 — Segmenter library** | BSF-SwinUNETR + SegResNet, loss, data/K-fold, metrics — built + unit-green | { **11** ∥ **13** ∥ **14** ∥ **15** } | S1 (task 10 merged); S3 = GO; BSF ckpts located |
-| ☐ | **S5 — Segmenter training + ensemble** | K+1 models trained; G-SEG report; per-class temperatures | **17** → **18** → `[O]` K+1 Picasso array + Monitor | S4 merged green |
+| ☑ | **S4 — Segmenter library** *(runs parallel to S1–S3, iter-9)* | BSF-SwinUNETR + SegResNet, loss, data/K-fold, metrics — built + unit-green | { **11** ∥ **13** ∥ **14** ∥ **15** } | S1 task 10 merged ✓; **BSF SSL located+pinned (UKB-SSL=headline)**; ~~S3=GO~~ removed → **FULLY UNBLOCKED** |
+| ☐ | **S5 — Segmenter training + ensemble** *(may overlap S2 oracle on Picasso)* | K+1 models trained; G-SEG report; **calibration MEASURED (Q5: no temperature)** | **17** → **18** → `[O]` K+1 Picasso array + Monitor | S4 merged green |
 | ☐ | **S6 — Predicted mask + deployable T-06** | `masks/tumor_latent_pred` cached; T-06 arm trained; oracle→predicted gap reported | { **19**(source:predicted) ∥ **22** } → `[O]` cache → `[O]` T-06 launch (reuse 20, `mask_source:predicted`) + Monitor | S5 G-SEG passed |
 | ☐ | **S7 — Deferred levers & ablations** | CFG / WT-weight sweep / SPADE-T07 — optional, post-validation | { **30** ∥ WT-weight sweep ∥ SPADE-T07 } (any/none) | explicit human opt-in |
 
@@ -196,6 +210,65 @@ on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note bel
     all-TC cache = job 1630706** (worker `tumor_region: tc`). Monitor armed. Corrected figures re-rendering → GT dir.
 - **⚠ S2 note (deferred):** aug latent H5s `*_latents_aug.h5` are NOT in the registry list; if S2 trains with offline
   aug, the soft mask must be present+consistently-transformed there too (task-20/DataModule concern).
+- **🔴 CACHE 1630706 PARTIALLY TIMED OUT — 7/9 done, 2 re-submitted (2026-07-23, Opus-4.8 resume).** Job 1630706
+  (the fresh all-TC cache) went terminal as **7 COMPLETED + 2 TIMEOUT**. Array-index→cohort map (from
+  `array_mask_derive_gt.sh` `COHORTS[]`): 0=UCSF-PDGM✅ **1=BraTS-GLI⏰ 2=UPENN-GBM⏰** 3=IvyGAP✅ 4=BraTS-Africa-Glioma✅
+  5=BraTS-Africa-Other✅ 6=LUMIERE✅ 7=REMBRANDT✅ 8=BraTS-PED✅. **Root cause = self-set `#SBATCH --time=08:00:00`**,
+  not a partition cap (`cpu_partition MaxTime=7-00:00:00`). The two largest latent H5s exceed 8h serial at the TC
+  per-component-SDT cost; both were CANCELLED "DUE TO TIME LIMIT" with **no Python error**.
+- **H5 state verified on disk** (metadata scan, `scratchpad/scan_soft_meta.py`): **7/9 SOFT-OK** — schema **2.1.0**,
+  `mask_source=gt`, `masks/tumor_latent_soft (N,2,48,56,48)`, `tumor_region=tc`, oracle `masks/tumor_latent (N,3,…)`
+  intact. **2/9 (BraTS-GLI, UPENN-GBM) byte-untouched** — schema still 2.0.0, no soft group, oracle intact. Confirms
+  the engine's write-all-in-memory-at-end design (`derive_engine.py::_process_cohort` line ~334): a timeout leaves the
+  H5 clean, **never a partial/corrupt write**.
+- **🔴 ROW-COUNT CORRECTION (load-bearing for sizing/re-runs).** Latent H5 `N` = **all cached scans**, NOT the deduped
+  CV counts in `01_SHARED_CONTRACTS.md §Cohorts`. Measured `N`: UCSF-PDGM **495**, BraTS-GLI **1251**, UPENN-GBM **611**,
+  IvyGAP **34**, BraTS-Africa-Glioma **95**, BraTS-Africa-Other **51**, LUMIERE **599**, REMBRANDT **63**, BraTS-PED **260**.
+  Per-scan TC-derive cost varies wildly by cohort (~16 s BraTS-PED → ~47 s UPENN-GBM, driven by native volume size +
+  #connected-components in the per-component euclidean SDT). BraTS-GLI (1251) ≈10-11 h, UPENN-GBM (611) ≈9-10 h serial.
+- **RE-SUBMIT = job `1631539`** (`sbatch --array=1,2 --time=24:00:00 array_mask_derive_gt.sh`), Picasso repo HEAD
+  confirmed at **`1b9f946`** (the correct all-TC commit that produced the 7 good cohorts), same idempotent engine +
+  same `gt_{1,2}.yaml` (`tumor_region: tc`). RUNNING (both tasks) as of 2026-07-23T10:30Z. **Monitor armed** (task
+  `b2lo3ahje`, all terminal states, ssh-per-poll so a dropped conn doesn't kill it). On completion the 2 H5s will
+  match the other 7 (schema→2.1.0, region=tc). Then all-9 validated ⇒ S1 exit-criterion-1 met.
+- **Figure render re-verified by eye** (I viewed montage + qc_0367; post `1b9f946`+`33f4751`): genuinely **soft TC**
+  (contour rings, graded), localised on focal lesions, NETC nested inside TC, masks only on tumour-bearing slices —
+  the binary-WT figure bug stays fixed. Two complete UCSF QC sets in the GT archive: default-bg
+  `…/gt/2026-07-22T21-53-06Z/` (12 pat; **1 invariant flag = UCSF-PDGM-0367**) + flair-bg `…/gt/t2f/2026-07-22T22-11-15Z/`
+  (12 pat; 0 flags). **0367 is BENIGN**: a multifocal small TC (main focus + 2 satellites); the 4×-avg-pool coarsens
+  the satellites → latent↔image IoU 0.332 / centroid 4.79 vox. Pooling-fidelity limit on tiny multifocal cores, **not**
+  a derivation/registration bug — the latent mask still marks the correct lesion. The other 4 "low IoU" rows are
+  `has_tc_region:false` (100%-edema tumours, TC=0 → IoU=0 by construction). **`t1c/` + `t1pre/` anatomy-variant dirs
+  under `…/gt/` are EMPTY** (the previous agent's runs were interrupted mid-render; the `anatomy_sequence` config from
+  commit `33f4751` works — only flair completed).
+- **⚠ S6 FINDING (parallelism, carry forward).** `MaskDeriveEngine._process_cohort` is a **serial per-scan loop** with
+  no multiprocessing; `_derive_one` is independent per scan (embarrassingly parallel). The **S6 predicted-mask re-cache**
+  (task 19 `source:predicted`) runs this SAME engine on all 9 cohorts and **will hit the identical 8h wall** on
+  BraTS-GLI+UPENN-GBM. Fix for S6: either (a) set `--time ≥ 24h` for the big cohorts (zero-code, what we did here), or
+  (b) add a `multiprocessing.Pool(cpus_per_task)` over the scan loop + bump `--cpus-per-task` (≈N×faster, de-risks the
+  wall permanently). Recommend (b) for S6 (predicted derive is even costlier: adds segmenter inference per scan).
+- **Human mask-review gate STILL OPEN** — user closes `masks_look_valid` in the QC `decision.json` after eyeballing the
+  two UCSF sets above (24 patients spanning small→large→multifocal→100%-edema). Gates the S2 GPU launch.
+- **✅ USER DECISION — KEEP the 0.034 soft-floor** (2026-07-23). The uniform far-field floor `sigmoid(-clip/σ)` (σ=3,
+  clip=10 → 0.034) is **retained by design**: it is representative of a best-case segmenter output (high probability
+  density inside the tumour, low-but-nonzero outside). No derivation change, **no re-cache** — job 1631539 stands.
+  (Mechanistically also harmless to the oracle: a constant DC field the ControlNet's zero-init conv+bias absorbs.)
+- **⚠ VERIFY-SCRIPT FALSE POSITIVE — BraTS-Africa-Other IS correct TC, not stale WT** (2026-07-23). The scratchpad
+  `verify_tc_cache.py` (Picasso) flagged BraTS-Africa-Other as "WT (STALE 1629508)" — a **verdict tie-break artifact**:
+  it picks the first patient with TC>500 vox and tie-breaks `iou_tc > iou_wt` → else "WT". Its sampled patient
+  `BraTS-SSA-00009-000` is **edema-free** (TC==WT) → both IoU=1.000 → tie → spurious "WT". **Refuted** by a targeted
+  re-check (`scratchpad/verify_bao_edema.py`) on two EDEMA-bearing patients (TC≠WT): `BraTS-SSA-00018-000` MAE(cache,TC)
+  =0.00000 vs MAE(cache,WT)=0.00072; `BraTS-SSA-00040-000` (edema 216k vox) MAE(cache,TC)=0.00000 vs MAE(cache,WT)=0.027.
+  Cache is **bit-exact TC**, `region_attr=tc`. **All 7 completed cohorts are clean TC, zero stale contamination.**
+  *Trap for S6:* when re-running `verify_tc_cache.py` after the predicted cache, use **MAE-to-fresh-derive** as the
+  TC/WT criterion, not the IoU tie-break (it misfires on every edema-free patient).
+- **t1c QC background DONE + eye-verified** (2026-07-23, per user) — `validate_masks anatomy_sequence=t1c` on the **same
+  12 patients** as the flair/t2f set (local UCSF image H5, git `33f4751`) → `…/gt/t1c/2026-07-23T08-41-50Z/` (14 figures,
+  **0/12 invariant violations, reg_iou_low=0, netc_viol=0**). I viewed the montage: on the T1c post-contrast background
+  the **green TC contour sits exactly on the bright enhancing core**, magenta NETC (necrotic, dark on T1c) nested inside,
+  **edema excluded** — the strongest visual confirmation of the channel-0=TC semantics and the mask-on-enhancement check.
+  Three QC backgrounds now available for the human gate: default (`2026-07-22T21-53-06Z`), flair (`t2f/2026-07-22T22-11-15Z`),
+  t1c (`t1c/2026-07-23T08-41-50Z`). (t1pre left unrendered — not requested.)
 
 ---
 
@@ -275,15 +348,55 @@ updated with the verdict.
    FM-train + dataset + augmentation) ∥ **15** (`metrics/` — Dice/AHD + ECE/Brier + G-SEG + dual selection).
 2. Each owns one subfolder → merges are near-conflict-free; run serially anyway, re-verify the suite each merge.
 
-**Gates.** Task 10 (scaffold) merged (S1); S3 verdict = GO; **BSF SSL checkpoints located** (task 11 reports BLOCKED
-with the path it looked for if absent — resolve before/at this session).
+**Gates.** Task 10 (scaffold) merged (S1 ✓). **~~S3 verdict = GO~~ REMOVED (iter-9)** — S4/S5 are code-independent
+of the oracle and run in parallel (see "The arc" parallelisation note; `00_INDEX.md` confirms the tracks share
+nothing at code level). **BSF SSL checkpoints RESOLVED (2026-07-23) — located + pinned in `src/external/LINKS.md`**
+(local + Picasso). **Arm priority: UKB-SSL = leak-free HEADLINE/PRIMARY** (`…_SSL_UKBiobank/64-gpu-model_bestValRMSE.pt`;
+no BraTS patients, no T1ce — the patient-overlap + T1ce leak in BraTS-SSL is **unfixable by OOF** because it is an
+SSL-stage leak), **BraTS-SSL = domain-matched comparator** (`…_SSL_BraTS/model_bestValRMSE-fold{0..4}.pt`),
+**SegResNet-scratch = floor**, **finetuned = NEVER use** (L1+L2+L3). **S4 is now FULLY UNBLOCKED. Launch order:**
+Arm-C (`segresnet`, no ckpt, fork `downstream_seg.py`) + 13/14/15 first (fastest to green), then Arm-B UKB-SSL
+(headline) + Arm-A BraTS-SSL (comparator).
 
 **Exit criteria.** All three arms forward `(B,3,·)→(B,2,·)`; BSF load-coverage reported; DML==soft-Dice-on-hard test
 green; K-fold plan deterministic + leakage-free; metrics + G-SEG gate + dual selection tested; suite green, new
 `segmentation` tests counted.
 
 **Orchestrator notes (append-only).**
-- _(empty)_
+- **S4 CLOSED 2026-07-23.** All four lanes merged to `main` working tree, ruff-clean on touched files. Fast suite
+  **1313 → 1453 passed** (+140: models 21, loss 26, data 55, metrics 38), 1 skipped, 21 deselected (17 = models
+  `slow` real-BSF-load tests). Every load-bearing number was **re-derived by the orchestrator from the on-disk
+  artifact**, not transcribed. **The merged code is UNCOMMITTED in `main`'s working tree** (4 re-wired `__init__.py`
+  + 13 new lane files + 4 new `tests/segmentation/*` dirs) — commit before any S5 run.
+- **⚠ Worktree stale-base incident (recovery, load-bearing lesson).** `isolation:"worktree"` cut lanes **11/14/15**
+  from a **stale base `c424a1f`** (pre-`vena.segmentation` scaffold); lane **13** was correctly at `main` `33f4751`.
+  The 3 stale workers silently **re-created** `config.py`/`exceptions.py`/`registry.py` instead of reusing them —
+  caught by `git diff --stat main` showing 9218 deletions, NOT by any worker report. Fix: `git reset --hard main`
+  per stale worktree (canonical scaffold restored, re-created dupes dropped, untracked lane files preserved), then
+  resumed the workers via SendMessage to re-wire `__init__` + re-verify against canonical interfaces. **Rule for
+  future orchestration: after spawning a worktree agent, assert `git -C $WT merge-base --is-ancestor <main-sha> HEAD`
+  BEFORE trusting its output.**
+- **PREMISE REFUTED — Arm A load-coverage ≥0.80 is architecturally impossible.** The BraTS-SSL ckpt
+  (`BrainSegFounder_SSL_BraTS/model_bestValRMSE-fold0.pt`, sha256 `e46d80ce75f3…`) is a **deeper non-standard
+  SwinUNETR** (56 extra `layers3` encoder blocks + 16 SSL task-head keys absent from MONAI `SwinUNETR(fs=48)`). Real
+  Arm A coverage = **126/198 = 0.636** (all 126 transferable keys load, no shape error, after `[FLAIR,T1pre,T2]=[0,1,3]`
+  stem slice). Arm B UKB (`64-gpu-model_bestValRMSE.pt`, sha256 `4be92492ae4f…`), the **leak-free HEADLINE**, =
+  **125/142 = 0.880** ≥0.80 with the 1-ch stem correctly in `skipped`. Test pins the actual 126/125, not the wrong
+  expectation. **S5 must treat Arm A as a comparator at 0.636 — do NOT gate on ≥0.80.** (BSF ckpts ARE present
+  locally, contra the stale "absent" line in *The arc*.)
+- **What S5 must know (build/train the K+1 ensemble):**
+  - `load_bsf_encoder(model.backbone, ckpt, brats_channel_slice=[0,1,3] for BraTS | None for UKB)` — **MUST pass
+    `.backbone`** (inner MONAI SwinUNETR, keys `swinViT.*`), NOT the `_VenaSwinUNETR` wrapper (keys `_backbone.*`) or
+    0 keys match. The builders already do this when `cfg.checkpoint` is set.
+  - SwinUNETR forward needs spatial dims **divisible by 32** (use 32³/64³); SegResNet Arm C takes any 8-divisible size.
+    Deep-sup return = `(logits, aux_H2, aux_H4)` (SwinUNETR via forward-hooks on `decoder2`/`decoder3`).
+  - **MONAI 1.5.2 has NO `RandGammad`** — lane 14 substituted a 2nd `RandAdjustContrastd` pass (γ∈[0.5,2.0]).
+  - `build_fold_plan(cfg, fm_splits, *, dedup_duplicates=None)` — transitive cross-cohort dedup exclusion is via the
+    **optional kwarg**; S5 must plumb the real dedup map from the corpus dedup source (synthetic-only in unit tests).
+  - Metrics are **MEASURED not corrected** (Q5 temperature dropped). Healthy-control gate threshold is a module
+    constant `_HEALTHY_TC_VOLUME_THRESHOLD=0.01` in `gate.py`, NOT a `MetricsConfig` field (config has only
+    `gseg_tc_dice`/`gseg_netc_dice`/`selection_metric`, `extra="forbid"`). `gseg_tc_dice=0.75` is **PROVISIONAL** —
+    re-derive from measured per-cohort TC Dice in S5.
 
 ---
 
@@ -294,14 +407,35 @@ green; K-fold plan deterministic + leakage-free; metrics + G-SEG gate + dual sel
    `decision.json` + `vena-segmentation-train`).
 2. `[O]` **Train the K+1 models** as a Picasso array (K fold-models + the all-FM-train model); Monitor.
 3. `[O]` **G-SEG evaluation** per cohort incl. Ring B (**TC Dice ≥ 0.75 provisional** — re-derive from measured TC
-   Dice; TC is harder than WT — NETC Dice ≥ 0.50; healthy → ~empty **TC** volume); fit per-class `T_TC`, `T_NETC`;
-   report DSC **and** Brier/classwise-ECE (dual selection). **Target/gate is TC (=NETC+ET, edema excluded), not WT.**
+   Dice; TC is harder than WT — NETC Dice ≥ 0.50; healthy → ~empty **TC** volume); **(iter-9 Q5: temperature
+   DROPPED — no `T_TC`/`T_NETC` fit)** report DSC **and** Brier/classwise-ECE (calibration MEASURED, not corrected)
+   + **ET=TC−NETC Dice as a reported diagnostic**. **Target/gate is TC (=NETC+ET, edema excluded), not WT.**
 
-**Gates.** S4 merged green; GPU budget on Picasso (K+1 SwinUNETR trainings).
+**Gates.** S4 merged green; GPU budget on Picasso (K+1 SwinUNETR trainings) — **may run concurrently with the S2
+oracle matrix** (both tracks on Picasso at once, iter-9 parallelisation); the SwinUNETR jobs are smaller (3-ch
+image-res) than the FM oracle jobs, so size the joint allocation accordingly.
 
-**Exit criteria.** K+1 checkpoints + `temperatures.json` + `fold_plan.json`; the G-SEG table passes (or the
+**Exit criteria.** K+1 checkpoints + `fold_plan.json` (no `temperatures.json` — iter-9 Q5 dropped temperature); the G-SEG table passes (or the
 documented fallback to a single coarse TC channel is invoked and recorded); no in-fold self-prediction (OOF routing
 asserted).
+
+**🎫 TICKET (S5, PARALLEL — opened 2026-07-23 from S4) — BraTS-SSL SwinUNETR config mismatch.**
+S4 measured, loading the BSF SSL encoders into a **standard** MONAI `SwinUNETR(feature_size=48)` via
+`load_bsf_encoder(model.backbone, ckpt, brats_channel_slice=[0,1,3]|None)`: **Arm B UKB = 125/142 = 0.880** (1-ch
+stem correctly skipped — expected) but **Arm A BraTS = only 126/198 = 0.636** — 72 skipped = **56 extra
+`swinViT.layers3.*` keys** + 16 SSL task-head keys absent from our build. BrainSegFounder is documented as a
+*standard* Swin, so **0.636 is probably a construction-config mismatch, not a genuinely deeper architecture.**
+- **Hypothesis (check first, cheapest):** BSF built its SwinUNETR with **`use_v2=True`** (MONAI SwinUNETR-v2 adds
+  residual conv blocks → extra per-stage keys) and/or non-default **`depths` / `num_heads`**. Our `_VenaSwinUNETR`
+  uses MONAI defaults.
+- **Investigation (CPU-only, runs parallel to the K+1 training array):** dump the ckpt `state_dict` keys, diff
+  against `SwinUNETR(fs=48, use_v2=True)` and against the standard build; identify the config that lifts Arm A
+  coverage toward ~0.92 (only the 16 SSL heads should legitimately drop). If found, set that config for **both**
+  arms (UKB is the same BSF family) and re-run the S4 load-coverage test with the corrected expectation.
+- **Fallback if genuinely deeper:** keep Arm A at 0.636 as a documented comparator (the headline Arm B UKB is
+  unaffected at 0.880). Do NOT block S5 training on this — it only changes Arm A's encoder-init quality.
+- Files: `src/vena/segmentation/models/bsf_swinunetr.py` (`_VenaSwinUNETR.__init__`, `load_bsf_encoder`);
+  caveat pinned in `src/external/LINKS.md`; context in the S4 orchestrator notes above.
 
 **Orchestrator notes (append-only).**
 - _(empty)_
@@ -353,3 +487,11 @@ defaults remain no-ops unless a guidance sweep is explicitly requested.
 | Q2 | Region-weight sweep | S2 launch matrix | ✅ **wt ∈ {1, 5, 10, 20}** (equal + 3 up-weights) |
 | Q3 | Trunk policy | S2 launch matrix | ✅ **J0 freeze @ wt:1 (floor) + J1–J4 joint-low-LR @ wt:{1,5,10,20}** = 5 jobs; LR = linear-warmup→cosine; **raise EarlyStopping patience to ~400–500** (harder objective transiently raises train loss) |
 | Q4 | Latent-embedding viz | S1 (task 40) | ✅ **per-patient PCA/UMAP + slice montage** (1 patient/row, 5 tumour-slice cols, soft mask α=0.7) |
+
+## Planning decisions (resolved 2026-07-23 — scientist audit / iter-9)
+
+| # | Decision | Affects | Resolved |
+|---|---|---|---|
+| Q5 | Soft-map softeners | S5/S6 (tasks 16/17/18/15) | ✅ **σ-only; temperature DROPPED.** avg-pool / DML+CE / K-fold-mean are mandatory (no knob); **σ is the one knob** (shared oracle↔predicted so the maps match); calibration **MEASURED not corrected** (report ECE/Brier); **ET=TC−NETC reported diagnostic** (not gated); `temperature.py` becomes unused (hygiene-delete when no live caller). Design: B.c banner + B.f-§2 superseded. |
+| Q6 | OOD segmenter coupling | S3/S6 + `../../article/03_generalization_ood.md` | ✅ **first-class contribution.** Oracle→predicted `PSNR_ET` gap reported **PER RING** (Ring A vs B, never pooled) + Ring-B segmenter **TC/NETC error distribution** + **localisation(segmenter)+intensity(generator)** decomposition. Segmenter is the OOD ceiling; T-13 oracle mask **leaks post-contrast** (ceiling, not deployable). Design: A.8-§7 addition; article T3.6. |
+| Q7 | Vessels / normal enhancement | eval (design A.9) | ✅ **evaluate-only, NO reserved channel.** Report in-ROI enhancement fidelity of the synth T1c on vessel/dural-sinus/choroid/pituitary (reuse Frangi / `venous_atlas_build`), **per ring**. Field's #1 open gap (Moya-Sáez 2023); TA-ViT ignores it; mask-free SynCE shows whole-image models capture it. Motivates a future SWAN/vessel channel **only if** the generator misses normal enhancement. Design: A.9. |

@@ -2,4 +2,16 @@
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from vena.segmentation.engine.loss import (
+    SegmentationLoss,
+    ce_term,
+    dice_semimetric_loss,
+    tversky_term,
+)
+
+__all__: list[str] = [
+    "SegmentationLoss",
+    "ce_term",
+    "dice_semimetric_loss",
+    "tversky_term",
+]
