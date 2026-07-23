@@ -546,15 +546,14 @@ class TestRealBsfLoad:
     """Real checkpoint load tests.
 
     Skipped automatically when the checkpoint files are absent (CI / Picasso).
-    Expected results (measured locally, 2026-07-23):
-        Arm A: total=198, matched=126 (63.6%), skipped=72 (all name_missing)
-        Arm B: total=142, matched=125 (88.0%), skipped=17 (1 shape + 16 name)
+    Expected results after the depths=(2,2,6,2) fix (2026-07-23):
+        Arm A: total=198, matched=182 (91.9%), skipped=16 (all SSL task heads)
+        Arm B: total=142, matched=125 (88.0%), skipped=17 (1 stem + 16 heads)
 
-    Note on Arm A matched/total < 0.80:
-        The BraTS SSL checkpoint has 56 extra layers3 encoder blocks absent
-        from standard MONAI SwinUNETR (deeper SSL architecture) plus 16 SSL
-        task-head keys.  All 126 transferable keys load without shape error.
-        The coordinator brief expected ≥0.80 — this is a PREMISE-FALSE finding.
+    BEFORE the fix, Arm A yielded matched=126 / skipped=72 because the MONAI
+    default depths=(2,2,2,2) was missing 56 stage-3 encoder blocks that the
+    BraTS SSL checkpoint contains (depths=(2,2,6,2)).  The fix adds
+    ``_BSF_BRATS_SWIN_KW`` and passes it to ``_VenaSwinUNETR``.
     """
 
     @pytest.fixture(autouse=True)
@@ -565,24 +564,56 @@ class TestRealBsfLoad:
                 pytest.skip(f"Real BSF checkpoint absent: {path}")
 
     def test_arm_a_real_load_matched_count(self) -> None:
-        """Arm A: 126/198 keys transferred (all 126 target-compatible transfer)."""
+        """Arm A: 182/198 keys transferred with depths=(2,2,6,2); only SSL heads skipped."""
         from monai.networks.nets import SwinUNETR
 
         from vena.segmentation.models.bsf_swinunetr import (
             _BRATS_STEM_CHANNEL_SLICE,
+            _BSF_BRATS_SWIN_KW,
             load_bsf_encoder,
         )
 
-        model = SwinUNETR(in_channels=3, out_channels=2, feature_size=48, spatial_dims=3)
+        model = SwinUNETR(
+            in_channels=3,
+            out_channels=2,
+            feature_size=48,
+            spatial_dims=3,
+            **_BSF_BRATS_SWIN_KW,
+        )
         report = load_bsf_encoder(
             model, _REAL_BRATS_CKPT, brats_channel_slice=_BRATS_STEM_CHANNEL_SLICE
         )
         assert report.total == 198
-        assert report.matched == 126
-        assert len(report.skipped) == 72
-        # All skipped are name_missing (no shape mismatches after stem slice).
+        assert report.matched == 182
+        assert len(report.skipped) == 16
+        # All 16 skipped are SSL task heads; no stage-3 blocks skipped.
         stem_in_skipped = [k for k in report.skipped if "patch_embed.proj.weight" in k]
         assert stem_in_skipped == [], f"Stem should be matched after slice: {stem_in_skipped}"
+        # Confirm: no swinViT keys skipped (only SSL heads).
+        swin_skipped = [k for k in report.skipped if k.startswith("swinViT.")]
+        assert swin_skipped == [], f"swinViT keys should all match: {swin_skipped}"
+
+    def test_arm_a_matched_fraction_above_0_80(self) -> None:
+        """Arm A: matched/total ≥ 0.80 (actual 0.919) with correct depths."""
+        from monai.networks.nets import SwinUNETR
+
+        from vena.segmentation.models.bsf_swinunetr import (
+            _BRATS_STEM_CHANNEL_SLICE,
+            _BSF_BRATS_SWIN_KW,
+            load_bsf_encoder,
+        )
+
+        model = SwinUNETR(
+            in_channels=3,
+            out_channels=2,
+            feature_size=48,
+            spatial_dims=3,
+            **_BSF_BRATS_SWIN_KW,
+        )
+        report = load_bsf_encoder(
+            model, _REAL_BRATS_CKPT, brats_channel_slice=_BRATS_STEM_CHANNEL_SLICE
+        )
+        assert report.matched / report.total >= 0.80
 
     def test_arm_b_real_load_matched_count(self) -> None:
         """Arm B: 125/142 keys transferred; stem goes to skipped (shape mismatch)."""
@@ -613,10 +644,17 @@ class TestRealBsfLoad:
 
         from vena.segmentation.models.bsf_swinunetr import (
             _BRATS_STEM_CHANNEL_SLICE,
+            _BSF_BRATS_SWIN_KW,
             load_bsf_encoder,
         )
 
-        model = SwinUNETR(in_channels=3, out_channels=2, feature_size=48, spatial_dims=3)
+        model = SwinUNETR(
+            in_channels=3,
+            out_channels=2,
+            feature_size=48,
+            spatial_dims=3,
+            **_BSF_BRATS_SWIN_KW,
+        )
         report = load_bsf_encoder(
             model, _REAL_BRATS_CKPT, brats_channel_slice=_BRATS_STEM_CHANNEL_SLICE
         )

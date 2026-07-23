@@ -15,30 +15,40 @@ Arm B — ``bsf_swinunetr_ukb``  (UKB SSL, primary / headline)
     Checkpoint: BrainSegFounder_SSL_UKBiobank/64-gpu-model_bestValRMSE.pt
     SSL task trained on UK Biobank with 1-channel input (T1w).
     Stem: shape (48, 1, 2, 2, 2) — incompatible with 3-ch target → goes to
-    ``LoadReport.skipped``; all other 141 encoder keys transfer.
+    ``LoadReport.skipped``; all other 125 encoder keys transfer.
     This is the leak-free headline arm (UKB has no glioma patients, no
     BraTS-style labelling — OOF-safe by cohort independence).
+
+Architecture constants ``_BSF_BRATS_SWIN_KW`` / ``_BSF_UKB_SWIN_KW``
+    Empirically inferred from the checkpoint key structure (2026-07-23):
+
+    Arm A (BraTS) has ``depths=(2, 2, 6, 2)`` — stage 3 contains 6 transformer
+    blocks (indices 0–5) vs the MONAI default of 2.  Without this correction,
+    56 stage-3 encoder keys are absent from a default-architecture build,
+    yielding 126/198 (63.6%) coverage.  With ``depths=(2, 2, 6, 2)`` all 182
+    encoder keys transfer; the 16 remaining skipped keys are exclusively the
+    SSL task heads (rotation_head, contrastive_head, conv.*).
+
+    Arm B (UKB) has ``depths=(2, 2, 2, 2)`` — the MONAI default.  No change
+    required; 125/142 coverage (88.0%); the single skipped swinViT key is the
+    1-ch stem which cannot transfer to a 3-ch model.
+
+    These constants are NOT user hyperparameters.  They are immutable facts
+    about the frozen checkpoints and must not be overridden via ``ModelConfig``.
 
 Verified checkpoint SHA-256 (logged at load time via :func:`load_bsf_encoder`):
     Arm A: e46d80ce75f3828222cdfd3f4891c753e9cd0356719e7d21803c89e1b8797077
     Arm B: 4be92492ae4f55e934e278700a13a6c18ef8406daba2177c5f9f157dcff5f341
 
 Real load statistics (validated on local workstation, 2026-07-23):
-    Arm A: total=198 ckpt keys, matched=126 (63.6%), skipped=72
-        — 56 skipped = extra BraTS encoder blocks in layers3 absent from MONAI
-          SwinUNETR (BSF BraTS uses a deeper architecture for 4-ch SSL);
-          16 skipped = SSL task heads (rotation_head, contrastive_head, conv.*).
-        — No shape mismatches after stem slicing.
+    Arm A: total=198 ckpt keys, matched=182 (91.9%), skipped=16
+        — 16 skipped = SSL task heads (rotation_head, contrastive_head, conv.*).
+        — Zero shape mismatches; all 182 encoder keys transfer cleanly.
+        — Requires ``depths=(2, 2, 6, 2)``; the MONAI default depths=(2,2,2,2)
+          yields only 126/198 (63.6%) because 56 stage-3 blocks are absent.
     Arm B: total=142 ckpt keys, matched=125 (88.0%), skipped=17
         — 1 skipped = stem shape mismatch (48,1,2,2,2) ≠ (48,3,2,2,2);
           16 skipped = SSL task heads (same as Arm A).
-
-Note on "≥0.80" expectation:
-    The coordinator brief expected Arm A matched/total ≥ 0.80.  The real
-    result is 0.636 because the BraTS SSL checkpoint's swinViT has extra
-    layers3 blocks not present in MONAI's standard SwinUNETR (the BraTS
-    architecture is deeper at the last stage).  All 126 transferable keys
-    load without error.  The discrepancy is structural, not a load bug.
 
 SwinUNETR spatial divisibility (load-bearing):
     MONAI SwinUNETR._check_input_size requires each spatial dim to be
@@ -65,6 +75,10 @@ Deep supervision (hook-based):
         [0]: (B, out_channels, H, W, D)       full resolution
         [1]: (B, out_channels, H/2, W/2, D/2) from decoder2
         [2]: (B, out_channels, H/4, W/4, D/4) from decoder3
+
+    The hook structure is identical for Arms A and B regardless of ``depths``,
+    because ``decoder3`` and ``decoder2`` are MONAI decoder blocks (not swinViT
+    encoder blocks) and are unaffected by the deeper stage-3.
 """
 
 from __future__ import annotations
@@ -92,6 +106,23 @@ logger = logging.getLogger(__name__)
 # BraTS channel order: [FLAIR, T1pre, T1ce, T2] (0-indexed).
 _BRATS_STEM_CHANNEL_SLICE: list[int] = [0, 1, 3]
 _STEM_KEY: str = "swinViT.patch_embed.proj.weight"
+
+# Per-arm SwinViT architecture constants.
+# Inferred empirically from checkpoint key structure (2026-07-23):
+#   BraTS SSL: stage 3 contains 6 transformer blocks (block indices 0–5).
+#     depth=6 at stage 3 vs the MONAI default of 2.  Missing this yields 56
+#     absent stage-3 keys and 63.6% coverage; with the correct value, 91.9%.
+#   UKB SSL: depths=(2,2,2,2) — MONAI default, no correction needed.
+# These dicts are passed to SwinUNETR(**_BSF_*_SWIN_KW) in each builder.
+# They are NOT user-configurable and must not be added to ModelConfig.
+_BSF_BRATS_SWIN_KW: dict[str, object] = {
+    "depths": (2, 2, 6, 2),
+    "num_heads": (3, 6, 12, 24),
+}
+_BSF_UKB_SWIN_KW: dict[str, object] = {
+    "depths": (2, 2, 2, 2),
+    "num_heads": (3, 6, 12, 24),
+}
 
 # Default checkpoint paths — overridden by cfg.checkpoint when set.
 _BSF_BRATS_CKPT = Path(
@@ -257,24 +288,42 @@ def load_bsf_encoder(
 class _VenaSwinUNETR(nn.Module):
     """MONAI SwinUNETR with optional hook-based deep supervision.
 
-    Hooks are registered on ``backbone.decoder3`` (H/4 output) and
-    ``backbone.decoder2`` (H/2 output) and removed in :meth:`remove_hooks`
+    Hooks are registered on ``backbone.decoder3`` (fires at H/4) and
+    ``backbone.decoder2`` (fires at H/2) and removed in :meth:`remove_hooks`
     (called automatically in ``__del__``).  Always call ``remove_hooks()``
     before discarding the instance to avoid dangling references.
 
     The :attr:`backbone` property gives direct access to the underlying MONAI
     SwinUNETR for checkpoint loading and inspection.
+
+    Parameters
+    ----------
+    cfg:
+        Segmentation model config (``in_channels``, ``out_channels``,
+        ``feature_size``, ``deep_supervision``).
+    swinunetr_kwargs:
+        Extra keyword arguments forwarded verbatim to ``SwinUNETR.__init__``
+        (e.g. ``depths``, ``num_heads``).  Use the per-arm constants
+        ``_BSF_BRATS_SWIN_KW`` / ``_BSF_UKB_SWIN_KW`` — do NOT expose these
+        through ``ModelConfig``; they are immutable facts about the checkpoints.
     """
 
-    def __init__(self, cfg: ModelConfig) -> None:
+    def __init__(
+        self,
+        cfg: ModelConfig,
+        *,
+        swinunetr_kwargs: dict[str, object] | None = None,
+    ) -> None:
         from monai.networks.nets import SwinUNETR
 
         super().__init__()
+        extra: dict[str, object] = swinunetr_kwargs or {}
         self._backbone = SwinUNETR(
             in_channels=cfg.in_channels,
             out_channels=cfg.out_channels,
             feature_size=cfg.feature_size,
             spatial_dims=3,
+            **extra,
         )
         self._ds = cfg.deep_supervision
         self._ds_outputs: list[Tensor] = []
@@ -375,13 +424,18 @@ def build_bsf_swinunetr_brats(cfg: ModelConfig) -> nn.Module:  # type: ignore[mi
     The 4-ch stem is sliced to 3-ch via ``_BRATS_STEM_CHANNEL_SLICE``.
     NEVER loads from ``BrainSegFounder_finetuned_BraTS/*`` (data leakage).
 
+    Uses ``_BSF_BRATS_SWIN_KW`` (``depths=(2,2,6,2)``) to match the BraTS
+    checkpoint's deeper stage-3 architecture.  The MONAI default
+    ``depths=(2,2,2,2)`` misses 56 stage-3 encoder blocks (63.6% coverage);
+    the correct architecture achieves 182/198 (91.9%).
+
     If ``cfg.checkpoint`` is set, uses that path instead of the default.
     If the checkpoint is absent, the model is returned with MONAI random init
     and a WARNING is emitted (allows smoke runs without the checkpoint).
 
     Spatial divisibility: H, W, D must each be divisible by 32.
     """
-    model = _VenaSwinUNETR(cfg)
+    model = _VenaSwinUNETR(cfg, swinunetr_kwargs=_BSF_BRATS_SWIN_KW)
     ckpt = Path(cfg.checkpoint) if cfg.checkpoint is not None else _BSF_BRATS_CKPT
 
     if not ckpt.exists():
@@ -401,7 +455,10 @@ def build_bsf_swinunetr_ukb(cfg: ModelConfig) -> nn.Module:  # type: ignore[misc
 
     Loads SSL pre-training weights from the UKB checkpoint.  The 1-ch stem
     is incompatible with the 3-ch target and goes to ``LoadReport.skipped``;
-    all other 141 encoder keys transfer cleanly (88.0% matched/total).
+    all other 125 encoder keys transfer cleanly (88.0% matched/total).
+
+    Uses ``_BSF_UKB_SWIN_KW`` (``depths=(2,2,2,2)``) — the MONAI default —
+    which matches the UKB checkpoint's architecture exactly.
 
     This is the leak-free headline arm — UK Biobank contains no glioma
     patients and no BraTS-style labels (OOF-safe by cohort independence).
@@ -411,7 +468,7 @@ def build_bsf_swinunetr_ukb(cfg: ModelConfig) -> nn.Module:  # type: ignore[misc
 
     Spatial divisibility: H, W, D must each be divisible by 32.
     """
-    model = _VenaSwinUNETR(cfg)
+    model = _VenaSwinUNETR(cfg, swinunetr_kwargs=_BSF_UKB_SWIN_KW)
     ckpt = Path(cfg.checkpoint) if cfg.checkpoint is not None else _BSF_UKB_CKPT
 
     if not ckpt.exists():

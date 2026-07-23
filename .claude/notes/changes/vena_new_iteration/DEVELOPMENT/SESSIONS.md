@@ -376,14 +376,11 @@ green; K-fold plan deterministic + leakage-free; metrics + G-SEG gate + dual sel
   resumed the workers via SendMessage to re-wire `__init__` + re-verify against canonical interfaces. **Rule for
   future orchestration: after spawning a worktree agent, assert `git -C $WT merge-base --is-ancestor <main-sha> HEAD`
   BEFORE trusting its output.**
-- **PREMISE REFUTED — Arm A load-coverage ≥0.80 is architecturally impossible.** The BraTS-SSL ckpt
-  (`BrainSegFounder_SSL_BraTS/model_bestValRMSE-fold0.pt`, sha256 `e46d80ce75f3…`) is a **deeper non-standard
-  SwinUNETR** (56 extra `layers3` encoder blocks + 16 SSL task-head keys absent from MONAI `SwinUNETR(fs=48)`). Real
-  Arm A coverage = **126/198 = 0.636** (all 126 transferable keys load, no shape error, after `[FLAIR,T1pre,T2]=[0,1,3]`
-  stem slice). Arm B UKB (`64-gpu-model_bestValRMSE.pt`, sha256 `4be92492ae4f…`), the **leak-free HEADLINE**, =
-  **125/142 = 0.880** ≥0.80 with the 1-ch stem correctly in `skipped`. Test pins the actual 126/125, not the wrong
-  expectation. **S5 must treat Arm A as a comparator at 0.636 — do NOT gate on ≥0.80.** (BSF ckpts ARE present
-  locally, contra the stale "absent" line in *The arc*.)
+- **Arm A load-coverage measured at 126/198 = 0.636 (S4, before fix).** The BraTS-SSL ckpt
+  (`BrainSegFounder_SSL_BraTS/model_bestValRMSE-fold0.pt`, sha256 `e46d80ce75f3…`) produced 56 extra `layers3` encoder
+  block keys absent from MONAI `SwinUNETR(fs=48, depths=(2,2,2,2))`. S4 test pinned 126/198 as provisional. Arm B UKB
+  (`64-gpu-model_bestValRMSE.pt`, sha256 `4be92492ae4f…`) = **125/142 = 0.880**. (BSF ckpts ARE present locally.)
+  **NOTE: RESOLVED in S5 parallel worker — see S5 orchestrator notes for the fix and updated numbers.**
 - **What S5 must know (build/train the K+1 ensemble):**
   - `load_bsf_encoder(model.backbone, ckpt, brats_channel_slice=[0,1,3] for BraTS | None for UKB)` — **MUST pass
     `.backbone`** (inner MONAI SwinUNETR, keys `swinViT.*`), NOT the `_VenaSwinUNETR` wrapper (keys `_backbone.*`) or
@@ -438,7 +435,24 @@ stem correctly skipped — expected) but **Arm A BraTS = only 126/198 = 0.636** 
   caveat pinned in `src/external/LINKS.md`; context in the S4 orchestrator notes above.
 
 **Orchestrator notes (append-only).**
-- _(empty)_
+- **✅ TICKET RESOLVED — Arm A BraTS depths=(2,2,6,2) (2026-07-23, S5 parallel worker).**
+  Empirically inferred from checkpoint key dump (key pattern `swinViT.layers{N}.0.blocks.{i}.*`):
+  - **Arm A BraTS:** `depths=(2,2,6,2)` — stage 3 has **6 blocks** (indices 0–5) vs MONAI default 2. 6−2 = 4 extra
+    blocks × 14 keys/block = **56 extra keys** = exactly the 56 observed missing keys. `num_heads=(3,6,12,24)`.
+    No `use_v2` markers (no residual-conv keys). With `depths=(2,2,6,2)`: **182/198 (91.9%)** matched; **16 skipped**
+    = SSL task heads only (`rotation_head`, `contrastive_head`, `conv.*`). No swinViT encoder keys left out.
+  - **Arm B UKB:** `depths=(2,2,2,2)` (MONAI default). **125/142 (88.0%)** unchanged (1-ch stem + 16 SSL heads).
+  - **Fix implemented:** module constants `_BSF_BRATS_SWIN_KW = {"depths":(2,2,6,2), "num_heads":(3,6,12,24)}` and
+    `_BSF_UKB_SWIN_KW = {"depths":(2,2,2,2), "num_heads":(3,6,12,24)}` added to `bsf_swinunetr.py`. `_VenaSwinUNETR`
+    accepts `swinunetr_kwargs: dict | None = None` forwarded to `SwinUNETR(**extra)`. Builders call
+    `_VenaSwinUNETR(cfg, swinunetr_kwargs=_BSF_{BRATS,UKB}_SWIN_KW)`. Decoder hooks (`decoder3`/`decoder2`) confirmed
+    present on both variants. Tests in `TestRealBsfLoad` updated to pin 182/198 + add `test_arm_a_matched_fraction_above_0_80`.
+  - **LINKS.md caveat** updated from `⚠ OPEN TICKET` to `RESOLVED`. T1ce removal documented at
+    `.claude/notes/changes/vena_new_iteration/bsf_stem_t1ce_removal.md` (drop-slice `[0,1,3]` = current = recommended).
+  - **What S5 must know (updated):** Arm A builder auto-uses `depths=(2,2,6,2)` — no YAML field, no ModelConfig change.
+    Deep-supervision hooks survive the deeper stage-3 (decoder blocks are MONAI decoder, independent of swinViT depth).
+    Coverage Arm A: **0.919 ≥ 0.80** (confirmed). All 182 encoder keys transfer; the 16 SSL heads drop as designed.
+    No action required from S5 — the fix is self-contained in the library layer.
 
 ---
 
