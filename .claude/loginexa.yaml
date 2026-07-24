@@ -92,6 +92,19 @@ profiles:
     # git repos, so provenance resolves either way; this one is simply not in use.
     repo_path_remote: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA-validation
 
+    # 🔴 PYTHONPATH IS LOAD-BEARING HERE — SPLIT-BRAIN IMPORT TRAP (hit 2026-07-24).
+    # `vena` is pip-installed EDITABLE into the shared env, path-pinned to
+    # repos/VENA/src. Running the CLI from VENA-validation without PYTHONPATH
+    # gives you `routines` from VENA-validation (cwd) and `vena` from the STALE
+    # repos/VENA — half your code, half someone else's, and NO error. Observed:
+    # `TypeError: MultiCohortLatentDataModule.__init__() got an unexpected
+    # keyword argument 'mask_source'` on code where the argument plainly exists.
+    # The SLURM worker already exports PYTHONPATH; an interactive loginexa
+    # launch must do the same or it validates the wrong library.
+    # Assert it, don't assume it:
+    #   PYTHONPATH=$PWD/src:$PWD python -c "import vena; print(vena.__file__)"
+    smoke_cmd_template: 'PYTHONPATH=/mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA-validation/src:/mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA-validation {python} -m routines.fm.train.cli {config}'
+
   segmentation:
     # S5 — tumour segmenter (BSF-SwinUNETR / SegResNet), image-domain, 3-ch
     # {T1pre, T2, FLAIR} -> soft [TC, NETC]. Never sees T1c (label leakage).
