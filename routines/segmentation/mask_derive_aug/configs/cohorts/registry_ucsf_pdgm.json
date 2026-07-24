@@ -1,0 +1,9 @@
+{
+  "cohorts": [
+    {
+      "name": "UCSF-PDGM",
+      "image_aug_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSF_PDGM/h5/ucsf_pdgm_image_aug.h5",
+      "latent_aug_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/UCSF_PDGM/h5/ucsf_pdgm_latents_aug.h5"
+    }
+  ]
+}

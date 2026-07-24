@@ -1,0 +1,9 @@
+{
+  "cohorts": [
+    {
+      "name": "REMBRANDT",
+      "image_aug_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/rembrandt/h5/rembrandt_image_aug.h5",
+      "latent_aug_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/rembrandt/h5/rembrandt_latents_aug.h5"
+    }
+  ]
+}

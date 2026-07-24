@@ -1,0 +1,9 @@
+{
+  "cohorts": [
+    {
+      "name": "IvyGAP",
+      "image_aug_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/ivy_gap/h5/ivy_gap_image_aug.h5",
+      "latent_aug_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/ivy_gap/h5/ivy_gap_latents_aug.h5"
+    }
+  ]
+}
