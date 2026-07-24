@@ -1,0 +1,90 @@
+# Loginexa V100 smoke — UKB-arm, fold 0, Picasso real data + checkpoint.
+#
+# Purpose: validate the REAL BSF-SwinUNETR load, REAL H5 read, a real optimiser
+# step, the viz panel, and every artifact — under the 25-min loginexa wallclock.
+#
+# Constraints (loginexa node: V100-DGXS-32GB, sm_70):
+#   - Python: /mnt/.../fscratch/conda_envs/vena-v100/bin/python
+#   - Use AMP dtype float16 (not bfloat16 — V100 doesn't support it natively)
+#   - max_epochs: 2 + val_every_epochs: 1 → 2 val rounds, safe inside 25 min
+#   - patch_size: [96,96,96] — real patch, fits in 32 GB
+#
+# Do NOT submit as a real job — this is a loginexa preflight only.
+# Test with the test-picasso-loginexa skill after rsync.
+
+model:
+  name: bsf_swinunetr_ukb
+  feature_size: 48
+  in_channels: 3
+  out_channels: 2
+  checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/BrainSegFounder_SSL_UKBiobank/64-gpu-model_bestValRMSE.pt
+  strict_load: false
+  deep_supervision: true
+
+data:
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  image_h5_root: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena
+  modalities: [t1pre, t2, flair]
+  k_folds: 5
+  fold_seed: 1337
+  fm_fold: 0
+  dedup_decision_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
+  patch_size: [96, 96, 96]    # real production patch — exercises the memory path
+  cache_rate: 0.0
+  num_workers: 4              # fewer workers than production to stay in time
+
+targets:
+  soft: true
+  sdt_sigma_vox: 3.0
+  netc_operator: euclidean_percomponent
+  clip_vox: 10.0
+  tumor_region: tc
+
+loss:
+  dice_variant: dml
+  ce_variant: ce
+  dice_weight: 1.0
+  ce_weight: 1.0
+  deep_supervision_weights: [1.0, 0.5, 0.25]
+
+train:
+  max_epochs: 2               # capped to keep under 25-min wallclock
+  lr: 1.0e-4
+  batch_size: 1               # V100 32 GB; patch_size 96³ → ~2.8 GB activations
+  optimizer: adamw
+  scheduler: cosine
+  amp: true
+  val_every_epochs: 1         # validate every epoch for full artifact coverage
+  early_stop_patience: 10
+  calibration_split_frac: 0.1
+
+derivation:
+  temperature: none
+  avg_pool_stride: 4
+  latent_grid: [48, 56, 48]
+  emit_variance: false
+
+metrics:
+  gseg_tc_dice: 0.75
+  gseg_netc_dice: 0.50
+  selection_metric: dual
+
+run:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments_seg
+  tag: loginexa_ukb_fold0
+  fold: 0
+  seed: 1337
+  device: cuda
+  log_level: INFO
+  resume_from: null
+
+viz:
+  enabled: true               # exercise the full viz code path
+  every_epochs: 1             # render panel at both epochs
+  n_patients: 3
+  n_cols: 6
+  patient_ids: null
+  gt_alpha: 0.6
+  soft_alpha: 0.6
+
+seed: 1337

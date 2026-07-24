@@ -1,0 +1,91 @@
+# Smoke configuration for local/CI: segresnet, tiny data, 2 epochs, < 5 min.
+#
+# Intended for end-to-end validation WITHOUT real data or GPU:
+#   vena-segmentation-train routines/segmentation/train/configs/smoke.yaml
+#
+# The test fixture (tests/routines/segmentation/test_train_routine.py) patches
+# resolve_fm_splits and SegTrainer to run entirely on synthetic in-memory data.
+
+model:
+  name: segresnet              # floor baseline — no external checkpoint required
+  feature_size: 48
+  in_channels: 3
+  out_channels: 2
+  checkpoint: null             # segresnet trains from random init
+  strict_load: false
+  deep_supervision: true
+
+data:
+  # Corpus registry is required by the config schema; the test fixture patches
+  # resolve_fm_splits so the registry is never actually opened during the smoke.
+  corpus_registry: routines/fm/train/configs/corpus/corpus_local.json
+  image_h5_root: /media/mpascual/MeningD2/GLIOMA   # registry carries absolute paths; this is the fallback root
+  modalities: [t1pre, t2, flair]
+  k_folds: 3                   # fewer folds → faster smoke fold plan
+  fold_seed: 1337
+  fm_fold: 0
+  dedup_decision_path: artifacts/preflights/cohort_dedup/LATEST/decision.json
+  # Real registry + real H5s + real resolver, capped to 2 patients/cohort/split so the
+  # smoke runs in minutes. Both bugs that made every real run fail (the ids-vs-
+  # patient_ids key, and the flattened H5 path) live in code a synthetic smoke
+  # never reaches, so the smoke must touch the real reader.
+  max_patients_per_cohort: 1
+  patch_size: [64, 64, 64]     # multiple of 8; 8x fewer sliding-window steps than 32^3 on CPU
+  cache_rate: 0.0
+  num_workers: 0               # no worker processes → avoids fork overhead
+
+targets:
+  soft: true
+  sdt_sigma_vox: 3.0
+  netc_operator: euclidean_percomponent
+  clip_vox: 10.0
+  tumor_region: tc
+
+loss:
+  dice_variant: dml
+  ce_variant: ce
+  dice_weight: 1.0
+  ce_weight: 1.0
+  deep_supervision_weights: [1.0, 0.5, 0.25]
+
+train:
+  max_epochs: 2                # two epochs is enough to exercise the full loop
+  lr: 1.0e-4
+  batch_size: 1
+  optimizer: adamw
+  scheduler: cosine
+  amp: false                   # CPU smoke — AMP not applicable
+  val_every_epochs: 1          # validate every epoch for coverage
+  early_stop_patience: 10
+  calibration_split_frac: 0.1
+
+derivation:
+  temperature: none
+  avg_pool_stride: 4
+  latent_grid: [48, 56, 48]
+  emit_variance: false
+
+metrics:
+  gseg_tc_dice: 0.75
+  gseg_netc_dice: 0.50
+  selection_metric: dual
+
+run:
+  experiments_root: /tmp/vena_smoke_seg
+  tag: smoke_segresnet
+  fold: 0
+  seed: 42
+  device: cpu
+  log_level: INFO
+  resume_from: null
+
+viz:
+  enabled: true                # exercise the panel path — it runs every epoch here
+  every_epochs: 1
+  n_patients: 2
+  n_cols: 4
+  patient_ids: null
+  gt_alpha: 0.6
+  soft_alpha: 0.6
+
+seed: 42

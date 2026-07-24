@@ -1,0 +1,88 @@
+# Picasso production — BSF-SwinUNETR (UKB arm), fold set by SLURM array task.
+#
+# Array layout (launcher_picasso_seg_ukb.sh --array=0-5):
+#   tasks 0-4: train fold-0 … fold-4 (OOF ensemble)
+#   task  5  : train all_train model (predicts FM val+test patients)
+#
+# The worker renders a per-task YAML overriding run.fold (and run.tag)
+# before invoking vena-segmentation-train on it.
+#
+# Resource sizing: ~5-6 min/epoch (1331 train scans/fold, 8 workers, 96³ patches)
+# → 300 epochs ≈ 25-30 h/fold → --time=2-00:00:00 covers early stopping.
+
+model:
+  name: bsf_swinunetr_ukb    # headline arm (leak-free UKB-SSL)
+  feature_size: 48
+  in_channels: 3
+  out_channels: 2
+  checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/BrainSegFounder_SSL_UKBiobank/64-gpu-model_bestValRMSE.pt
+  strict_load: false          # encoder-only: 182/198 keys (0.919 coverage)
+  deep_supervision: true
+
+data:
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  image_h5_root: /mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena
+  modalities: [t1pre, t2, flair]
+  k_folds: 5
+  fold_seed: 1337
+  fm_fold: 0
+  dedup_decision_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
+  patch_size: [96, 96, 96]
+  cache_rate: 0.0
+  num_workers: 8              # feed 8 CPU cores (--cpus-per-task=8 in worker)
+
+targets:
+  soft: true
+  sdt_sigma_vox: 3.0
+  netc_operator: euclidean_percomponent
+  clip_vox: 10.0
+  tumor_region: tc
+
+loss:
+  dice_variant: dml
+  ce_variant: ce
+  dice_weight: 1.0
+  ce_weight: 1.0
+  deep_supervision_weights: [1.0, 0.5, 0.25]
+
+train:
+  max_epochs: 300
+  lr: 1.0e-4
+  batch_size: 2
+  optimizer: adamw
+  scheduler: cosine
+  amp: true
+  val_every_epochs: 5
+  early_stop_patience: 30
+  calibration_split_frac: 0.1
+
+derivation:
+  temperature: none
+  avg_pool_stride: 4
+  latent_grid: [48, 56, 48]
+  emit_variance: false
+
+metrics:
+  gseg_tc_dice: 0.75
+  gseg_netc_dice: 0.50
+  selection_metric: dual
+
+run:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments_seg
+  tag: ukb_k5                 # worker overrides per task: ukb_k5_fold0 … fold4, ukb_k5_all_train
+  fold: 0                     # OVERRIDDEN by the worker YAML render per array task
+  seed: 1337
+  device: cuda
+  log_level: INFO
+  resume_from: null
+
+viz:
+  enabled: true
+  every_epochs: 10
+  n_patients: 5
+  n_cols: 10
+  patient_ids: null
+  gt_alpha: 0.6
+  soft_alpha: 0.6
+
+seed: 1337

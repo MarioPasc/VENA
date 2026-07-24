@@ -122,6 +122,7 @@ class FmSplitResolution:
     per_cohort: tuple[CohortSplit, ...]
     patient_to_scans: Mapping[str, tuple[str, ...]]
     patient_to_cohort: Mapping[str, str]
+    max_patients_per_cohort: int | None = None
 
     def fm_splits(self) -> dict[str, list[str]]:
         """Union of splits across all cohorts → sorted patient keys.
@@ -179,6 +180,10 @@ class FmSplitResolution:
             "dedup_decision_path": (
                 str(self.dedup_decision_path) if self.dedup_decision_path else None
             ),
+            # Loud, machine-readable marker: a capped run is a smoke/debug run and
+            # its metrics are not comparable to a full one.
+            "max_patients_per_cohort": _normalise_cap(self.max_patients_per_cohort),
+            "is_capped_subset": _normalise_cap(self.max_patients_per_cohort) is not None,
             "per_cohort": {
                 cs.name: {
                     "role": cs.role,
@@ -424,6 +429,61 @@ def _read_cv_splits(
 # ---------------------------------------------------------------------------
 
 
+def _normalise_cap(value: object) -> int | None:
+    """Coerce a per-cohort patient cap to ``int | None``.
+
+    A real :class:`~vena.segmentation.config.DataConfig` is Pydantic-validated so
+    the value is already ``int | None``.  This guard exists because unit tests
+    inject stub configs whose attribute access yields ``MagicMock``, which would
+    otherwise blow up on the ``<=`` comparison here and on JSON serialisation in
+    :func:`write_splits_json`.  Non-positive values mean "no cap".
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
+def _cap_patients(
+    patient_keys: list[str],
+    cfg: DataConfig,
+    cohort_name: str,
+    split_name: str,
+) -> list[str]:
+    """Deterministically cap a split to ``cfg.max_patients_per_cohort`` patients.
+
+    Selection is the lexicographic head of the sorted keys, so the result depends
+    only on ``(patient_keys, cap)`` — no RNG, identical on every machine and every
+    re-run.  ``None`` (production) returns *patient_keys* unchanged.
+
+    Parameters
+    ----------
+    patient_keys:
+        Patient keys for one split of one cohort, post-dedup.
+    cfg:
+        Frozen :class:`~vena.segmentation.config.DataConfig`.
+    cohort_name, split_name:
+        Used only for the WARNING emitted when a cap actually bites.
+
+    Returns
+    -------
+    list[str]
+        At most ``cfg.max_patients_per_cohort`` keys.
+    """
+    cap = _normalise_cap(getattr(cfg, "max_patients_per_cohort", None))
+    if cap is None or len(patient_keys) <= cap:
+        return patient_keys
+    logger.warning(
+        "%s (%s): CAPPED %d -> %d patients (data.max_patients_per_cohort=%d). "
+        "This is a smoke/debug run — its metrics are NOT comparable to a full run.",
+        cohort_name,
+        split_name,
+        len(patient_keys),
+        cap,
+        cap,
+    )
+    return sorted(patient_keys)[:cap]
+
+
 def resolve_fm_splits(cfg: DataConfig) -> FmSplitResolution:
     """Resolve patient splits for all registry cohorts.
 
@@ -543,6 +603,12 @@ def resolve_fm_splits(cfg: DataConfig) -> FmSplitResolution:
                 n_test_before,
             )
 
+        # Optional smoke cap — applied AFTER dedup so a capped run is a strict
+        # subset of the production split, never a differently-deduplicated one.
+        train_pkeys = _cap_patients(train_pkeys, cfg, cohort.name, "train")
+        val_pkeys = _cap_patients(val_pkeys, cfg, cohort.name, "val")
+        test_pkeys = _cap_patients(test_pkeys, cfg, cohort.name, "test")
+
         # Build patient→scans map for all patients in this cohort
         all_pkeys_for_cohort = sorted(set(train_pkeys) | set(val_pkeys) | set(test_pkeys))
         for pk in all_pkeys_for_cohort:
@@ -605,6 +671,8 @@ def resolve_fm_splits(cfg: DataConfig) -> FmSplitResolution:
                 n_before,
             )
 
+        all_pkeys = _cap_patients(all_pkeys, cfg, cohort.name, "test")
+
         for pk in all_pkeys:
             if pk not in patient_to_scans:
                 scan_ids = _expand_patients_to_scans(offsets, keys, ids, [pk])
@@ -640,6 +708,7 @@ def resolve_fm_splits(cfg: DataConfig) -> FmSplitResolution:
         per_cohort=tuple(per_cohort),
         patient_to_scans=patient_to_scans,
         patient_to_cohort=patient_to_cohort,
+        max_patients_per_cohort=cfg.max_patients_per_cohort,
     )
 
 
@@ -782,6 +851,10 @@ def write_splits_json(
         "dedup_decision_path": (
             str(resolution.dedup_decision_path) if resolution.dedup_decision_path else None
         ),
+        # Loud, machine-readable marker so a capped smoke/debug run can never be
+        # mistaken for a full one when this file is read back months later.
+        "max_patients_per_cohort": _normalise_cap(resolution.max_patients_per_cohort),
+        "is_capped_subset": _normalise_cap(resolution.max_patients_per_cohort) is not None,
         "counts": {
             "fm_train_patients": len(fm_train),
             "fm_val_patients": len(fm_val),

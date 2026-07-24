@@ -101,6 +101,16 @@ class DataConfig(BaseModel):
         duplicate patients.  Mirrors ``MultiCohortLatentDataModule``: the same
         allow-list filter must run here or the segmenter trains on patients the
         generator excluded.  ``None`` disables the filter (tests only).
+    max_patients_per_cohort:
+        Deterministically cap each cohort to at most this many patients **after**
+        the dedup filter.  ``None`` (production) uses every patient.  Exists so a
+        smoke run can exercise the real registry, the real H5 reader and the real
+        split resolver in minutes rather than hours — both bugs that made every
+        real run fail (the ``ids`` vs ``patient_ids`` key, and the flattened H5
+        path) lived in code that a fully-synthetic smoke never touches.  Mirrors
+        ``MultiCohortLatentDataModule.max_train_patients_per_cohort``.  A capped
+        run records the cap in ``splits.json`` so it can never be mistaken for a
+        full one.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -112,6 +122,7 @@ class DataConfig(BaseModel):
     fold_seed: int = 1337
     fm_fold: int = 0
     dedup_decision_path: Path | None = None
+    max_patients_per_cohort: int | None = None
     patch_size: tuple[int, int, int]
     cache_rate: float
     num_workers: int
