@@ -545,9 +545,34 @@ stem correctly skipped — expected) but **Arm A BraTS = only 126/198 = 0.636** 
   the array trains. Do not treat the gate as meaningful until then.
   ⚠ Local `/home` (separate 600 G partition) was **85 % full with 296 GB of stale pytest basetemp** across 47 dirs.
 
-- **STILL OPEN at the end of this session:** loginexa smoke on the real UKB checkpoint (blocked only on the S1
-  mask-derive job `1631539_2` releasing `fscratch/repos/VENA-validation`), then the K+1 Picasso array, then the
-  G-SEG re-derivation of the TC-Dice gate.
+- **✅ LOGINEXA SMOKE PASSED (2026-07-24).** `loginexa_seg_ukb_fold0.yaml` on V100 GPU 3, **3 m 11 s** of a 25-min
+  budget. `seg-train completed` hit; **0** forbidden patterns; 6/6 artifacts (`best/last.pt` 256 MB, `train_epoch.csv`
+  3 rows, `fold_plan.json`, `splits.json`, `decision.json`); `temperatures.json` absent; `figures/epoch_00{0,1}.png`.
+  Training loaded the **real Picasso UKB ckpt** (`sha256=4be92492ae4f…`) at **125/142 = 88.0 %** — matching the
+  locally re-derived figure. Per-cohort G-SEG from that 2-epoch model was real and honest: BraTS-GLI tc=0.249,
+  UPENN-GBM 0.449, REMBRANDT 0.178, Ring-B BraTS-Africa-Glioma 0.226 / -Other 0.111 / BraTS-PED 0.228, and three
+  cohorts correctly `null` + `missing-data` (no fold-0 patients after the smoke cap).
+- **Fixed from the smoke (`0f5ba32`):** the evaluation rebuild logged `BSF UKB checkpoint not found at
+  /media/mpascual/Sandisk2TB/... — using MONAI random init` six times. Training was NOT affected (it had already
+  loaded correctly), but a log claiming random init on a trained model is a trap. `ModelConfig.init_from_ssl`
+  (default True) is set False by `load_seg_checkpoint`, which is about to overwrite every weight anyway.
+- **🔴 SLURM A100 SELECTOR CORRECTED (`10e0825`) — CLAUDE.md is WRONG on this.** `--gres=gpu:A100:1` matches **no
+  node**: `exa[01-04]` advertise **untyped** `Gres=gpu:8` (feature `a100`); only `blk[01-02]` publish typed
+  `gpu:B200:8`. `sbatch --test-only` rejected it as "Requested node configuration is not available". And a bare
+  `--constraint=dgx` is satisfied by BOTH types, so it silently schedules an A100 job onto a **B200** (observed:
+  `blk01`). Correct: `--partition=gpu_partition --constraint=a100 --gres=gpu:1` (`dgx&a100` is an invalid feature
+  spec). Memory `[[reference_picasso_a100_selector]]`.
+- **🚀 K+1 ARRAY SUBMITTED — job `1635802`**, 6 tasks (0-4 = folds, 5 = `all_train`), UKB headline arm, PENDING with
+  `Features=a100`, `TresPerNode=gres/gpu:1`, `Dependency=(null)` (none intended). Logs
+  `~/execs/vena/logs_seg/seg_ukb_1635802_<task>.out`; runs land in `~/execs/vena/experiments_seg/`. Monitor armed.
+  The Arm-A (BraTS comparator) and Arm-C (SegResNet floor) configs are ready — submit by pointing the launcher at
+  `picasso_seg_{brats,segresnet}.yaml`.
+- **STILL OPEN:** array `1635802` to finish; then **re-derive `gseg_tc_dice`** from measured per-cohort TC Dice (0.75
+  is provisional and the gate is not trustworthy until then); then S6 (predicted-mask cache + T-06), which now needs
+  no multiprocessing workaround thanks to the SDT fix.
+- **⚠ S1 STILL BLOCKED:** mask-derive `1631539_2` (UPENN-GBM) hit **TIMEOUT** at 24 h. The H5 is byte-clean (schema
+  2.0.0, no soft group, oracle `(611,3,48,56,48)` intact — the write-all-at-end design held). **Re-run it: with
+  `bfb36ee` deployed the derive is ~60x faster, so it should take minutes, not 22+ hours.**
 
 ---
 
