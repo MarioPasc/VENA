@@ -289,7 +289,25 @@ on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note bel
   *(Method note: re-running a cached-vs-fresh MAE check after a repo bump is the cheap general way to prove an
   "optimisation is bit-identical" claim — reuse it before the S6 predicted re-cache.)*
 - **UPENN-GBM re-submitted = job `1635814`** (`sbatch --array=2 --time=04:00:00`), HEAD `0f5ba32` (fast path), RUNNING.
-  Expected ~25 min instead of >24 h. Monitor armed (`bghy0f4ab`). **This is the last item for S1 exit-criterion-1.**
+  Expected ~25 min instead of >24 h. Monitor armed (`bghy0f4ab`).
+- **✅ S1 EXIT-CRITERION-1 MET — all 9 cohorts cached + formally validated (2026-07-24).** `1635814_2` COMPLETED in
+  **00:09:50** (611 scans ≈1 s/scan; ~146× vs the 24 h TIMEOUT — and the elapsed time is *plausible for real work*,
+  with all 611 rows present, so it did not silently skip). Final validation
+  (`scratchpad/final_s1_validate.py`, run on Picasso at `0f5ba32`):
+  - **9/9 pass `assert_latent_soft_mask_group_valid`** (the formal validator, not just a metadata peek).
+  - All 9: schema **2.1.0**, `masks/tumor_latent_soft (N,2,48,56,48)` float32, `tumor_region=tc`, `mask_source=gt`.
+  - **Oracle `masks/tumor_latent (N,3,48,56,48)` intact on all 9** (byte-untouched exit criterion).
+  - **NETC ≤ TC nesting True on all 9.**
+  - Fresh-derive spot-check on the two re-cached cohorts: BraTS-GLI ×2 + UPENN-GBM ×2 all **MAE(TC)=0.00000**,
+    MAE(WT) 0.003-0.020 ⇒ correct TC, bit-exact, not WT.
+  - **Corpus total = 3,459 scans**: UCSF 495 · BraTS-GLI 1251 · UPENN-GBM 611 · IvyGAP 34 · BraTS-Africa-Glioma 95 ·
+    BraTS-Africa-Other 51 · LUMIERE 599 · REMBRANDT 63 · BraTS-PED 260.
+- **S1 STATUS: every mechanical exit criterion is met** (5 code tasks merged; masks cached + validated across all 9;
+  oracle untouched; nesting holds; QC figures rendered in 3 anatomy backgrounds and eye-verified; `segmentation` marker
+  registered; **zero code changes made in the 2026-07-23/24 resume sessions**, so the suite/ruff baseline is whatever
+  the SEG-track sessions left it at — nothing to re-verify from S1). **The row stays ☐ solely because the human
+  mask-review gate (`masks_look_valid`) is unclosed** — that is the user's call and it gates the S2 GPU launch.
+  **S2 is otherwise unblocked and may start as soon as the user closes the gate.**
 
 ---
 
@@ -587,7 +605,23 @@ stem correctly skipped — expected) but **Arm A BraTS = only 126/198 = 0.636** 
   `~/execs/vena/logs_seg/seg_ukb_1635802_<task>.out`; runs land in `~/execs/vena/experiments_seg/`. Monitor armed.
   The Arm-A (BraTS comparator) and Arm-C (SegResNet floor) configs are ready — submit by pointing the launcher at
   `picasso_seg_{brats,segresnet}.yaml`.
-- **STILL OPEN:** array `1635802` to finish; then **re-derive `gseg_tc_dice`** from measured per-cohort TC Dice (0.75
+- **🚀 SEGRESNET FLOOR ARM SUBMITTED — job `1636072`** (2026-07-24, `180002c`), same 6-task K+1 array, same
+  `--constraint=a100 --gres=gpu:1`. **One-variable comparison against the UKB arm, verified by a parsed-config
+  diff: 59/62 fields identical**, differing ONLY in `model.name`, `model.checkpoint` (null = random init) and
+  `run.tag`. Crucially `k_folds=5` + `fold_seed=1337` are shared, so both arms train on a **byte-identical fold
+  assignment** and are comparable fold-by-fold; optimiser (AdamW), cosine schedule, lr 1e-4, batch 2, patch 96³,
+  AMP, DML+CE loss with deep-supervision weights (1.0,0.5,0.25), 300 epochs, patience 30 and seed 1337 all match.
+  The only free variable is encoder initialisation. Logs `~/execs/vena/logs_seg/seg_segresnet_1636072_<task>.out`.
+- **Arm coverage now:** UKB headline `1635802` ✓ submitted · SegResNet floor `1636072` ✓ submitted ·
+  **BraTS-SSL comparator (`picasso_seg_brats.yaml`) still NOT submitted** — iter-9 wants it run to quantify the
+  leakage↔Dice trade-off; launcher can be cloned from the segresnet one in a minute.
+- **⚠ Input-channel fact worth pinning (asked 2026-07-24).** The **UKB-SSL checkpoint stem is
+  `patch_embed.proj.weight (48, 1, 2, 2, 2)` — pre-trained on T1w ALONE, one channel.** The BraTS-SSL stem is
+  `(48, 4, …)` = `[FLAIR, T1pre, T1ce, T2]`. Our model is `in_channels=3` and DOES receive `{T1pre, T2, FLAIR}`,
+  but the UKB 1-ch stem cannot map onto 3 channels, so it is **skipped and re-initialised** (MONAI default) while
+  encoder stages 1-4 transfer — that is exactly the 17 skipped keys (stem weight+bias + 16 SSL heads) behind
+  125/142 = 88.0 %. So: representation transfers, input projection is learned from scratch on all three modalities.
+- **STILL OPEN:** arrays `1635802` + `1636072` to finish; then **re-derive `gseg_tc_dice`** from measured per-cohort TC Dice (0.75
   is provisional and the gate is not trustworthy until then); then S6 (predicted-mask cache + T-06), which now needs
   no multiprocessing workaround thanks to the SDT fix.
 - **⚠ S1 STILL BLOCKED:** mask-derive `1631539_2` (UPENN-GBM) hit **TIMEOUT** at 24 h. The H5 is byte-clean (schema
