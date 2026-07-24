@@ -1081,3 +1081,97 @@ class TestHeterogeneousCohortShapes:
         ).fit()
         assert result.checkpoint.exists()
         assert np.isfinite(result.final_train_loss)
+
+
+class TestValRetainsOnlyPinnedPatients:
+    """Validation must keep full-volume preds ONLY for the pinned viz patients.
+
+    Regression for the CPU-RAM OOM that killed Picasso tasks 1642748_2 /
+    1642760_4: `_run_val` stashed every val patient's (2,H,W,D) soft map
+    (~71 MB each) in a dict, ~49 GB over ~345 scans, which crossed the 80 GB
+    cgroup limit during the validation pass. Metrics are still computed over
+    every patient; only the panel cache is bounded.
+    """
+
+    pytestmark = pytest.mark.segmentation
+
+    def _tiny_trainer(self, tmp_path, viz_ids):
+        from vena.segmentation.config import (
+            DataConfig,
+            ModelConfig,
+            SegmentationConfig,
+            TrainConfig,
+            VizConfig,
+        )
+        from vena.segmentation.data.kfold import FoldPlan
+        from vena.segmentation.engine.train import SegTrainer
+
+        ids = [f"P{i}" for i in range(9)]
+        plan = FoldPlan(
+            k=3,
+            fm_train_ids=tuple(ids),
+            folds=(tuple(ids[0:3]), tuple(ids[3:6]), tuple(ids[6:9])),
+            fm_val_ids=(),
+            fm_test_ids=(),
+        )
+        cfg = SegmentationConfig(
+            model=ModelConfig(name="segresnet"),
+            data=DataConfig(
+                corpus_registry=tmp_path / "r.json",
+                image_h5_root=tmp_path,
+                patch_size=(16, 16, 16),
+                cache_rate=0.0,
+                num_workers=0,
+            ),
+            train=TrainConfig(
+                max_epochs=1, lr=1e-4, batch_size=1, val_every_epochs=1, early_stop_patience=1
+            ),
+            viz=VizConfig(enabled=True, n_patients=2),
+        )
+        tr = SegTrainer(cfg, 0, plan=plan, run_dir=tmp_path / "run")
+        # Pin the viz patients directly — bypass dataset construction.
+        object.__setattr__(tr, "_viz_patient_ids", tuple(viz_ids))
+        return tr, cfg
+
+    def test_only_pinned_patients_retained(self, tmp_path) -> None:
+        import torch
+        from torch.utils.data import DataLoader, Dataset
+
+        shape = (24, 24, 20)
+        pinned = ("V0", "V3")
+
+        class _ValDS(Dataset):
+            def __init__(self) -> None:
+                self._ids = [f"V{i}" for i in range(8)]
+
+            def __len__(self) -> int:
+                return len(self._ids)
+
+            def __getitem__(self, idx: int) -> dict:
+                t = torch.zeros(2, *shape)
+                t[0, 4:9, 4:9, 4:9] = 1.0
+                t[1, 5:7, 5:7, 5:7] = 1.0
+                return {
+                    "image": torch.randn(3, *shape),
+                    "target": t,
+                    "patient_id": self._ids[idx],
+                }
+
+        tr, cfg = self._tiny_trainer(tmp_path, pinned)
+        loader = DataLoader(_ValDS(), batch_size=1)
+
+        class _Stub(torch.nn.Module):
+            def forward(self, x):
+                b, _, h, w, d = x.shape
+                return torch.zeros(b, 2, h, w, d)
+
+        metrics, preds, targets = tr._run_val(
+            _Stub(), loader, torch.device("cpu"), use_amp=False,
+            amp_dtype=torch.float32, patch_size=cfg.data.patch_size,
+        )
+        # Metrics aggregate over ALL 8 val patients...
+        assert "val_dice_tc" in metrics
+        # ...but only the 2 pinned patients are retained in the panel cache.
+        assert set(preds) == set(pinned)
+        assert set(targets) == set(pinned)
+        assert all(tuple(v.shape) == (2, *shape) for v in preds.values())

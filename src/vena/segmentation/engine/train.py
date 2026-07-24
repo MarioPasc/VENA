@@ -726,9 +726,14 @@ class SegTrainer:
         tuple
             ``(metrics, preds, targets)`` where:
 
-            * ``metrics`` — aggregate metric dict (all val_* keys).
-            * ``preds`` — ``{patient_id: (2,H,W,D) float Tensor}`` soft probabilities.
-            * ``targets`` — ``{patient_id: (2,H,W,D) float Tensor}`` soft targets.
+            * ``metrics`` — aggregate metric dict (all val_* keys), computed over
+              **every** validation patient.
+            * ``preds`` — ``{patient_id: (2,H,W,D) float Tensor}`` soft
+              probabilities, retained **only for the pinned viz patients**
+              (``self._viz_patient_ids``).  Retaining all patients cost ~49 GB of
+              CPU RAM per validation pass and OOM-killed the larger folds; the
+              panel is the sole consumer and reads at most ``cfg.viz.n_patients``.
+            * ``targets`` — same keys as ``preds``.
         """
         from monai.inferers import sliding_window_inference
 
@@ -791,8 +796,14 @@ class SegTrainer:
                 et_dice_list.append(etd["et_dice"])
                 et_soft_list.append(etd["mean_et_soft"])
 
-                preds[pid] = ps.cpu()
-                targets[pid] = tgt.cpu()
+                # Keep full-volume predictions ONLY for the pinned viz patients.
+                # _try_render_panel reads nothing else, and a full soft map is
+                # ~71 MB (2, 240, 240, 155 float32); holding all ~345 val scans
+                # here cost ~49 GB of CPU RAM per validation pass and OOM-killed
+                # the larger folds against the 80 GB cgroup limit.
+                if pid in self._viz_patient_ids:
+                    preds[pid] = ps.cpu()
+                    targets[pid] = tgt.cpu()
 
         n = max(len(dice_tc_list), 1)
         dice_tc_m = sum(dice_tc_list) / n
