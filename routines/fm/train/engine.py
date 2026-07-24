@@ -212,6 +212,14 @@ class _DataCfg(BaseModel):
             "v4": 0.2,
         }
     )
+    # Soft 2-channel mask [TC, NETC] serving policy (task-20 / S2 T-13).
+    # "none" (default) → m_tc_soft / m_netc_soft absent; every existing run
+    #   YAML is back-compat with no change required.
+    # "oracle_soft" → reads masks/tumor_latent_soft (schema 2.1.0, cached).
+    # "predicted"   → reads masks/tumor_latent_pred (written by task-18).
+    # "derived"     → clip(NETC+ET, 0, 1) from masks/tumor_latent (aug-safe).
+    # Absent group with oracle_soft/predicted → hard raise, never a warning.
+    mask_source: Literal["none", "oracle_soft", "predicted", "derived"] = "none"
 
     @model_validator(mode="before")
     @classmethod
@@ -1032,9 +1040,9 @@ class FMTrainRoutineEngine:
         cfm_block = (cfg.loss or {}).get("cfm") or {}
         rw_block = cfm_block.get("region_weights")
         return {
-            "schema_version": "0.10.0",
+            "schema_version": "0.11.0",
             "produced_at": now_iso_utc(),
-            "producer": "routines.fm.train:0.10.0",
+            "producer": "routines.fm.train:0.11.0",
             "run_id": run_id,
             "run_dir": str(run_dir),
             "stage": cfg.run.stage,
@@ -1105,6 +1113,8 @@ class FMTrainRoutineEngine:
             "loss_cfm_reduction": cfm_block.get("reduction", "mean"),
             "loss_cfm_norm": cfm_block.get("norm", "l2"),
             "region_weights": (dict(rw_block) if rw_block is not None else None),
+            # Schema 0.11.0 — soft 2-channel mask [TC, NETC] serving policy.
+            "mask_source": cfg.data.mask_source,
             # Reserved for the (deferred) normalisation-audit sibling spec;
             # null until that preflight lands and v3 latents carry a
             # ``normalization_variant_id`` attr cross-checked at engine init.
@@ -1385,6 +1395,7 @@ class FMTrainRoutineEngine:
             dedup_allowlists=dedup_allowlists,
             use_offline_augmented_data=cfg.data.use_offline_augmented_data,
             variant_weights=cfg.data.variant_weights,
+            mask_source=cfg.data.mask_source,
         )
         if cfg.data.use_offline_augmented_data:
             logger.info(
