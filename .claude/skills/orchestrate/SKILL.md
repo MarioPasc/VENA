@@ -264,13 +264,34 @@ An rsync'd **worktree** carries a `.git` *file* pointing back to the dev box, so
 Even `--parsable` returns `$'\033[31m\033[0m1604488'`. Interpolated into
 `--dependency`, sbatch **ACCEPTS it** and records `Dependency=(null)` — the
 dependent job then runs immediately against a partial input. **sbatch accepting
-a flag proves nothing.** Strip and verify:
+a flag proves nothing.**
+
+**⚠ Stripping ANSI is NOT sufficient (measured 2026-07-24).** The wrapper also
+prints a multi-line Lua warning **on stdout**, e.g.
+
+```
+sbatch.orig: (lua): ====================== WARNING ======================
+sbatch.orig: (lua): No constraint specified. It will be used by default:
+sbatch.orig: (lua):  #SBATCH --constraint=cpu
+sbatch.orig: (lua): =====================================================
+1642663
+```
+
+`sed 's/[^0-9]//g'` runs **line-by-line**, so the newlines survive and the "id"
+comes back multi-line. The guard then rejects an id for a job that **has already
+been submitted**, leaving an untracked job running on the cluster — worse than
+no guard, because you believe nothing was submitted. Take the **last line
+first**:
 ```bash
-_clean_job_id() { sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/[^0-9]//g' <<<"$1"; }
+_clean_job_id() {
+    tail -n 1 <<<"$1" | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/[^0-9]//g'
+}
 ID=$(_clean_job_id "$(sbatch --parsable ...)")
 [[ "$ID" =~ ^[0-9]+$ ]] || { echo "FATAL: unparsable job id" >&2; exit 1; }
 scontrol show job "$DEP" | grep -q 'Dependency=(null)' && { scancel "$DEP"; exit 1; }
 ```
+If a guard ever fires *after* a submission command has run, your first act is
+`squeue -u $USER` — assume the job exists until you have proved it does not.
 Picasso's `squeue` wrapper also rejects `-h -o '%T'` and prints help instead —
 use `/usr/bin/squeue` or `sacct` when scripting.
 
