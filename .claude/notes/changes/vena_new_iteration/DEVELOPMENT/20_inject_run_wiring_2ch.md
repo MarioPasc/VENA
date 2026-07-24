@@ -10,6 +10,26 @@
 parallel and integrated at the run step). Owns the DataModule mask-serving + a conditioning-spec wiring block + a
 run/smoke YAML. **NO segmenter required** — the T-13 oracle reads the GT-derived soft cache.
 
+## 🔧 ITER-9 HARNESS ADDENDUM (2026-07-23)
+
+**Parallel-launch.** INJECT/oracle track, **Phase-1** — runs **concurrent with the SEG track (S4/S5)**; the two share
+no code and only join at S6.
+**Grid settled:** `base_img_size_numel = 129024 = 48×56×48` is CORRECT — there is **no** `(60,60,40)` mismatch. **Drop
+the stale "report the base_img_size_numel mismatch as an open QUESTION"** in the Report-format line below; it is
+resolved (a confirming YAML comment suffices).
+**Reuse, don't rebuild:** the ControlNet **assembler / specs / downsamplers** (`controlnet/`), `module._trunk_forward`,
+and `maisi/maisi_controlnet.py`'s `controlnet_cond_embedding` hint net already exist — wire the soft-mask keys through
+them; **copy** `picasso_s1_v3a_concat_only_fft.yaml` as the base (never edit it) + a v3b ControlNet YAML for block shape.
+**Load-bearing checks (the point of the task):**
+1. **Step-0 identity (P1):** `output_scale=0` → all CN residuals zero → trunk+CN output == plain-v3a output
+   (`assert_allclose`). If this fails, the warm-start damages v3a — STOP.
+2. **Two-spec channel count (A.8-§4):** `[mask:tc_soft:identity, mask:netc_soft:identity]` → mask-part
+   `total_channels == 2`, hint-net `conditioning_in_channels == 2`; a single 2-ch key is asserted-against.
+3. **Swap guarantee:** oracle and predicted paths differ ONLY by `data.mask_source` — assert the run code is
+   byte-identical apart from that key.
+**Definition of done:** all 4 acceptance criteria green + the loginexa 2-step smoke builds the 2-ch ControlNet with no
+shape error; ruff-clean.
+
 ## Objective
 Make the v3a-warm-start **fresh `[WT,NETC]` ControlNet** run buildable and runnable on the **oracle** soft mask
 (T-13): serve the cached soft `[WT,NETC]` selected by `data.mask_source`, wire the **two-spec** conditioning

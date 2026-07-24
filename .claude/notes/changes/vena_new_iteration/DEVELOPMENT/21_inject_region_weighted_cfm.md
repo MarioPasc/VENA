@@ -4,6 +4,23 @@
 Owns `controlnet/losses/` (the region-weighted CFM) + a loss-config block; may edit a loss-wiring block in
 `lightning/module.py` (merge after 20 to avoid a module.py clash).
 
+## 🔧 ITER-9 HARNESS ADDENDUM (2026-07-23)
+
+**Parallel-launch.** INJECT/oracle track — runs concurrent with the SEG track.
+**🔴 WT→TC (channel-0=TC erratum + `01_SHARED_CONTRACTS.md` §Region-semantics).** The region is **TC**, not WT:
+regions = **`{Brain = NOT-BG ∩ NOT-TC, TC}`**, weights `{brain:1.0, tc:1.0}`, where **TC = mask channel 0 (edema
+EXCLUDED)**. Read every "WT" in the body below as "TC". **Edema now falls in the Brain region** (reconstructed from the
+inputs — intended). Config key: `loss.region_weights: {brain:1.0, tc:1.0}`.
+**Reuse, don't rebuild:** grep the **existing** `region_weights` (shipped with the retired v3b_rw arm; in
+`decision.json` 0.10.0), reuse its BG rule + combination — only add the equal-weight default + the L1-equivalence
+guarantee. Region masks on-device via `metrics/regions.py` (`F.max_pool3d` dilation), never a CPU loop.
+**Load-bearing check (the whole point):** with `{brain:1.0, tc:1.0}` (BG handled as the current L1-mean support does),
+`region_weighted_cfm == cfm_l1_mean` to floating tolerance — ship the mechanism, change **nothing** numerically until a
+weight is deliberately raised. Assert this equivalence.
+**Definition of done:** L1-equivalence assert green; up-weight raises the TC-voxel grad; `decision.json.region_weights
+== {brain:1.0, tc:1.0}`; ruff-clean. If the existing `region_weights` set differs from the assumed one → report
+`PREMISE-FALSE` with what you found.
+
 ## Objective
 Provide the region-weighted CFM velocity loss with regions **`{Brain = NOT-BG ∩ NOT-WT, WT}`** and a **default of
 EQUAL weights `{brain:1.0, wt:1.0}`, numerically identical to the current unweighted L1 velocity loss**. The

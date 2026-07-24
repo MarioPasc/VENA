@@ -66,6 +66,37 @@ Session effort is inherited — run the session at `xhigh`/`max` for this work.
 the project's equivalent fact sheet), its lane, and what it must not touch.
 Nothing else — it starts cold with no memory of your session.
 
+**Pick the cheapest subagent_type that fits the role** — do not default
+everything to `general-purpose`+`opus`. Coding a spec against acceptance criteria
+wants Opus; a pure search / read-only verification fan-out can use a cheaper
+read-only type (`explore`, `review`). Tools and effort come from the
+`subagent_type` definition, so a role that only reads must not be handed
+write/web tools (cookbook R9/R10/AP3: restrict tools and effort per role — an
+over-tooled agent costs more and wanders).
+
+### Minimal context — hand the agent a self-contained brief, not a reading list
+
+Tokens *and* wandering both scale with how much an agent must read before it can
+start. **Do not tell an agent to "read files A, B, C, D."** Give it at most **its
+one `NN_*.md` spec + the fact sheet**, and put everything else it needs **inline
+in the prompt as a 4–10 line BRIEF** (cookbook R8: pass the fields it needs, not
+the raw context). The brief carries the load-bearing facts it would otherwise
+hunt for:
+
+- the **exact already-merged interfaces to reuse, with import paths** (e.g.
+  `from vena.segmentation.targets import make_soft_targets`) — so it *reuses*
+  instead of rebuilding;
+- the **one or two invariants it must not break** (shapes, a nesting rule, a
+  normalisation world) stated as literals;
+- **any decision that overrides the spec body**, called out explicitly (e.g.
+  "temperature is DROPPED — ignore every temperature step in the spec");
+- the **closed set of files it may touch** + the do-NOT-touch list.
+
+Rule of thumb: **if the agent must open more than its spec + the fact sheet to
+begin, the brief is too thin — move the missing facts into the prompt.** A dense
+inline brief is faster, cheaper, and less error-prone than making the agent
+re-derive those facts from source, and it removes the excuse to read broadly.
+
 ### ⚠ The worktree trap that will cost you an agent's work
 
 `isolation: "worktree"` cuts a **fresh worktree from the SESSION BASE commit**,
@@ -127,9 +158,44 @@ premise errors in orchestrator instructions this way.
 
 **Two correction rounds max, then escalate to the user.**
 
+### Watch the agent live — the completion notification is the floor, not the whole signal
+
+A background subagent sends **one** completion notification. That is the minimum
+of what you should observe, not the maximum. (Practices adapted from Anthropic's
+`managed_agents/CMA_watch_subagents_live` cookbook — watch subagents *live*.)
+
+- **Never fire-and-forget and read only the closing report.** The report is what
+  the agent *says* it did; §3 verification against the on-disk artifact is
+  mandatory regardless (cookbook AP1).
+- **Steer mid-run instead of failing at the end.** The moment an intermediate
+  signal shows an agent going wrong — a wrong path in a progress line, a premise
+  it is about to build on, a format that will not reconcile — send a corrective
+  **`SendMessage`** to the *still-running* agent (address it by its id/name)
+  rather than waiting for it to finish and re-spawning from scratch (cookbook
+  R13). A two-line correction now beats a full re-run later.
+- **Wait silently.** Do **not** emit "still working… / almost done…" commentary
+  while an agent runs — it burns tokens and context and tells the user nothing
+  (cookbook AP2). Say nothing until the notification arrives or a monitor fires;
+  do independent work in the meantime.
+- **A stall is a failure signal, not patience.** If a run that should be
+  progressing produces no movement, the agent may be stuck waiting on a
+  confirmation or out of retries — investigate or escalate, do not just keep
+  waiting (cookbook R3/R7/AP4). Give any long `Monitor` a hard timeout.
+- **Break on any terminal state, not only success** — apply the §4 SLURM
+  monitor rule (match every terminal state) to agent watches too (cookbook R4).
+
 ---
 
-## 3. Verifying what comes back — the part that matters
+## 3. Verifying what comes back — ALWAYS, every agent, no exceptions
+
+**This is not optional and it is not risk-scaled. Verify EVERY subagent's work,
+EVERY time — a one-line change, an agent that reports green, a task that "looks
+trivial", a moment when you are in a hurry. There is no category of subagent
+output that is exempt.** A subagent's report is a hypothesis, never evidence
+(the rule from §Purpose; cookbook AP1: the closing report says what the agent
+*did*, it does not prove the artifact is correct). The one time you skip
+verification is the time a plausible-looking wrong number reaches the paper.
+Re-derive every load-bearing number yourself, from the artifact on disk.
 
 **Order matters. Check provenance before you read a single number.**
 

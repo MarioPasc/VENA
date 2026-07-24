@@ -3,6 +3,22 @@
 **Track/Wave/Deps.** INJECT · **Wave 1 (merge after 20)** · deps: 20 (conditioning keys). Owns a new augment
 transform + a perturbation hook. **OFF by default** (T-13 oracle stays clean; this is for T-06).
 
+## 🔧 ITER-9 HARNESS ADDENDUM (2026-07-23)
+
+**Parallel-launch.** INJECT track — runs concurrent with the SEG track; **OFF by default** (T-13 oracle byte-unchanged;
+this transform is for the deployable T-06 only).
+**🔴 WT→TC:** the conditioning keys are **`("m_tc_soft", "m_netc")`**, not `("m_wt_soft", …)` (channel 0 = TC). Preserve
+**`NETC ≤ TC`** after every perturbation (the body's "NETC ≤ WT" means "NETC ≤ TC").
+**Scope (audit link, Q6):** this is the **unstructured** baseline robustness (dilate/erode + Gaussian + dropout). The
+*structured* segmenter-error modeling — and the **Ring-B segmenter error distribution** that quantifies the coupled OOD
+failure — is the separate T3.6 analysis (`03_generalization_ood.md`), **NOT** required here. Keep 22 scoped to the
+unstructured perturbation; do not synthesise Ring-B failure modes in this transform.
+**Reuse, don't rebuild:** subclass the **existing** online-transform ABC (`data/augment/online/transforms/`) and honour
+the `AugmentationTracker` seed-replay so runs reproduce; do not hard-code the pipeline wiring.
+**Load-bearing check:** `enabled=False → EXACT identity` (assert_allclose) so the T-13 oracle path is byte-unchanged.
+**Definition of done:** all 5 acceptance criteria green incl. `NETC ≤ TC` preserved + off=identity; determinism under
+seed-replay; ruff-clean.
+
 ## Objective
 A latent-grid **mask-perturbation** transform applied to the `[WT,NETC]` conditioning **during T-06 training** to
 close the train-on-GT → deploy-on-predicted gap and to enable optional CFG. Design authority: **A.8-§7** (Q_C:

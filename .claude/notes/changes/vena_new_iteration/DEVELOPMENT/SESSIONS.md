@@ -76,7 +76,7 @@ gap. **Phase 3:** deferred ablations (CFG, WT up-weight sweep, SPADE).
 
 | ✓ | Session | Goal | Task structure | Gates |
 |---|---|---|---|---|
-| ☐ | **S1 — Oracle soft-mask + validation** | SDT-soft GT `[WT,NETC]` cached in every latent H5, visually + latent-embedding validated | `[O]` preflight → **10** → { **12** ∥ **16** } → **19**(source:gt) → **40**(mask QC + latent embedding) → `(gate)` human mask review | latent H5s writable; scaffold decision |
+| ☑ | **S1 — Oracle soft-mask + validation** *(CLOSED 2026-07-24)* | SDT-soft GT `[TC,NETC]` cached + audited in all 9 latent H5s (3,459 scans); QC + embedding figures reviewed; **human gate CLOSED** | `[O]` preflight → **10** → { **12** ∥ **16** } → **19**(source:gt) → **40**(mask QC + latent embedding) → `(gate)` human mask review ✓ | latent H5s writable; scaffold decision |
 | ☐ | **S2 — Injection + launch oracle** | v3a + fresh 2-ch ControlNet wired; **5 oracle runs** launched + monitored | { **20** ∥ **21** } → **40**(injection sanity) → `[O]` loginexa smoke → `[O]` launch the 5-job matrix + Monitor | S1 masks cached+validated; v3a ckpt (+`trunk_ema_snapshot.pt` for J1–J4) on Picasso |
 | ☐ | **S3 — Oracle verdict** | Injection-sufficiency verdict + region-weight/trunk pick + go/no-go for the segmenter | `[O]` harvest → `[O]` analysis (PSNR_ET / no-regression / FP-safety) → `[O]` verdict | S2 jobs terminal |
 | ☑ | **S4 — Segmenter library** *(runs parallel to S1–S3, iter-9)* | BSF-SwinUNETR + SegResNet, loss, data/K-fold, metrics — built + unit-green | { **11** ∥ **13** ∥ **14** ∥ **15** } | S1 task 10 merged ✓; **BSF SSL located+pinned (UKB-SSL=headline)**; ~~S3=GO~~ removed → **FULLY UNBLOCKED** |
@@ -254,7 +254,7 @@ on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note bel
   BraTS-GLI+UPENN-GBM. Fix for S6: either (a) set `--time ≥ 24h` for the big cohorts (zero-code, what we did here), or
   (b) add a `multiprocessing.Pool(cpus_per_task)` over the scan loop + bump `--cpus-per-task` (≈N×faster, de-risks the
   wall permanently). Recommend (b) for S6 (predicted derive is even costlier: adds segmenter inference per scan).
-- **Human mask-review gate STILL OPEN** — user closes `masks_look_valid` in the QC `decision.json` after eyeballing the
+- **~~Human mask-review gate STILL OPEN~~ → CLOSED 2026-07-24 (see the S1 CLOSED entry below).** Was: user closes `masks_look_valid` in the QC `decision.json` after eyeballing the
   two UCSF sets above (24 patients spanning small→large→multifocal→100%-edema). Gates the S2 GPU launch.
 - **✅ USER DECISION — KEEP the 0.034 soft-floor** (2026-07-23). The uniform far-field floor `sigmoid(-clip/σ)` (σ=3,
   clip=10 → 0.034) is **retained by design**: it is representative of a best-case segmenter output (high probability
@@ -302,12 +302,17 @@ on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note bel
     MAE(WT) 0.003-0.020 ⇒ correct TC, bit-exact, not WT.
   - **Corpus total = 3,459 scans**: UCSF 495 · BraTS-GLI 1251 · UPENN-GBM 611 · IvyGAP 34 · BraTS-Africa-Glioma 95 ·
     BraTS-Africa-Other 51 · LUMIERE 599 · REMBRANDT 63 · BraTS-PED 260.
-- **S1 STATUS: every mechanical exit criterion is met** (5 code tasks merged; masks cached + validated across all 9;
+- **✅ S1 CLOSED (2026-07-24) — human gate confirmed.** The user reviewed the QC figures and **confirmed the oracle
+  masks are correct**. `masks_look_valid: true` written into all three QC `decision.json` artifacts
+  (`2026-07-22T21-53-06Z`, `t2f/2026-07-22T22-11-15Z`, `t1c/2026-07-23T08-41-50Z`) with `masks_look_valid_set_by`
+  /`_set_at`/`_note` provenance. **Every S1 exit criterion — mechanical and human — is now met; the row is ticked
+  and S2 (including its GPU launch) is fully unblocked.** The one `invariant_ok=false` row in the default-bg set
+  (UCSF-PDGM-0367) is the documented benign multifocal small-TC pooling artifact, not a defect.
+- **S1 STATUS (historical, pre-gate): every mechanical exit criterion was met** (5 code tasks merged; masks cached + validated across all 9;
   oracle untouched; nesting holds; QC figures rendered in 3 anatomy backgrounds and eye-verified; `segmentation` marker
   registered; **zero code changes made in the 2026-07-23/24 resume sessions**, so the suite/ruff baseline is whatever
-  the SEG-track sessions left it at — nothing to re-verify from S1). **The row stays ☐ solely because the human
-  mask-review gate (`masks_look_valid`) is unclosed** — that is the user's call and it gates the S2 GPU launch.
-  **S2 is otherwise unblocked and may start as soon as the user closes the gate.**
+  the SEG-track sessions left it at — nothing to re-verify from S1). *(At the time of writing, the row was still ☐
+  pending the human gate; **that gate was closed on 2026-07-24 and the row is now ☑** — see the S1 CLOSED entry.)*
 - **✅ FULL MASK INVARIANT AUDIT — 3,459 scans / 9 cohorts, job `1636104` (2026-07-24).** New tool
   `scripts/mask_audit/` (`audit_cohort.py` worker + `flag_and_visualize.py` merge + `array_mask_audit.sh`
   + `README.md` documenting every invariant and threshold). CPU array, 9 tasks, ~21 min wall.
@@ -693,9 +698,13 @@ stem correctly skipped — expected) but **Arm A BraTS = only 126/198 = 0.636** 
 - **STILL OPEN:** arrays `1640255` + `1640256` to finish; then **re-derive `gseg_tc_dice`** from measured per-cohort TC Dice (0.75
   is provisional and the gate is not trustworthy until then); then S6 (predicted-mask cache + T-06), which now needs
   no multiprocessing workaround thanks to the SDT fix.
-- **⚠ S1 STILL BLOCKED:** mask-derive `1631539_2` (UPENN-GBM) hit **TIMEOUT** at 24 h. The H5 is byte-clean (schema
-  2.0.0, no soft group, oracle `(611,3,48,56,48)` intact — the write-all-at-end design held). **Re-run it: with
-  `bfb36ee` deployed the derive is ~60x faster, so it should take minutes, not 22+ hours.**
+- **~~⚠ S1 STILL BLOCKED~~ → S1 IS CLOSED (2026-07-24).** mask-derive `1631539_2` (UPENN-GBM) hit TIMEOUT at 24 h
+  with the H5 byte-clean; re-run on the `bfb36ee` fast path as job **`1635814`** and it **COMPLETED in 9m50s**
+  (~146x). All **9/9 cohorts cached + `assert_latent_soft_mask_group_valid`-green**, then fully audited (array
+  `1636104`, `recompute_max_abs = 0.0` on all 3,459 scans), and the **human `masks_look_valid` gate is now CLOSED**
+  (user confirmed the oracle masks are correct). **S1 requires nothing further — S2 is fully unblocked, including
+  its GPU launch.** Nothing in S5 depends on S1; this note exists only because an earlier S5 entry claimed S1 was
+  blocking.
 
 ---
 

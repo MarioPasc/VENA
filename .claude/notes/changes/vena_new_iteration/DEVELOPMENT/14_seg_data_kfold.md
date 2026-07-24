@@ -3,6 +3,30 @@
 **Track/Wave/Deps.** SEG · **Wave 1 (parallel)** · deps: 10 (+ task 12's `make_soft_targets` at train time, but
 build/test independently with a stub). Owns `src/vena/segmentation/data/` only.
 
+## 🔧 ITER-9 HARNESS ADDENDUM (2026-07-23)
+
+**Parallel-launch.** SEG track, **fully unblocked** — build NOW.
+**🔴 CROSS-COHORT DEDUP (new leakage vector — load-bearing).** The FM corpus deduplicates patients shared across
+cohorts (UCSF-PDGM / UPENN-GBM ↔ BraTS-GLI; see `[[project_cohort_dedup]]`). The K-fold plan MUST respect it: a
+patient that is an FM-val/test case under one cohort must **NOT** appear in any segmenter training fold under its
+**duplicate** in another cohort — else an FM-test patient leaks into segmenter training. **Read the FM dedup source**
+(the dedup preflight decision + the corpus registry's dedup records) and **assert no dedup-duplicate of any FM-val/test
+id appears in any fold**, in addition to the direct-id check.
+**Reuse:** read FM splits from the ACTUAL `splits/{train,val,test}` in the H5 + `corpus_*.json` (never invent a split);
+`target_fn` defaults to `make_soft_targets` (task 12, **merged**); z-score via MONAI `NormalizeIntensityd(nonzero=True)`.
+
+**Sharper acceptance (all must hold):**
+1. `build_fold_plan` is **bit-identical** across two calls with the same `(sorted(ids), fold_seed, k)`; `folds`
+   pairwise disjoint; `⋃ folds == fm_train_ids` exactly.
+2. **No FM-val/test id in any fold** (direct) **AND no dedup-duplicate of an FM-val/test id in any fold** (transitive).
+3. `oof_assignment(fm_val_id) == "all_train"`; `oof_assignment(train_id) == that id's held-out fold index`.
+4. `SegImageDataset[i]` → `image (3,H,W,D)`, `target (2,H,W,D) ∈ [0,1]`, brain-z-score mean≈0/std≈1 over nonzero,
+   `patient_id` present; a soft target survives flip/affine **without binarisation** (stays in `[0,1]`).
+5. Modality-dropout zeros exactly one of {t2,flair} at rate ≈p; t1c never present.
+
+**Definition of done:** all 5 green incl. the **transitive-dedup leakage assert**; `FoldPlan` serialises to JSON for
+provenance; ruff-clean.
+
 ## Objective
 Build the **K-fold out-of-fold** split machinery (the free-ensemble backbone), the image-domain dataset serving
 `{t1pre, t2, flair}` (z-score-on-brain) + GT soft targets, and the augmentation pipeline. **Leakage is the enemy**:

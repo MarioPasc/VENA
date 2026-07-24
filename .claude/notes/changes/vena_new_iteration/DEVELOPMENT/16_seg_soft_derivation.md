@@ -2,6 +2,17 @@
 
 **Track/Wave/Deps.** SEG · **Wave 1 (parallel)** · deps: 10. Owns `src/vena/segmentation/derivation/` only.
 
+> **🔴 ITER-9 SUPERSEDES (2026-07-23) — read before using this spec (task 16 is MERGED; body kept as history).**
+> Two corrections to everything below:
+> 1. **Temperature is DROPPED from the pipeline (planning-decision Q5).** `temperature.py` was built + unit-tested,
+>    but the derived-map pipeline is now **SDT-σ → DML+CE → K-fold OOF mean → avg-pool**, with **NO temperature**.
+>    Calibration is *measured* (ECE/Brier, task 15) but *not corrected*. The S5/S6 integrator (task 17 `predict`,
+>    task 19 `_predicted_path` in `derive.py`) **must NOT call `apply_temperature`** — `temperature.py` stays as an
+>    unused utility (hygiene-delete when no live caller remains). Rationale: design **B.c banner + B.f-§2**
+>    (superseded); the σ that grades the map is shared with the SDT soft target so oracle≈predicted match.
+> 2. **Grid is `(48,56,48)`, NOT `(60,60,40)`.** Every `(2,60,60,40)` / `avg_pool` reference below is stale; the
+>    merged code + `01_SHARED_CONTRACTS.md` are canonical at `(2,48,56,48)` (crop `(192,224,192)`, stride 4).
+
 ## Objective
 The post-prediction pipeline that turns per-model logits into the **soft `[WT,NETC]` conditioning map on the latent
 grid `(2,60,60,40)`**: **per-class temperature scaling** → **avg-pool partial-volume** → **K-fold ensemble mean**

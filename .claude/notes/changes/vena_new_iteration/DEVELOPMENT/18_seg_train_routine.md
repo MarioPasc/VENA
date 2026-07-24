@@ -4,6 +4,27 @@
 `routines/segmentation/train/`. (The mask→latent-H5 write moved to **task 19**, which is source-agnostic and runs
 GT-first without the segmenter.)
 
+## 🔧 ITER-9 HARNESS ADDENDUM (2026-07-23)
+
+**Parallel-launch.** SEG Wave-2, after task 17; **no oracle dependency**.
+**🔴 TEMPERATURE DROPPED (Q5).** Remove `temperatures.json` from the artifacts and `T_TC`/`T_NETC` from `decision.json`.
+`decision.json` (segmenter schema — its own `schema_version`) carries: backbone arm, `fold`, ckpt SHA-256, `k_folds`,
+seed, corpus registry, `selection_metric`, and the per-cohort {TC,NETC} **Dice/AHD/ECE/Brier (incl. Ring B)** + the
+**ET=TC−NETC diagnostic** (reported). Calibration measured, not corrected — **no temperature fields**.
+**Reuse:** the routine pattern (`preflight-pattern.md`: one positional YAML arg, frozen Pydantic config `from_yaml`,
+`Engine.run()->Path`, no import-time side effects, `vena-segmentation-train` console script); `SegTrainer` (17);
+G-SEG (15); `routines/fm/train/` as the `decision.json` / CLI idiom reference.
+
+**Sharper acceptance (all must hold):**
+1. `RoutineConfig.from_yaml` round-trips; `cli.py` takes exactly one positional arg; importing the engine triggers no
+   CUDA and no checkpoint load.
+2. `smoke.yaml` trains fold 0 on a 4-patient synthetic subset in **< 5 min** → checkpoint + `decision.json` +
+   `fold_plan.json` (**NO `temperatures.json`**).
+3. `decision.json` carries the G-SEG table + ET diagnostic + fold + ckpt SHA + a `schema_version`; **no temperature
+   keys**; `fold` is a config field so a Picasso array trains the K+1 models as separate tasks.
+
+**Definition of done:** all 3 green, `decision.json` has no temperature fields, ruff-clean, console script registered.
+
 ## Objective
 A thin routine (`preflight-pattern.md`) that trains **one** segmenter model (a fold, or the `all_train` model) from
 a YAML, writing a checkpoint + fitted per-class temperatures + a `decision.json` with the per-cohort G-SEG report.

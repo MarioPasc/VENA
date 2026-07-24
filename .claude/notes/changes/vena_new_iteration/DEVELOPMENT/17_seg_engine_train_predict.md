@@ -3,6 +3,27 @@
 **Track/Wave/Deps.** SEG · **Wave 2 (sequential)** · deps: 11, 12, 13, 14, 16 (all merged). Owns
 `src/vena/segmentation/engine/{train.py,predict.py}` (NOT `loss.py` — that is task 13).
 
+## 🔧 ITER-9 HARNESS ADDENDUM (2026-07-23)
+
+**Parallel-launch.** SEG Wave-2, after the S4 leaves merge; **no oracle dependency** (runs while the oracle trains).
+**🔴 TEMPERATURE DROPPED (Q5) — correct the interface below.** `fit` **does NOT fit `T_WT`/`T_NETC`** and stores no
+temperatures; it **measures** ECE/Brier (task 15) and stores them for reporting only. `predict_oof` = **ensemble-mean
+only** (no `apply_temperature`). When calling `derive.py::_predicted_path` (task 16, merged) **skip the temperature
+step** (see task 16's superseding banner). Calibration is measured, not corrected.
+**Reuse (import, do NOT reinvent):** `make_soft_targets` (12), `pool_to_latent`/`ensemble_soft` (16, temperature-free),
+`SegmentationLoss` (13), `FoldPlan`/`SegImageDataset`/`oof_assignment` (14), G-SEG metrics (15), and the FM Lightning
+idioms in `src/vena/model/fm/lightning/module.py` for EMA / grad-clip logging / CSV metrics / `logs/train.log`.
+
+**Sharper acceptance (all must hold):**
+1. `SegTrainer(cfg, fold=0).fit()` on an 8-patient synthetic fixture: train loss **strictly decreases** (final <
+   initial by a stated margin); run dir has ckpt + `fold_plan.json` + metrics CSV (readback). **NO `temperatures.json`.**
+2. Overfit-tiny: train Dice → high on the fixture (wiring correct end-to-end).
+3. **OOF routing (load-bearing leakage assert):** `predict_oof` uses `all_train` for every FM-val/test id and the
+   correct held-out fold model for every FM-train id — **assert no patient is predicted by a model that trained on it.**
+4. Predictions soft `[TC,NETC] ∈ [0,1]`, image-res `(2,H,W,D)`; TTA (Málaga only) averages ≥2 augs, stays in `[0,1]`.
+
+**Definition of done:** all 4 green, **no temperature artifacts anywhere**, OOF-routing assert passes, ruff-clean.
+
 ## Objective
 Wire the leaves into a trainer and an inference path. **Train ONE model per invocation** (a given fold, or the
 `all_train` model) so the K+1 models fan out as a SLURM array; **predict** assembles the K-fold **ensemble mean**

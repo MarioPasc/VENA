@@ -2,6 +2,27 @@
 
 **Track/Wave/Deps.** SEG · **Wave 1 (parallel)** · deps: 10. Owns `src/vena/segmentation/engine/loss.py` only.
 
+## 🔧 ITER-9 HARNESS ADDENDUM (2026-07-23)
+
+**Parallel-launch.** SEG track, **fully unblocked** (no checkpoint, no oracle dependency) — build NOW.
+**Temperature drop (Q5) does NOT change this task:** DML+CE is unchanged (Part B.a). But because post-hoc temperature
+scaling was dropped, **focal-CE is now the PRIMARY training-time calibration lever** — keep `focal_gamma`
+config-selectable; expect an S5 ablation DML+CE vs focal-CE-DML on ECE. (B.f-§2 is superseded for *derivation*; the
+loss code is unaffected.)
+**Reuse:** import `make_soft_targets` from `vena.segmentation.targets` (task 12, **merged**) for the real-mask test;
+reuse MONAI `TverskyLoss`/`FocalLoss` where correct, but **implement DML explicitly** (MONAI's Dice is improper on
+soft labels — assert this improperness in a test so the reason DML exists is pinned).
+
+**Sharper acceptance (all numeric; all must hold):**
+1. `dice_semimetric_loss(hard) == 1 − soft_dice(hard)` to **rtol=1e-5** (independent inline soft-Dice reference).
+2. On soft targets: DML finite, non-negative, minimal at `probs==target`, strictly increasing under perturbation
+   (state the exact Wang-2023 semimetric symmetry property you test).
+3. `SegmentationLoss.forward` → scalar with finite grad; **grad ≈ 0 at a perfect prediction** (within tol).
+4. Deep-sup: a 2-head stub → weighted sum matches a hand computation exactly.
+5. Tversky `alpha<beta`: an FN-heavy pred incurs strictly larger loss than an equal-count FP-heavy pred.
+
+**Definition of done:** all 5 green; DML/CE/Tversky are free-standing module-level functions (rule 16); ruff-clean.
+
 ## Objective
 Implement the composite segmentation loss: **DML (Dice Semimetric Loss, Wang MICCAI 2023) + CE**, the
 soft-label-**proper** replacement for soft-Dice, with optional **focal-CE** and **Tversky / focal-Tversky** Dice

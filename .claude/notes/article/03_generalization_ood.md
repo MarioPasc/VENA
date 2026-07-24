@@ -20,7 +20,9 @@ Ring A → Ring B; (ii) **pediatric (BraTS-PED)** is the largest drop for every
 method (adult-trained); (iii) the **tier gap persists OOD** (image tier still
 leads whole-brain); (iv) *open sub-question*: does the oracle mask (`v3b-rw`)
 help **more** OOD (anatomy less reliable) or **less** (mask still perfect)?
-— report whichever the data shows.
+— report whichever the data shows; (v) **[iter-9] the deployable (predicted-mask)
+arm degrades MORE than the oracle OOD** — the *segmenter* is the OOD ceiling
+(coupled segmenter+generator failure, an unstudied open problem; see T3.6).
 
 ## 2. Design
 
@@ -57,6 +59,12 @@ method break" map.
 **Table 3C — shift-penalty (supp).** ΔMAE vs UCSF-PDGM per method per cohort;
 sort cohorts by mean penalty (expected: PED worst).
 
+**Table 3D — oracle→predicted gap by ring (supp, iter-9).** Rows = {v3a, T-06
+predicted-mask, T-13 oracle-mask}; columns = PSNR_ET × {Ring A, Ring B} + the
+oracle−predicted gap. Paired with the segmenter's Ring-B TC/NETC Dice/ECE so the
+reader sees the **generator-vs-segmenter split of the OOD penalty** — how much of
+the deployable OOD drop is the generator failing vs the segmenter failing.
+
 ## 5. Figures
 
 **Fig 3 — degradation ladder.** x = cohorts ordered by increasing shift severity
@@ -84,3 +92,11 @@ and where distributions overlap.
 - [ ] **T3.3** Table 3C shift-penalty; confirm PED is worst.
 - [ ] **T3.4** Fig 3 degradation ladder + violin supp.
 - [ ] **T3.5** Report the oracle-mask-OOD sub-question outcome (helps more/less).
+- [ ] **T3.6** [iter-9, first-class contribution] **Oracle→predicted gap PER RING.**
+  Report `PSNR_ET(T-13 oracle) − PSNR_ET(T-06 predicted)` stratified by Ring A vs
+  Ring B (never pooled). Overlay the segmenter's **Ring-B TC/NETC error
+  distribution** (Dice/AHD/ECE on Ring-B GT) to quantify the coupled failure: how
+  much of the OOD synthesis drop is the *generator* vs the *segmenter*. Frame the
+  decomposition = localisation (segmenter) + intensity (generator); note T-13's
+  oracle mask leaks post-contrast (ceiling, not deployable). Source:
+  `../changes/vena_new_iteration/segmenter_conditioning_design.md` A.8-§7.

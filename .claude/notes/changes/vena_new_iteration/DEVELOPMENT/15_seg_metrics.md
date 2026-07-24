@@ -13,6 +13,33 @@ authority: Part B.b, **B.f-§2, B.f-§7**.
 > G-SEG gate is therefore a **TC-Dice** gate (`cfg.gseg_tc_dice`), NOT WT-Dice. **TC is harder to segment than WT**
 > (BraTS TC Dice ~0.80-0.87 vs WT ~0.88-0.92), so the `0.75` default is **PROVISIONAL** — re-derive it from the
 > measured per-cohort TC Dice in S5 before trusting the gate. See `[[project_channel0_tumor_core_not_wt]]`.
+> (Stale "WT-volume" in the healthy-control test at line ~65 means **TC-volume**.)
+
+> **🔴 ITER-9 ADDITIONS (2026-07-23).** (a) **ECE/Brier are still MEASURED here, not corrected** — planning-decision
+> Q5 dropped temperature scaling from the *derivation* (task 16), but calibration is still *reported* (that is the
+> whole point of measuring it); `calibration.py` is unchanged and the dual DSC+Brier selection stays. (b) **Add
+> `ET = TC − NETC` as a reported diagnostic** in `overlap.py`: ET-Dice + mean soft-value in the ET shell, alongside
+> the per-class TC/NETC metrics — ET is the load-bearing quantity the generator must enhance, so NETC miscalibration
+> that corrupts it must be *visible* (design B.c). ET is **reported-for-visibility, NOT part of the G-SEG gate**
+> (gate stays TC ∧ NETC). (c) The per-cohort TC/NETC Dice/AHD/ECE this module emits **feed the T3.6 coupled-failure
+> analysis** (`../../article/03_generalization_ood.md`): the Ring-B error distribution is what quantifies how much of
+> the deployable OOD synthesis drop is the *segmenter* vs the *generator* (planning-decision Q6).
+
+## 🔧 ITER-9 HARNESS ADDENDUM (2026-07-23)
+
+**Parallel-launch.** SEG track, **fully unblocked** — build NOW.
+**Sharper acceptance (all numeric; all must hold):**
+1. `dice`: identical=1.0, disjoint=0.0, a hand-built 50%-overlap = the hand value; AHD of identical = 0.
+2. `expected_calibration_error` ≈ 0 on perfectly-calibrated synthetic bins; strictly > 0 when skewed overconfident;
+   `brier` matches the closed-form on a 3-value example; **all calibration metrics on RAW soft probs, never thresholded**.
+3. `check_gseg`: dict at exactly {TC:0.75, NETC:0.50} passes; {NETC:0.49} fails and lists `(cohort, "netc", 0.49)`;
+   an all-zero pred on a healthy control flags the **TC-volume** check (not Dice).
+4. `select_ensemble` picks better-Brier within 1% DSC, else better-DSC (two numeric cases).
+5. **ET diagnostic (Q5):** add `et_diagnostic(pred, target)` returning ET-Dice (`ET = clip(TC − NETC, 0, 1)`) + the
+   mean soft-value in the ET shell — **reported, NOT part of the G-SEG gate**.
+
+**Definition of done:** all 5 green; ECE/Brier are MEASURED (no temperature correction anywhere — that lived in task
+16 and is dropped); ruff-clean.
 
 ## Read and verify first
 - `01_SHARED_CONTRACTS.md`; `MetricsConfig` from task 10.
