@@ -20,8 +20,14 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
-#SBATCH --constraint=dgx
-#SBATCH --gres=gpu:A100:1
+#SBATCH --partition=gpu_partition
+# A100 selector: exa01-04 advertise UNTYPED `Gres=gpu:8` and carry the `a100`
+# feature; only the B200 nodes (blk01-02) publish a typed `gpu:B200:8`.
+# `--gres=gpu:A100:1` therefore matches NOTHING (verified: sbatch --test-only
+# -> "Requested node configuration is not available"), and a bare
+# `--constraint=dgx` matches B200 too since both node types carry `dgx`.
+#SBATCH --constraint=a100
+#SBATCH --gres=gpu:1
 
 set -euo pipefail
 
