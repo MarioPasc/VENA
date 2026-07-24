@@ -16,19 +16,26 @@ from vena.segmentation.metrics.overlap import average_hausdorff, dice, et_diagno
 # ---------------------------------------------------------------------------
 # Task-40: visualisation helpers (do NOT reorder or remove)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Task-17 (DEVELOPMENT): prediction panel for segmenter training callbacks
+# ---------------------------------------------------------------------------
 from vena.segmentation.metrics.visualize import (
+    PanelRow,
     PatientView,
     compute_mask_stats,
     compute_residual_energy_ratio,
     render_injection_sanity,
     render_latent_embedding,
     render_mask_qc,
+    render_prediction_panel,
     render_slice_montage,
+    sort_panel_rows,
 )
 
 __all__: list[str] = [
     "GSegResult",
     "ModelScore",
+    "PanelRow",
     "PatientView",
     "average_hausdorff",
     "brier",
@@ -42,6 +49,8 @@ __all__: list[str] = [
     "render_injection_sanity",
     "render_latent_embedding",
     "render_mask_qc",
+    "render_prediction_panel",
     "render_slice_montage",
     "select_ensemble",
+    "sort_panel_rows",
 ]

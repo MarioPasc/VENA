@@ -1067,6 +1067,336 @@ def render_latent_embedding(
     return path
 
 
+# ---------------------------------------------------------------------------
+# Prediction panel — per-patient, sorted by metric (Task-15 / DEVELOPMENT-17)
+# ---------------------------------------------------------------------------
+
+# Figure-size constants for render_prediction_panel.
+_PANEL_FIG_COL_WIDTH: float = 1.8  # inches per column in the prediction panel
+_PANEL_FIG_ROW_HEIGHT: float = 2.2  # inches per row in the prediction panel
+_PANEL_LABEL_FONTSIZE: int = 7  # font size for row labels and column titles
+# Annotation appended to the row label when gt_hard[0] is entirely zero.
+# Two of twelve QC'd UCSF patients are 100 % edema; their GT TC is empty.
+_PANEL_EMPTY_TC_LABEL: str = "(no TC — edema only)"
+
+
+@dataclass(frozen=True)
+class PanelRow:
+    """Per-patient data bundle for :func:`render_prediction_panel`.
+
+    Attributes
+    ----------
+    patient_id : str
+        Identifier shown in row labels.
+    anatomy : np.ndarray
+        Background volume, shape ``(H, W, D)``, float.  Used as greyscale
+        backdrop for every slice cell.  Typically z-scored T1pre.
+    gt_hard : np.ndarray
+        Hard ground-truth binary map, shape ``(2, H, W, D)``.
+        Channel 0 = TC (tumour core = NETC + ET, edema excluded),
+        channel 1 = NETC.
+    pred_soft : np.ndarray
+        Predicted soft-probability map, shape ``(2, H, W, D)``, float32 in
+        ``[0, 1]``.  Channel 0 = TC, channel 1 = NETC.
+    metric : float
+        Performance metric used to rank rows (descending = best on top).
+    metric_name : str
+        Human-readable metric name shown in row labels.  Default ``"dice_tc"``.
+    """
+
+    patient_id: str
+    anatomy: np.ndarray
+    gt_hard: np.ndarray
+    pred_soft: np.ndarray
+    metric: float
+    metric_name: str = "dice_tc"
+
+
+def sort_panel_rows(rows: list[PanelRow]) -> list[PanelRow]:
+    """Sort panel rows descending by :attr:`PanelRow.metric`; tie-break by patient_id.
+
+    Parameters
+    ----------
+    rows : list[PanelRow]
+        Unsorted patient bundles.
+
+    Returns
+    -------
+    list[PanelRow]
+        Rows ordered best (highest metric) → worst, stable on patient_id ties.
+    """
+    return sorted(rows, key=lambda r: (-r.metric, r.patient_id))
+
+
+def _axial_gt_slices(hard_tc: np.ndarray, n_cols: int) -> np.ndarray:
+    """Return *n_cols* depth indices covering the GT TC lesion extent.
+
+    Unlike :func:`_axial_tumor_slices`, this helper accepts a single binary
+    channel ``(H, W, D)`` rather than a 2-channel soft map, and is designed
+    specifically for the hard GT TC mask used in :func:`render_prediction_panel`.
+    When the TC mask is entirely empty (edema-only patient), indices span the
+    full depth axis so the function never raises.
+
+    Parameters
+    ----------
+    hard_tc : np.ndarray
+        Shape ``(H, W, D)``, binary bool or uint8; channel 0 of ``gt_hard``.
+    n_cols : int
+        Number of slice indices to return.
+
+    Returns
+    -------
+    np.ndarray
+        1-D int array of length *n_cols*, depth indices along axis 2.
+    """
+    depth_presence = hard_tc.astype(bool).any(axis=(0, 1))  # (D,) bool
+    z_tc = np.where(depth_presence)[0]
+    if len(z_tc) == 0:
+        # Fall back to evenly-spaced indices over the full depth extent.
+        d = hard_tc.shape[2]
+        return np.linspace(0, d - 1, n_cols, dtype=int)
+    return np.linspace(z_tc[0], z_tc[-1], n_cols, dtype=int)
+
+
+def _validate_panel_rows(rows: list[PanelRow]) -> None:
+    """Raise :class:`SegMetricError` for empty input or per-row shape violations.
+
+    Parameters
+    ----------
+    rows : list[PanelRow]
+        Patient bundles to validate.
+
+    Raises
+    ------
+    SegMetricError
+        If *rows* is empty, or any row has wrong channel count (must be 2) or
+        a spatial shape mismatch between ``anatomy``, ``gt_hard``, and
+        ``pred_soft``.
+    """
+    if len(rows) == 0:
+        raise SegMetricError("rows is empty; cannot render prediction panel")
+    for row in rows:
+        anat = _to_numpy(row.anatomy)
+        gt = _to_numpy(row.gt_hard)
+        pred = _to_numpy(row.pred_soft)
+        pid = row.patient_id
+        if gt.ndim != 4 or gt.shape[0] != 2:
+            raise SegMetricError(f"PanelRow({pid}): gt_hard must be (2, H, W, D); got {gt.shape}")
+        if pred.ndim != 4 or pred.shape[0] != 2:
+            raise SegMetricError(
+                f"PanelRow({pid}): pred_soft must be (2, H, W, D); got {pred.shape}"
+            )
+        spatial = gt.shape[1:]
+        if anat.ndim != 3 or anat.shape != spatial:
+            raise SegMetricError(
+                f"PanelRow({pid}): anatomy {anat.shape} does not match "
+                f"gt_hard spatial dims {spatial}"
+            )
+        if pred.shape[1:] != spatial:
+            raise SegMetricError(f"PanelRow({pid}): pred_soft {pred.shape} != gt_hard {gt.shape}")
+
+
+def render_prediction_panel(
+    rows: list[PanelRow],
+    out_path: Path,
+    *,
+    n_cols: int = 10,
+    title: str = "",
+    gt_alpha: float = 0.6,
+    soft_alpha: float = 0.6,
+    gt_color: tuple[float, float, float] = (0.55, 0.0, 0.0),
+    tc_cmap: str = "YlGn",
+    netc_cmap: str = "RdPu",
+    dpi: int = 120,
+) -> Path:
+    """Produce a ranked prediction-panel figure for segmenter quality assessment.
+
+    Rows are patients, sorted **descending** by :attr:`PanelRow.metric`
+    (best first) via :func:`sort_panel_rows`.  Columns are axial slices
+    sampled from the GT TC lesion extent of each patient, identified by
+    :func:`_axial_gt_slices`.  Each cell shows:
+
+    1. Anatomy (greyscale backdrop; per-slice ``(vmin, vmax)`` window anchored
+       to the real anatomy slice so intensity is comparable across cells).
+    2. Hard GT TC mask (``gt_color``, ``gt_alpha``) — rendered **under** the
+       soft predictions.  Dark red bleeding through where the model assigns
+       little probability is a **false negative**: the ground truth says
+       tumour but the prediction does not.  This is the single most
+       informative signal during training and must not be hidden.  Order
+       also matches the user specification ("overlap the GT mask ..., and
+       the soft probability mask").
+    3. Predicted TC soft-probability (``tc_cmap``, ``soft_alpha``) — channel 0
+       of ``pred_soft``; YlGn (yellow → dark-green) by default.
+    4. Predicted NETC soft-probability (``netc_cmap``, ``soft_alpha``) — channel
+       1 of ``pred_soft``; RdPu (light-pink → dark-magenta) by default.
+    5. Probability contour rings at {0.25, 0.5, 0.75} on both channels
+       (topmost), so boundary probability levels remain legible when both
+       colormaps overlap.  TC contours use ``_WT_COLOR`` (green); NETC use
+       ``_NETC_COLOR`` (magenta).
+
+    The TC and NETC soft layers use perceptually distinct colormaps (YlGn vs
+    RdPu) plus matching contours, ensuring both channels remain distinguishable
+    even when composited on the same cell.
+
+    **Degenerate patients** (GT TC entirely empty, i.e. edema-only) render
+    without raising: slice indices fall back to the full depth extent and the
+    row label is annotated with :data:`_PANEL_EMPTY_TC_LABEL`.  Patients with
+    fewer than *n_cols* tumour-bearing slices are handled by
+    :func:`_axial_gt_slices` via linear interpolation over the available extent
+    (endpoints may repeat without raising).
+
+    Parameters
+    ----------
+    rows : list[PanelRow]
+        Per-patient data bundles.  Must be non-empty.
+    out_path : Path
+        Output PNG path; parent directories are created automatically.
+    n_cols : int
+        Number of axial slice columns.  Default 10.
+    title : str
+        Optional figure suptitle.  Default ``""`` (no suptitle).
+    gt_alpha : float
+        Opacity of the hard GT TC overlay.  Default 0.6.
+    soft_alpha : float
+        Opacity of the predicted TC and NETC soft overlays.  Default 0.6.
+    gt_color : tuple[float, float, float]
+        RGB colour for the hard GT overlay.  Default dark red ``(0.55, 0, 0)``.
+    tc_cmap : str
+        Matplotlib colormap name for the predicted TC channel.  Default
+        ``"YlGn"``.
+    netc_cmap : str
+        Matplotlib colormap name for the predicted NETC channel.  Default
+        ``"RdPu"``.
+    dpi : int
+        Output resolution.  Default 120.
+
+    Returns
+    -------
+    Path
+        *out_path* after writing.
+
+    Raises
+    ------
+    SegMetricError
+        If *rows* is empty, or any row has wrong channel count or spatial
+        shape mismatch between ``anatomy``, ``gt_hard``, and ``pred_soft``.
+    """
+    _validate_panel_rows(rows)
+    ordered = sort_panel_rows(rows)
+    n_rows = len(ordered)
+
+    tc_cm = plt.get_cmap(tc_cmap)
+    netc_cm = plt.get_cmap(netc_cmap)
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(n_cols * _PANEL_FIG_COL_WIDTH, n_rows * _PANEL_FIG_ROW_HEIGHT),
+    )
+    fig.patch.set_facecolor("black")
+
+    # Normalise axes to always be a 2-D array (n_rows × n_cols)
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = axes[np.newaxis, :]
+    elif n_cols == 1:
+        axes = axes[:, np.newaxis]
+
+    for r, row in enumerate(ordered):
+        anat = _to_numpy(row.anatomy)
+        gt_hard = _to_numpy(row.gt_hard).astype(np.float32)
+        pred_soft = _to_numpy(row.pred_soft)
+
+        is_empty_tc = not gt_hard[0].astype(bool).any()
+        z_indices = _axial_gt_slices(gt_hard[0], n_cols=n_cols)
+
+        # Build the row label (patient id + optional edema annotation + metric)
+        row_label_parts = [row.patient_id]
+        if is_empty_tc:
+            row_label_parts.append(_PANEL_EMPTY_TC_LABEL)
+        row_label_parts.append(f"{row.metric_name}={row.metric:.3f}")
+        row_label = "\n".join(row_label_parts)
+
+        for c_idx, k in enumerate(z_indices):
+            k = int(k)
+            ax = axes[r, c_idx]
+            ax.set_facecolor("black")
+
+            # --- 1. Anatomy backdrop (greyscale; per-slice window) ---
+            anat_sl = anat[:, :, k]
+            v0 = float(anat_sl.min())
+            v1 = float(anat_sl.max())
+            if v1 <= v0:
+                v0, v1 = 0.0, 1.0
+            ax.imshow(np.rot90(anat_sl), cmap="gray", vmin=v0, vmax=v1)
+
+            # --- 2. Hard GT TC (dark red, UNDER the soft predictions) ---
+            # Dark red bleeding through is a false negative: GT says tumour
+            # but the model assigned little probability there.  This is the
+            # most diagnostic signal during training and must not be hidden.
+            gt_tc_sl = np.rot90(gt_hard[0, :, :, k])
+            ax.imshow(_overlay_rgba(gt_tc_sl, gt_color, gt_alpha))
+
+            # --- 3. Predicted TC soft (YlGn cmap, over GT layer) ---
+            tc_sl = np.rot90(pred_soft[0, :, :, k])
+            ax.imshow(_overlay_cmap_rgba(tc_sl, tc_cm, soft_alpha))
+
+            # --- 4. Predicted NETC soft (RdPu cmap, on top of TC layer) ---
+            netc_sl = np.rot90(pred_soft[1, :, :, k])
+            ax.imshow(_overlay_cmap_rgba(netc_sl, netc_cm, soft_alpha))
+
+            # --- 5. Probability contours (topmost) on both channels ---
+            _add_contours(ax, tc_sl, _WT_COLOR)
+            _add_contours(ax, netc_sl, _NETC_COLOR)
+
+            ax.axis("off")
+
+            # Column title (z-index) centred above each top-row cell.
+            if r == 0:
+                ax.set_title(f"z={k}", color="white", fontsize=_PANEL_LABEL_FONTSIZE)
+            # Row label as an in-cell text annotation on the leftmost column.
+            # Using ax.text instead of set_title avoids the collision in cell
+            # (r=0, c_idx=0) where both a column title and a row label
+            # otherwise compete for the same set_title slot.
+            if c_idx == 0:
+                ax.text(
+                    0.02,
+                    0.98,
+                    row_label,
+                    transform=ax.transAxes,
+                    color="white",
+                    fontsize=_PANEL_LABEL_FONTSIZE,
+                    ha="left",
+                    va="top",
+                    bbox={
+                        "boxstyle": "round,pad=0.1",
+                        "facecolor": "black",
+                        "alpha": 0.55,
+                        "linewidth": 0,
+                    },
+                )
+
+    if title:
+        fig.suptitle(title, color="white", fontsize=10)
+
+    fig.tight_layout(pad=0.3)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    logger.debug(
+        "render_prediction_panel -> %s  rows=%d  cols=%d",
+        out_path,
+        n_rows,
+        n_cols,
+    )
+    return out_path
+
+
+__all__ += ["PanelRow", "render_prediction_panel", "sort_panel_rows"]
+
+
 def render_injection_sanity(
     module: Any,
     batch: dict[str, Any],
