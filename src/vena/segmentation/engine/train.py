@@ -156,6 +156,54 @@ def _build_tumour_crop_transform(patch_size: tuple[int, int, int]) -> Any:
     )
 
 
+def build_presample_crop(cfg: SegmentationConfig) -> Any:
+    """Tumour-aware crop applied INSIDE the dataset, before augmentation.
+
+    Operates on the pre-stack sample dict, where each modality is ``(H, W, D)``
+    with no channel axis and ``target`` is ``(2, H, W, D)``.  Channel axes are
+    added for the crop and squeezed afterwards so the dataset's downstream
+    stacking is unchanged -- the same convention
+    :func:`~vena.segmentation.data.augment.build_augmentation` uses.
+
+    Cropping here rather than after the DataLoader is what makes the run fit its
+    wallclock: measured, the augmentation pipeline costs 2.38 s on a native
+    ``(240, 240, 155)`` volume and 0.20 s on a ``(96, 96, 96)`` patch.
+
+    Parameters
+    ----------
+    cfg:
+        Frozen config; reads ``cfg.data.modalities`` and ``cfg.data.patch_size``.
+
+    Returns
+    -------
+    Any
+        A MONAI ``Compose`` mapping sample dict -> cropped sample dict.
+    """
+    from monai.transforms import Compose, EnsureChannelFirstd, RandCropByPosNegLabeld, SqueezeDimd
+
+    mods = list(cfg.data.modalities)
+    # Only the bare (H, W, D) keys need a channel axis. "target" is already
+    # (2, H, W, D) and the dataset builds "label_tc" as (1, H, W, D); adding a
+    # second axis to either makes MONAI read 4 spatial dims and raise
+    # "Sequence must have length 4, got 3".
+    single = [*mods, "brain"]
+    return Compose(
+        [
+            EnsureChannelFirstd(keys=single, channel_dim="no_channel"),
+            RandCropByPosNegLabeld(
+                keys=[*mods, "target", "brain"],
+                label_key="label_tc",
+                spatial_size=cfg.data.patch_size,
+                pos=_CROP_POS,
+                neg=_CROP_NEG,
+                num_samples=1,
+                allow_smaller=True,
+            ),
+            SqueezeDimd(keys=[*mods, "brain"], dim=0),
+        ]
+    )
+
+
 def _crop_one_sample(
     image: Tensor,
     target: Tensor,
@@ -215,14 +263,24 @@ class _CropCollate:
     therefore usable with ``num_workers > 0``.
     """
 
-    def __init__(self, transform: Any) -> None:
+    def __init__(self, transform: Any, patch_size: tuple[int, int, int] | None = None) -> None:
         self._transform = transform
+        self._patch_size = tuple(patch_size) if patch_size is not None else None
 
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
         from torch.utils.data._utils.collate import default_collate
 
         cropped: list[dict[str, Any]] = []
         for s in samples:
+            # The dataset normally crops already (cheaper: augmentation then runs
+            # on the patch). Re-cropping would be wasted work, so pass through
+            # when the sample is at patch size. This still guarantees uniform
+            # shapes for datasets that do NOT crop -- injected test doubles, and
+            # any future caller -- which is what stops default_collate blowing up
+            # on cohorts with different native shapes.
+            if self._patch_size is not None and tuple(s["image"].shape[-3:]) == self._patch_size:
+                cropped.append(s)
+                continue
             out = _crop_one_sample(s["image"], s["target"], s.get("brain"), self._transform)
             passthrough = {k: v for k, v in s.items() if k not in ("image", "target", "brain")}
             cropped.append({**passthrough, **{k: out[k] for k in ("image", "target", "brain")}})
@@ -529,11 +587,17 @@ class SegTrainer:
             )
         from vena.segmentation.data.dataset import SegImageDataset
 
+        # Crop only on the training split, and inside the dataset so the
+        # augmentation pipeline sees a patch (2.38 s -> 0.20 s per sample).
+        # Validation deliberately keeps the full volume: it is scored with
+        # whole-volume sliding-window inference so the numbers stay comparable
+        # to the G-SEG gate.
         return SegImageDataset(
             ids=scan_ids,
             cfg=cfg.data,
             augment=augment,
             target_cfg=cfg.targets,
+            crop_transform=build_presample_crop(cfg) if augment else None,
         )
 
     # ------------------------------------------------------------------
@@ -883,7 +947,7 @@ class SegTrainer:
             pin_memory=(dev_type == "cuda"),
             drop_last=False,
             persistent_workers=_pw,
-            collate_fn=_CropCollate(crop_transform),
+            collate_fn=_CropCollate(crop_transform, cfg.data.patch_size),
         )
         val_loader = DataLoader(
             val_ds,

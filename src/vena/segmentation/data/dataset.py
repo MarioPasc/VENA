@@ -283,6 +283,13 @@ class SegImageDataset(Dataset):
         Pre-built augmentation callable.  If ``None`` and ``augment=True``,
         :func:`~vena.segmentation.data.augment.build_augmentation` is called
         with ``cfg`` at construction time.
+    crop_transform:
+        Optional MONAI dict-transform applied to the per-modality sample
+        **before** *augmentation_pipeline*.  Supplied by the trainer for the
+        training split so spatial augmentation runs on a patch rather than the
+        full native volume (12x cheaper -- see :meth:`__getitem__`).  ``None``
+        (validation / inference) leaves the full volume intact for
+        sliding-window evaluation.
     id_index:
         Optional pre-built ``{patient_id: (h5_path, row_index)}`` mapping.
         When provided, the corpus registry is not read.  Useful for injecting
@@ -299,11 +306,15 @@ class SegImageDataset(Dataset):
         target_cfg: TargetConfig | None = None,
         augmentation_pipeline: Callable | None = None,
         id_index: dict[str, tuple[Path, int]] | None = None,
+        crop_transform: Callable | None = None,
     ) -> None:
         self._ids: tuple[str, ...] = tuple(ids)
         self._cfg = cfg
         self._augment = augment
         self._target_fn = target_fn
+        # Applied BEFORE the augmentation pipeline so the expensive spatial
+        # transforms operate on a patch, not the full native volume.
+        self._crop_transform = crop_transform
 
         # Resolve target config — import here to avoid circular at module level
         if target_cfg is None:
@@ -394,6 +405,20 @@ class SegImageDataset(Dataset):
             "target": target,
             "brain": brain,
         }
+
+        # Tumour-aware crop FIRST, then augment the patch.
+        #
+        # Order is load-bearing for throughput, not just tidiness: measured on a
+        # native (240,240,155) volume the augmentation pipeline costs 2.38 s,
+        # versus 0.20 s on a (96,96,96) patch -- 12x. Augmenting before cropping
+        # made an epoch 24.4 min instead of 6.0 min, so a 300-epoch run needed
+        # 122 h against a 48 h wallclock and could never even reach its own
+        # early-stopping criterion.
+        if self._crop_transform is not None:
+            sample["label_tc"] = (np.asarray(sample["target"])[0:1] > 0.5).astype(np.float32)
+            cropped = self._crop_transform(sample)
+            sample = cropped[0] if isinstance(cropped, list) else cropped
+            sample.pop("label_tc", None)
 
         # Apply augmentation pipeline (intensity + spatial + dropout)
         if self._pipeline is not None:

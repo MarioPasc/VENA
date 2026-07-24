@@ -812,3 +812,79 @@ class TestBuildIdIndexBugRegressions:
 
         index = _build_id_index(reg_path, tmp_path)
         assert set(index.keys()) == set(scan_ids)
+
+
+class TestCropBeforeAugment:
+    """The dataset must crop BEFORE augmenting when a crop transform is given.
+
+    Order is load-bearing for throughput: measured on a native (240,240,155)
+    volume the augmentation pipeline costs 2.38 s versus 0.20 s on a (96,96,96)
+    patch. Augmenting first made an epoch 24.4 min instead of ~6, so a 300-epoch
+    run needed 122 h against a 48 h wallclock and could never reach its own
+    early-stopping criterion.
+    """
+
+    pytestmark = pytest.mark.segmentation
+
+    def test_crop_transform_yields_patch_sized_sample(self, tmp_path) -> None:
+        from vena.segmentation.config import (
+            DataConfig,
+            ModelConfig,
+            SegmentationConfig,
+            TrainConfig,
+        )
+        from vena.segmentation.data.dataset import SegImageDataset
+        from vena.segmentation.engine.train import build_presample_crop
+
+        patch = (32, 32, 32)
+        ids = ["P0", "P1"]
+        h5_path = tmp_path / "c.h5"
+        _write_synthetic_h5(h5_path, ids, shape=(48, 52, 44))
+        data_cfg = DataConfig(
+            corpus_registry=tmp_path / "r.json",
+            image_h5_root=tmp_path,
+            patch_size=patch,
+            cache_rate=0.0,
+            num_workers=0,
+        )
+        cfg = SegmentationConfig(
+            model=ModelConfig(name="segresnet"),
+            data=data_cfg,
+            train=TrainConfig(
+                max_epochs=1, lr=1e-4, batch_size=1, val_every_epochs=1, early_stop_patience=1
+            ),
+        )
+        index = {pid: (h5_path, i) for i, pid in enumerate(ids)}
+        ds = SegImageDataset(
+            ids,
+            data_cfg,
+            augment=False,
+            id_index=index,
+            crop_transform=build_presample_crop(cfg),
+        )
+        s = ds[0]
+        assert tuple(s["image"].shape) == (3, *patch)
+        assert tuple(s["target"].shape) == (2, *patch)
+        assert tuple(s["brain"].shape) == (1, *patch)
+        # label_tc is scaffolding for the crop and must not leak downstream
+        assert "label_tc" not in s
+
+    def test_without_crop_transform_shape_is_native(self, tmp_path) -> None:
+        """Validation path keeps the full volume for sliding-window scoring."""
+        from vena.segmentation.config import DataConfig
+        from vena.segmentation.data.dataset import SegImageDataset
+
+        native = (48, 52, 44)
+        ids = ["P0", "P1"]
+        h5_path = tmp_path / "c.h5"
+        _write_synthetic_h5(h5_path, ids, shape=native)
+        data_cfg = DataConfig(
+            corpus_registry=tmp_path / "r.json",
+            image_h5_root=tmp_path,
+            patch_size=(32, 32, 32),
+            cache_rate=0.0,
+            num_workers=0,
+        )
+        index = {pid: (h5_path, i) for i, pid in enumerate(ids)}
+        ds = SegImageDataset(ids, data_cfg, augment=False, id_index=index)
+        assert tuple(ds[0]["image"].shape) == (3, *native)

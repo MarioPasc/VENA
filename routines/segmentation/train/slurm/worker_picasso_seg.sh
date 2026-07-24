@@ -16,7 +16,10 @@
 #     --export=ALL,REPO_DIR=...,ARM_CONFIG=...,LOGS_DIR=...
 # ============================================================================
 #SBATCH -J vena-seg-train
-#SBATCH --time=2-00:00:00
+# 3 days (skill: 3 standard / 7 max). Measured after the crop-before-augment
+# fix: ~5-9 min/epoch depending on Lustre contention, so 300 epochs lands
+# around 27-46 h. 48 h left no margin; SLURM bills actual use, not the request.
+#SBATCH --time=3-00:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
