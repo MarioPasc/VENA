@@ -17,6 +17,21 @@
 > enhancing region. Segmenter target (Phase 2) is TC, so the G-SEG WT-Dice gate must be re-set to a TC-Dice gate.
 > See `[[project_channel0_tumor_core_not_wt]]`.
 
+> **✅ VERIFIED (2026-07-24) — the oracle soft-mask cache is CORRECT; do not re-litigate it.** Full invariant
+> audit over **all 3,459 scans / 9 cohorts** (`scripts/mask_audit/`, Picasso array `1636104`):
+> **`recompute_max_abs = 0.0` in every cohort** — re-deriving from GT and re-pooling through the canonical
+> `apply_crop_pad` → `avg_pool3d(4)` path reproduces the cached `masks/tumor_latent_soft` **bit-exactly**.
+> `median_dice_tc_img = median_volratio_tc = 1.000` in all 9; nesting `NETC ≤ TC` holds everywhere; **zero**
+> violations of mass-conservation, continuity, or agreement with the independent `masks/tumor_latent` oracle.
+> Verdict `0 error · 2 FAIL · 196 WARN · 3,245 OK`. Two caveats that ARE real and must be carried forward:
+> **(a)** a TC below ~1-2 latent voxels (**≲130 image voxels**) cannot be represented on the `(48,56,48)`
+> conditioning grid at all — it drops below 0.5 everywhere after 4x pooling; **(b)** **BraTS-PED latent
+> fidelity is systematically degraded** (`median lat_iou_tc` **0.596** vs 0.82-0.86 for adult glioma
+> cohorts, **19.6% TC-empty**), and both FAILs are **defective BraTS-PED GT labels**, not pipeline bugs
+> (`dice_tc_img = 1.000`, `recompute = 0.0` on both). LUMIERE second-worst (0.735). **Report the
+> oracle→predicted gap PER COHORT in S6** — BraTS-PED's oracle ceiling is already lower.
+> See `[[project_mask_audit_2026_07_24]]` and `scripts/mask_audit/README.md`.
+
 ## Environment, paths, commands
 
 | What | Value |
@@ -92,6 +107,10 @@ Never `pip install -e .` from a worktree; the env is shared read-only.
 - Per-cohort latent H5 groups today: `latents/*` (per modality), `masks/tumor_latent` **`(N, 3, 48, 56, 48)`
   float32 = soft `[NETC, ED, ET]`**, `masks/brain_latent` `(N, 1, …)` int8 (when encoded). Root attrs incl.
   `vae_checkpoint_sha256`. The image-domain H5 carries `images/*`, `masks/{tumor,brain}`, `splits/*`, `metadata/*`.
+- **`masks/tumor_latent_soft` `(N, 2, 48, 56, 48)` float32 = soft `[TC, NETC]` — CACHED AND AUDITED on all 9
+  cohorts (3,459 scans), schema `2.1.0`, `tumor_region="tc"` attr, `mask_source="gt"`.** The oracle
+  `masks/tumor_latent` is byte-untouched beside it. Validated by `assert_latent_soft_mask_group_valid`
+  (9/9) plus the full invariant audit above. This is the group S2 serves via `data.mask_source: oracle_soft`.
 - **New group to add (task 18):** `masks/tumor_latent_pred` **`(N, 2, 48, 56, 48)`** float32 = soft `[TC, NETC]`
   predicted (channel 0 = tumour core, edema excluded), + a `predicted_mask_seg_sha256` root attr, + a
   `schema_version` bump. Written **beside**
@@ -158,13 +177,21 @@ src/vena/segmentation/
 Routines (task 18): `routines/segmentation/train/` (segmenter training) + `routines/segmentation/mask_predict/`
 (T-04 latent-H5 write). Console scripts `vena-segmentation-train`, `vena-segmentation-mask-predict`.
 
-## Model checkpoints for BrainSegFounder (needs a path — `[verify]` before task 11)
+## Model checkpoints for BrainSegFounder (LOCATED 2026-07-23 — pinned in `src/external/LINKS.md`)
 
-BSF = **SwinUNETR `feature_size=48`**, two **encoder-only** SSL checkpoints: **BraTS-SSL** (4-ch, tumour-aware —
-drop the T1ce slice, feed `[FLAIR,T1pre,T2]`, load `strict=False`) and **UKB-SSL** (T1-only, leak-free). Neither
-is a segmenter (decoder is trained from scratch). **Locate the checkpoint files** via `src/external/LINKS.md` or
-the BrainSegFounder release before task 11; if absent locally, task 11 reports the missing path as a BLOCKED
-premise rather than guessing. MONAI `SwinUNETR` + `SegResNet` are the library backbones (MONAI, Apache-2.0).
+BSF = **SwinUNETR `feature_size=48`**, **encoder-only** SSL (the decoder is trained from scratch). **Arm priority
+RE-PRIORITIZED 2026-07-23: UKB-SSL is the leak-free HEADLINE/PRIMARY; BraTS-SSL is the comparator** (supersedes the
+design's original "Arm A primary" — the generalization headline demands L3 purity).
+- **Arm B `bsf_swinunetr_ukb` (PRIMARY, leak-free)** — `.../BrainSegFounder_SSL_UKBiobank/64-gpu-model_bestValRMSE.pt`.
+  Healthy UK Biobank, **no BraTS patients, no T1ce** → removes the patient-overlap representation leak (BraTS-SSL saw
+  BraTS-GLI = a VENA CV cohort; **OOF cannot fix an SSL-stage leak**) and the contrast-exposure leak. Likely T1-focused →
+  **the 3-ch {T1pre,T2,FLAIR} input stem may not transfer** (deep blocks do); `load_bsf_encoder` lists the stem in
+  `skipped` if so. `strict=False`.
+- **Arm A `bsf_swinunetr_brats` (COMPARATOR)** — `.../BrainSegFounder_SSL_BraTS/model_bestValRMSE-fold{0..4}.pt` (5 folds,
+  4-ch tumour-aware; drop the T1ce slice → feed `[FLAIR,T1pre,T2]`, `strict=False`). Leaks BraTS-GLI images + T1ce → not
+  the headline; run it to quantify the leakage↔Dice trade-off.
+- **NEVER `BrainSegFounder_finetuned_BraTS/*`** — a supervised BraTS segmenter = L1+L2+L3 leakage at once.
+MONAI `SwinUNETR` + `SegResNet` are the library backbones (MONAI, Apache-2.0).
 
 ## Region semantics for the generator loss (task 21) — verify in `controlnet/losses/` + `lightning/module.py`
 

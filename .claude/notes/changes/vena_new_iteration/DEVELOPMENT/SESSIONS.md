@@ -308,6 +308,51 @@ on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note bel
   the SEG-track sessions left it at — nothing to re-verify from S1). **The row stays ☐ solely because the human
   mask-review gate (`masks_look_valid`) is unclosed** — that is the user's call and it gates the S2 GPU launch.
   **S2 is otherwise unblocked and may start as soon as the user closes the gate.**
+- **✅ FULL MASK INVARIANT AUDIT — 3,459 scans / 9 cohorts, job `1636104` (2026-07-24).** New tool
+  `scripts/mask_audit/` (`audit_cohort.py` worker + `flag_and_visualize.py` merge + `array_mask_audit.sh`
+  + `README.md` documenting every invariant and threshold). CPU array, 9 tasks, ~21 min wall.
+  **Result: 0 errors · 2 FAIL · 196 WARN (5.7%) · 16 INFO · 3,245 OK (93.8%).**
+  - **`recompute_max_abs = 0.0` in EVERY cohort** — re-deriving from GT and re-pooling through the
+    canonical `apply_crop_pad`→`avg_pool3d(4)` path reproduces the cache **bit-exactly on all 3,459
+    scans**. This is the definitive validation of derivation + registration + write.
+  - `median_dice_tc_img = 1.000` and `median_volratio_tc = 1.000` in **all 9** cohorts (hard GT ⊆ soft,
+    perfect volume calibration). **Zero** warnings for mass-conservation, volume-ratio, continuity, or
+    `oracle_tc_centroid_dist` — i.e. the new soft mask agrees with the independently-produced
+    `masks/tumor_latent` oracle everywhere. Continuity confirmed non-binary (`intermediate_frac` 0.005-0.025).
+  - Artifacts (hash-verified copy) → `/media/…/results/prior/tumor/gt/mask_audit_2026-07-24/`:
+    `audit_metrics_all.csv` (3,459 × ~45 metrics), `audit_flags.csv`, `per_cohort_summary.csv`,
+    `audit_summary.json`, `figures_index.csv`, `figures/` (**92 PNGs, ≥1 per cohort guaranteed**),
+    `per_cohort_metrics/`.
+- **🔴 AUDIT FINDING — BraTS-PED has systematically degraded latent mask fidelity (Ring-B OOD relevance).**
+  `median_lat_iou_tc = 0.596` vs **0.82-0.86** for every adult glioma cohort; `median_lat_centroid_dist`
+  0.494 vs 0.20-0.28; lowest `intermediate_frac` (0.0047); **51/260 (19.6%) TC-empty**. Mechanism:
+  pediatric brains are smaller and PED tumours frequently non-enhancing, so the tumour core occupies
+  far fewer of the (48,56,48) latent voxels. **LUMIERE is second-worst** (latIoU 0.735, 11 TC-empty) —
+  consistent with longitudinal post-treatment/resected timepoints. Both FAILs are BraTS-PED. **Carry into
+  S6/Q6:** the oracle→predicted gap must be reported per cohort, because BraTS-PED's *oracle* ceiling is
+  already materially lower than the adult cohorts'.
+- **🔴 AUDIT FINDING — 2 BraTS-PED GT labels are defective, not our pipeline.** `BraTS-PED-00186-000`
+  (TC = **102 vox** ≈1.6 latent voxels; `latIoU = 0.000` — the lesion is **sub-latent-resolution** and
+  vanishes entirely at the 0.5 threshold after 4x pooling; 80% of its mass outside `masks/brain_latent`)
+  and `BraTS-PED-00112-000` (TC 4943, 45% outside brain). **Both have `dice_tc_img = 1.000` and
+  `recompute_max_abs = 0.0`** — we faithfully reproduced whatever the GT said, so these are **GT
+  annotation / registration defects in BraTS-PED** (a stray label blob outside the brain parenchyma;
+  visually confirmed in `figures/BraTS-PED__FAIL__*.png`). BraTS-PED is `test_only`, so no training
+  contamination. **Also a general limit worth stating in the paper: a TC below ~1-2 latent voxels
+  (≲130 image vox) cannot be represented on the (48,56,48) conditioning grid at all.**
+- **⚠ Three methodology defects in my own audit thresholds, caught by dry-running on partial data before
+  the final report** (all documented in `scripts/mask_audit/README.md`):
+  1. A **false invariant**: "cached far-field == SDT floor" flagged **100%** of scans. `apply_crop_pad`
+     **zero-pads** outside the native volume, so `lat_tc_min == 0` legitimately; the floor holds only in
+     the un-padded interior (proof: a TC-empty scan's `lat_tc_max == floor` exactly). Check removed —
+     non-negativity is already covered by `lat_range_ok`.
+  2. **Global size strata confounded cohort effects with patient outliers** (small OOD cohorts flagged en
+     masse). Fixed → strata are `cohort × size-quartile`, adaptive bin count; cohort-level effects belong
+     in `per_cohort_summary.csv`.
+  3. **Robust z is hypersensitive on zero-inflated / tightly-concentrated metrics** (mass ratio ≈1,
+     brain-spill ≈0 ⇒ MAD→0 ⇒ trivial deviations score z>3.5; 67 + 44 spurious WARNs). Fixed → a scan is
+     flagged only when statistically unusual **AND** past a per-metric `MIN_EFFECT` (119→43 WARN on the
+     dry set). `max_z` now ranks on gated z only.
 
 ---
 
