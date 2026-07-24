@@ -51,7 +51,9 @@ loss:
 train:
   max_epochs: 2                # two epochs is enough to exercise the full loop
   lr: 1.0e-4
-  batch_size: 1
+  batch_size: 2                # MUST be >1: batch_size=1 never stacks two samples,
+                               # so it cannot catch the heterogeneous-native-shape
+                               # collate failure that killed jobs 1635802/1636072.
   optimizer: adamw
   scheduler: cosine
   amp: false                   # CPU smoke — AMP not applicable

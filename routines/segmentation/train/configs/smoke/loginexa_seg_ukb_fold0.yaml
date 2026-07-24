@@ -57,7 +57,9 @@ loss:
 train:
   max_epochs: 2               # capped to keep under 25-min wallclock
   lr: 1.0e-4
-  batch_size: 1               # V100 32 GB; patch_size 96³ → ~2.8 GB activations
+  batch_size: 2               # matches production. MUST be >1 — batch_size=1 never
+                              # stacks two samples, so it cannot reproduce the
+                              # cross-cohort collate failure (jobs 1635802/1636072).
   optimizer: adamw
   scheduler: cosine
   amp: true

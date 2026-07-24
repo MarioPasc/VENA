@@ -952,3 +952,132 @@ class TestAllTrainMode:
 
         assert isinstance(result, FitResult)
         assert result.checkpoint.exists()
+
+
+# ---------------------------------------------------------------------------
+# Heterogeneous native shapes across cohorts (regression, 2026-07-24)
+# ---------------------------------------------------------------------------
+
+
+class _HeteroShapeDataset(Dataset):
+    """Samples whose native volume shape differs per index, as real cohorts do.
+
+    Measured on the corpus: UCSF-PDGM is ``(240, 240, 155)`` while other cohorts
+    are e.g. ``(182, 218, 182)``.
+    """
+
+    _SHAPES = ((40, 44, 36), (36, 40, 44))
+
+    def __init__(self, ids, **kwargs) -> None:
+        self._ids = list(ids)
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    def __getitem__(self, idx: int) -> dict:
+        h, w, d = self._SHAPES[idx % len(self._SHAPES)]
+        target = torch.zeros(2, h, w, d)
+        target[0, 5:15, 5:15, 5:15] = 1.0
+        target[1, 7:11, 7:11, 7:11] = 1.0
+        return {
+            "image": torch.randn(3, h, w, d),
+            "target": target,
+            "brain": torch.ones(1, h, w, d),
+            "patient_id": self._ids[idx],
+        }
+
+
+class TestHeterogeneousCohortShapes:
+    """Cropping must happen per-sample, before collation.
+
+    The K+1 Picasso arrays (jobs 1635802 / 1636072) both died in ~90 s with
+
+        RuntimeError: stack expects each tensor to be equal size, but got
+        [3, 182, 218, 182] at entry 0 and [3, 240, 240, 155] at entry 1
+
+    because the crop ran on an already-collated batch.  Neither smoke caught it:
+    both used ``batch_size=1``, so ``default_collate`` never had to stack two
+    differently-shaped volumes.
+    """
+
+    PATCH = (32, 32, 32)
+
+    def test_collate_crops_before_stacking(self) -> None:
+        from vena.segmentation.engine.train import _build_tumour_crop_transform, _CropCollate
+
+        ds = _HeteroShapeDataset(["A", "B"])
+        collate = _CropCollate(_build_tumour_crop_transform(self.PATCH))
+        batch = collate([ds[0], ds[1]])
+
+        assert tuple(batch["image"].shape) == (2, 3, *self.PATCH)
+        assert tuple(batch["target"].shape) == (2, 2, *self.PATCH)
+        assert tuple(batch["brain"].shape) == (2, 1, *self.PATCH)
+        assert list(batch["patient_id"]) == ["A", "B"]
+
+    def test_default_collate_would_have_failed(self) -> None:
+        """Pin the failure mode this guards against, so the guard keeps meaning."""
+        from torch.utils.data._utils.collate import default_collate
+
+        ds = _HeteroShapeDataset(["A", "B"])
+        with pytest.raises(RuntimeError, match="equal size"):
+            default_collate([ds[0], ds[1]])
+
+    def test_collate_is_picklable_for_workers(self) -> None:
+        """num_workers>0 pickles the collate_fn; a closure would break here."""
+        import pickle
+
+        from vena.segmentation.engine.train import _build_tumour_crop_transform, _CropCollate
+
+        restored = pickle.loads(pickle.dumps(_CropCollate(_build_tumour_crop_transform(self.PATCH))))
+        ds = _HeteroShapeDataset(["A", "B"])
+        assert tuple(restored([ds[0], ds[1]])["image"].shape) == (2, 3, *self.PATCH)
+
+    def test_fit_runs_with_batch_size_2_on_mixed_shapes(self, tmp_path) -> None:
+        """End-to-end: the exact configuration the Picasso arrays used."""
+        from vena.segmentation.config import (
+            DataConfig,
+            ModelConfig,
+            SegmentationConfig,
+            TrainConfig,
+            VizConfig,
+        )
+        from vena.segmentation.data.kfold import FoldPlan
+        from vena.segmentation.engine.train import SegTrainer
+
+        ids = [f"P{i}" for i in range(6)]
+        plan = FoldPlan(
+            k=3,
+            fm_train_ids=tuple(ids),
+            folds=(tuple(ids[0:2]), tuple(ids[2:4]), tuple(ids[4:6])),
+            fm_val_ids=(),
+            fm_test_ids=(),
+        )
+        cfg = SegmentationConfig(
+            model=ModelConfig(name="segresnet"),
+            data=DataConfig(
+                corpus_registry=tmp_path / "r.json",
+                image_h5_root=tmp_path,
+                patch_size=self.PATCH,
+                cache_rate=0.0,
+                num_workers=0,
+                k_folds=3,
+            ),
+            train=TrainConfig(
+                max_epochs=1,
+                lr=1e-4,
+                batch_size=2,  # the load-bearing part — 1 would not reproduce it
+                val_every_epochs=1,
+                early_stop_patience=5,
+                amp=False,
+            ),
+            viz=VizConfig(enabled=False),
+        )
+        result = SegTrainer(
+            cfg,
+            0,
+            plan=plan,
+            run_dir=tmp_path / "run",
+            dataset_factory=lambda ids, **kw: _HeteroShapeDataset(ids),
+        ).fit()
+        assert result.checkpoint.exists()
+        assert np.isfinite(result.final_train_loss)

@@ -156,12 +156,90 @@ def _build_tumour_crop_transform(patch_size: tuple[int, int, int]) -> Any:
     )
 
 
+def _crop_one_sample(
+    image: Tensor,
+    target: Tensor,
+    brain: Tensor | None,
+    transform: Any,
+) -> dict[str, Tensor]:
+    """Tumour-aware crop of a SINGLE un-batched sample.
+
+    The one place the crop is actually performed; both the per-sample collate
+    (:class:`_CropCollate`) and the legacy batch helper
+    (:func:`_apply_tumour_crop`) route through here so the two cannot drift.
+
+    Parameters
+    ----------
+    image:
+        ``(C, H, W, D)``.
+    target:
+        ``(2, H, W, D)`` soft ``[TC, NETC]``.
+    brain:
+        ``(1, H, W, D)`` or ``None`` (an all-ones mask is substituted).
+    transform:
+        Pre-built callable from :func:`_build_tumour_crop_transform`.
+
+    Returns
+    -------
+    dict[str, Tensor]
+        Keys ``"image"``, ``"target"``, ``"brain"``, each ``(C, *patch_size)``.
+    """
+    sample: dict[str, Tensor] = {
+        "image": image,
+        "target": target,
+        # Hard TC mask drives the pos/neg sampler — never the soft map.
+        "label_tc": (target[0:1] > 0.5).float(),
+        "brain": brain
+        if brain is not None
+        else torch.ones(1, *image.shape[-3:], dtype=image.dtype),
+    }
+    result = transform(sample)
+    return result[0] if isinstance(result, list) else result
+
+
+class _CropCollate:
+    """DataLoader ``collate_fn`` that crops each sample BEFORE stacking.
+
+    Cropping must happen per-sample, not on a collated batch: cohorts have
+    **different native volume shapes** (measured — UCSF-PDGM ``240x240x155`` vs
+    ``182x218x182`` elsewhere), so ``default_collate`` raises
+
+        RuntimeError: stack expects each tensor to be equal size,
+        but got [3, 182, 218, 182] at entry 0 and [3, 240, 240, 155] at entry 1
+
+    the moment two cohorts share a batch.  Doing the crop here also moves the
+    work into the DataLoader workers and shrinks what crosses the IPC boundary
+    from a full volume to one patch.
+
+    Implemented as a class rather than a closure so it is picklable and
+    therefore usable with ``num_workers > 0``.
+    """
+
+    def __init__(self, transform: Any) -> None:
+        self._transform = transform
+
+    def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
+        from torch.utils.data._utils.collate import default_collate
+
+        cropped: list[dict[str, Any]] = []
+        for s in samples:
+            out = _crop_one_sample(s["image"], s["target"], s.get("brain"), self._transform)
+            passthrough = {k: v for k, v in s.items() if k not in ("image", "target", "brain")}
+            cropped.append({**passthrough, **{k: out[k] for k in ("image", "target", "brain")}})
+        return default_collate(cropped)
+
+
 def _apply_tumour_crop(
     batch: dict[str, Any],
     patch_size: tuple[int, int, int],
     transform: Any,
 ) -> dict[str, Any]:
-    """Apply tumour-aware random crop to a collated batch.
+    """Apply tumour-aware random crop to an ALREADY-collated batch.
+
+    Retained for callers that hold a homogeneous batch (and for the unit tests).
+    The training loop does **not** use this — it crops per-sample via
+    :class:`_CropCollate`, because a collated batch cannot exist at all when the
+    cohorts' native shapes differ.
 
     For each sample in the batch the transform is applied independently; results
     are re-stacked along the batch dimension.
@@ -195,18 +273,12 @@ def _apply_tumour_crop(
     cropped_brains: list[Tensor] = []
 
     for b in range(images.shape[0]):
-        sample: dict[str, Tensor] = {
-            "image": images[b],  # (C, H, W, D)
-            "target": targets[b],  # (2, H, W, D)
-            # Hard TC mask used by the pos/neg sampler
-            "label_tc": (targets[b, 0:1] > 0.5).float(),  # (1, H, W, D)
-            # brain: use ones if not in batch so the key is always present
-            "brain": brains[b]
-            if brains is not None
-            else torch.ones(1, *images.shape[-3:], dtype=images.dtype),
-        }
-        result_list = transform(sample)
-        result: dict[str, Tensor] = result_list[0] if isinstance(result_list, list) else result_list
+        result = _crop_one_sample(
+            images[b],
+            targets[b],
+            brains[b] if brains is not None else None,
+            transform,
+        )
         cropped_images.append(result["image"])
         cropped_targets.append(result["target"])
         cropped_brains.append(result["brain"])
@@ -799,6 +871,10 @@ class SegTrainer:
         # (skip when num_workers=0 to avoid the "persistent_workers requires
         #  num_workers > 0" constraint).
         _pw = cfg.data.num_workers > 0
+        # Tumour-aware crop runs INSIDE the DataLoader workers, per sample, before
+        # collation — cohorts have different native shapes so a batch of raw
+        # volumes cannot be stacked at all (see _CropCollate).
+        crop_transform = _build_tumour_crop_transform(cfg.data.patch_size)
         train_loader = DataLoader(
             train_ds,
             batch_size=cfg.train.batch_size,
@@ -807,6 +883,7 @@ class SegTrainer:
             pin_memory=(dev_type == "cuda"),
             drop_last=False,
             persistent_workers=_pw,
+            collate_fn=_CropCollate(crop_transform),
         )
         val_loader = DataLoader(
             val_ds,
@@ -816,9 +893,6 @@ class SegTrainer:
             pin_memory=(dev_type == "cuda"),
             persistent_workers=_pw,
         )
-
-        # ---- tumour-aware crop transform (created once, reused per batch) ---
-        crop_transform = _build_tumour_crop_transform(cfg.data.patch_size)
 
         # ---- CSV writers (headers frozen up front) ----------------------
         step_csv = _CSVWriter(
@@ -903,12 +977,14 @@ class SegTrainer:
 
                 step_t0 = time.perf_counter()
 
-                # Tumour-aware crop: applies jointly to image, target, brain.
-                # Validation uses sliding-window on the full volume so metrics
-                # are whole-volume numbers comparable to the G-SEG gate.
-                cropped = _apply_tumour_crop(batch, patch_size, crop_transform)
-                images: Tensor = cropped["image"].to(device)
-                target: Tensor = cropped["target"].to(device)
+                # The batch is ALREADY cropped to patch_size: _CropCollate does it
+                # per-sample inside the workers, which is the only place it can
+                # happen because cohorts have different native shapes and a batch
+                # of raw volumes cannot be stacked. Validation is untouched — it
+                # runs sliding-window on the full volume so its metrics are
+                # whole-volume numbers comparable to the G-SEG gate.
+                images: Tensor = batch["image"].to(device)
+                target: Tensor = batch["target"].to(device)
 
                 optimizer.zero_grad()
 
