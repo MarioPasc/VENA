@@ -401,7 +401,102 @@ jobs RUNNING** (job ids recorded, `Dependency` clean); exhaustive-val cadence wr
 `metrics.csv` (not the empty-CSV `use_timestep_transform` trap — verify one early epoch); monitor armed.
 
 **Orchestrator notes (append-only).**
-- _(empty)_
+
+- **2026-07-24 — S2 (`/orchestrate`, Opus 4.8 @ xhigh, 3 workers + orchestrator).** Base `b821f27`; docs committed
+  first as `4bfd2c8` so worktree agents cut a current spec. **Baseline: pytest `1569 passed / 1 skipped /
+  23 deselected`, ruff 478 pre-existing, `df -h /` 44 %.** Suite after all merges: **1599 passed**, ruff clean on
+  every touched file.
+
+- **Tasks 20 + 21 merged.** 20 = `data.mask_source ∈ {none,oracle_soft,predicted,derived}` served through ONE shared
+  helper in both the clean and offline-aug dataset paths; a missing `masks/tumor_latent_soft` **raises** instead of
+  warning; `decision.json` `0.10.0 → 0.11.0`. 21 = `BrainTCWeights {brain, tc, threshold}`, a strict 3-way partition
+  `{BG, Brain = in_brain & ¬TC, TC}` driven by `m_tc_soft`.
+
+- **Numbers I re-derived myself (not transcribed from a worker report):**
+  - **Step-0 identity:** with 10 perturbed output-projection tensors and non-zero conditioning, `output_scale=1` →
+    **9728 non-zero residual elements** (control: the branch is live); `output_scale=0` → **exactly 0 non-zero across
+    all 5 residual tensors**, trunk-add bit-identical. Also confirmed structurally that `MaisiControlNet.forward`
+    returns only those tensors and the scale multiplies every one.
+  - **Equal-weight ≡ L1:** max-abs residual **0.0**, and the weight tensor is uniformly 1.0 — structural, not luck.
+  - **Back-compat:** **9** live YAML `region_weights` blocks (the spec and the worker both said 6) are `torch.equal`
+    before/after. Mode selection is structural (`extra="forbid"` on both models), so a YAML cannot pick the wrong one.
+  - **Up-weight ratio** is NOT the nominal weight: `w·N_tot/(N_tot + (w−1)·N_TC)`. Verified at two operating points
+    (0.25 and 0.35 TC fraction). On real data TC ≈ 0.1 % of latent voxels, so the effective ratio ≈ the nominal weight.
+
+- **🔴 THE DEFECT THAT MATTERED — exhaustive-val never served the soft mask.** Task 20 wired `mask_source` into the
+  *training* DataModule only; `routines/fm/exhaustive_val/engine.py` builds its **own** `LatentH5Dataset` (two call
+  sites) and did not pass it. Every patient raised `ConditioningAssembler: batch missing required key 'm_tc_soft'`
+  and was swallowed by a broad `except Exception` → **header-only `metrics.csv` while the log said "complete"**.
+  Exhaustive-val PSNR_ET is the model-selection signal, so all 5 jobs would have produced nothing usable for days.
+  **Found by the loginexa smoke, not by any unit test** (the unit tests construct datasets directly).
+  Fixed: `mask_source` plumbed launcher → `job.yaml` → both dataset sites; a 100 %-skip run now **raises**
+  `ExhaustiveValAllSkippedError` *before* writing the CSV; skip fraction ≥ 0.5 logs at ERROR.
+  **This is the third instance of one pattern this session** (after S5's all-zero G-SEG table and the stale-run-dir
+  no-op below): *an operation completing cleanly while producing an empty or stale artifact.* Treat it as a
+  codebase-wide smell, not three incidents.
+
+- **⚠ A "successful" smoke rerun that proved nothing.** The first re-run after the fix auto-promoted
+  `WARM_START → CONTINUE` into the previous run dir, found `max_epochs: 2` already satisfied, and exited with a
+  clean `artifact:` line **without running a single epoch** — leaving the two original header-only CSVs in place.
+  It looked exactly like a pass. Quarantine the run dir (or change `run.tag`) before re-smoking a warm-start config.
+
+- **✅ Verified green after the fix:** `conditioning_total_channels=2`, `MaisiControlNet built: cond_in=2`,
+  `init_from_trunk copied=179`, optimiser `ControlNet=223 + trunk=0`, `output_scale` at step 0 = **0.0067 = sigmoid(−5)**
+  exactly, `FM-train completed`, 0 forbidden patterns, and **`exhaustive_val/epoch_00{0,1}/metrics.csv` = 6 real
+  per-patient rows + 2 figures each**. (PL summary "Non-trainable params 71.9 M" is the **EMA shadow**, not a frozen
+  ControlNet — trainable 71.9 M is the CN. Not a defect.)
+
+- **🔴 OFFLINE AUG — premise refuted, decision recorded.** The aug latent H5s lack `masks/tumor_latent_soft`. The
+  **aug image H5 already stores the correctly-warped `masks/tumor` (int8 labels, pre-cropped to (192,224,192))**, so
+  no TorchIO transform replay is needed — the same `derive_latent_soft_mask` runs with a no-op crop. New routine
+  `routines/segmentation/mask_derive_aug/` (task 19b). **Rows must be matched by INDEX, not id — `ids` are
+  non-unique in the aug bank (4 variants per patient).**
+  **The "bit-exact" premise I asserted is FALSE.** Measured over v1/v2/v3 rows (label unchanged) in all 6 cohorts:
+  `max_abs = 0.03444` (= the SDT far-field floor) and `max_abs_outside_the_zero_pad = 0.009–0.028`, i.e. the
+  disagreement reaches the brain interior, not just the pad margin. Mechanism: the clean path computes the SDT on the
+  **native** volume then crops; the aug bank is **pre-cropped**, so far-field distances near the crop boundary differ.
+  **But restricted to what drives conditioning it is exact:** `max_abs` where cached ≥ 0.5 is **0.0** and thresholded
+  **Dice = 1.000** in all six. User decision (2026-07-24): **proceed, document the caveat** — the supra-threshold TC
+  region and the 0.5-thresholded loss region are identical; the residual is a ≤0.028 wobble around the 0.034 floor
+  that was already retained by design. Probe: `scripts/preflight_aug_bit_exactness.py`.
+  **Measured cost:** 8264 rows (UCSF 724 · BraTS-GLI 4496 · UPENN-GBM 588 · IvyGAP 116 · LUMIERE 2108 · REMBRANDT 232)
+  at **0.64–0.83 s/row**; IvyGAP pilot COMPLETED in **1:36**.
+
+- **Recipe decisions I made (stated, not buried):**
+  - **`lr = 5e-5` for all five arms** (half v3a's 1e-4). `configure_optimizers` has a **single param group** in the
+    `fft` regime — there is no per-group LR — so a shared value is what makes J0→J1 a one-variable read of the
+    freeze→joint gain.
+  - **All five run `reduction: none` + `region_weights`**, including J0/J1 at `{brain:1, tc:1}` which is numerically
+    identical to mean-L1. One loss code path for every arm; no two-path asymmetry.
+  - Matrix verified by structural diff: **104 leaf keys, identical key-set, exactly 3 differing** (`run.tag`,
+    `model.trunk.trainable`, `loss.cfm.region_weights.tc`).
+
+- **🔴 SLURM / deployment traps found (all cost real time):**
+  1. **Split-brain imports on Picasso.** `vena` is an **editable** install pinned to `repos/VENA/src`; running from
+     `VENA-validation` without `PYTHONPATH` gives `routines` from the working tree and `vena` from the **stale**
+     shared repo — no error. Tell: `TypeError: ... unexpected keyword argument 'mask_source'` on code where the
+     argument plainly exists. Memory `[[reference_picasso_split_brain_imports]]`.
+  2. **The documented ANSI job-id recipe is insufficient.** The wrapper also prints a multi-line Lua WARNING on
+     stdout, so `sed 's/[^0-9]//g'` (line-based) returns a multi-line id; the guard then rejects a job that **has
+     already been submitted**, leaving it untracked. Fix: `tail -n 1` **first**. `/orchestrate` §4 corrected.
+  3. **The shared FM worker uses `--constraint=dgx`**, which B200 nodes also satisfy — it would have scattered the
+     matrix across two GPU generations. New `worker_fm_train_picasso_s2.sh` pins `--constraint=a100`. **The shared
+     worker is still wrong and is NOT mine to fix — flag it before the next FM submission.**
+  4. The aug launcher shipped pointing at the **stale shared repo** (where the routine does not exist) and at a
+     partition spec that did not match the S1 precedent.
+
+- **⚠ MY MISTAKE, recorded.** I `rsync --delete`'d over `fscratch/repos/VENA-validation` **twice while the S5
+  segmenter arrays were running out of that same tree** — after having explicitly identified that hazard for
+  `repos/VENA` and routed my own jobs away from it. Arrays `1640255`/`1640256` went `CANCELLED by 11228` (the user's
+  own uid, `ExitCode 0:0`, `Reason None`, task logs ending cleanly after `Launching:`), which is the signature of an
+  explicit `scancel` rather than a crash — so I do not believe the rsync killed them, but the risk was real and
+  avoidable. **Rule: check `squeue` for jobs running out of a tree before rsyncing over it.**
+
+- **What S3 must know:** use **PSNR_ET**, never PSNR_WT. J0 is the ControlNet-only floor; **J0→J1 is the
+  freeze→joint gain** and is only interpretable because lr and the loss path are shared. Watch **FP-safety on J4**
+  (top weight). The oracle→predicted gap must be reported **per cohort** — BraTS-PED's oracle ceiling is already
+  materially lower (`lat_iou_tc` 0.596). The aug-vs-clean far-field mask difference above is a documented,
+  quantified caveat, not a bug.
 
 ---
 
