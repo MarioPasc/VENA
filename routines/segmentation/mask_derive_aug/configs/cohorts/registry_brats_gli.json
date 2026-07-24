@@ -1,0 +1,9 @@
+{
+  "cohorts": [
+    {
+      "name": "BraTS-GLI",
+      "image_aug_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/BRATS_GLI/PRE_OPERATIVE/h5/brats_gli_image_aug.h5",
+      "latent_aug_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/BRATS_GLI/PRE_OPERATIVE/h5/brats_gli_latents_aug.h5"
+    }
+  ]
+}

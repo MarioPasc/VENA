@@ -1,0 +1,9 @@
+{
+  "cohorts": [
+    {
+      "name": "UPENN-GBM",
+      "image_aug_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/upenn_gbm/h5/upenn_gbm_image_aug.h5",
+      "latent_aug_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/upenn_gbm/h5/upenn_gbm_latents_aug.h5"
+    }
+  ]
+}

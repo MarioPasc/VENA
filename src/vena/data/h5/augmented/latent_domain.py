@@ -47,6 +47,22 @@ files are accepted as long as their ``masks/brain_latent``, if present,
 satisfies the (N, 1, *LATENT_SPATIAL) int8 layout.
 """
 
+AUG_LATENT_SCHEMA_VERSION_SOFT: str = "0.3.0"
+"""Schema version stamped on the aug-latent H5 after writing ``masks/tumor_latent_soft``.
+
+This is additive: aug-latent H5 files that have NOT been processed by the
+``mask_derive_aug`` routine retain ``schema_version = "0.2.0"`` and continue
+to validate against :func:`validate_aug_latent_h5`.  Only once the group
+``masks/tumor_latent_soft`` is written does the root ``schema_version``
+advance to ``"0.3.0"``.
+
+The write is performed by :class:`routines.segmentation.mask_derive_aug.engine.MaskDeriveAugEngine`;
+validated by :func:`assert_aug_latent_soft_mask_group_valid`.
+"""
+
+# Expected per-row shape of the soft mask group: (2 channels, *spatial).
+_AUG_SOFT_MASK_ROW_SHAPE: tuple[int, ...] = (2, *LATENT_SPATIAL)
+
 _AUG_LATENT_REQUIRED_AUG_ROOT_ATTRS: tuple[str, ...] = (
     "source_aug_image_h5_path",
     "source_aug_image_h5_sha256",
@@ -256,3 +272,118 @@ def assert_aug_latent_h5_valid(
             f"(schema v{AUG_LATENT_SCHEMA_VERSION}):\n  - {joined}"
         )
     logger.debug("aug-latent H5 valid: %s", path)
+
+
+# ---------------------------------------------------------------------------
+# Soft-mask group validator (additive — called after mask_derive_aug write)
+# ---------------------------------------------------------------------------
+
+_REQUIRED_DATASET_ATTRS: tuple[str, ...] = ("units", "description", "dtype", "leading_dim")
+
+
+def validate_aug_latent_soft_mask_group(
+    path: Path | str,
+    *,
+    group: str = "masks/tumor_latent_soft",
+) -> list[str]:
+    """Validate the additive soft-mask group in an aug-latent H5.
+
+    This validator is separate from :func:`validate_aug_latent_h5` (which uses
+    the manifest) so that un-processed ``0.2.0`` aug-latent H5s continue to
+    pass their own manifest check unchanged.  Call this function only *after*
+    the group has been written by :class:`MaskDeriveAugEngine`.
+
+    Parameters
+    ----------
+    path : Path or str
+        Path to an aug-latent H5 file.
+    group : str
+        Dataset path to validate; defaults to ``"masks/tumor_latent_soft"``.
+
+    Returns
+    -------
+    list[str]
+        Empty list when the group is valid; non-empty on violations.
+    """
+    path = Path(path)
+    violations: list[str] = []
+
+    if not path.exists():
+        return [f"file does not exist: {path}"]
+
+    with h5py.File(path, "r") as f:
+        # Schema version must be one of the two supported values.
+        sv = str(f.attrs.get("schema_version", ""))
+        supported = {AUG_LATENT_SCHEMA_VERSION, AUG_LATENT_SCHEMA_VERSION_SOFT}
+        if sv not in supported:
+            violations.append(
+                f"schema_version {sv!r} not in "
+                f"{{{AUG_LATENT_SCHEMA_VERSION!r}, {AUG_LATENT_SCHEMA_VERSION_SOFT!r}}}"
+            )
+
+        # mask_source root attr must be present.
+        if "mask_source" not in f.attrs:
+            violations.append("missing root attr: mask_source")
+
+        # The group itself must exist.
+        if group not in f:
+            violations.append(f"missing group/dataset: {group!r}")
+            return violations  # no further checks are possible
+
+        dset = f[group]
+        if not isinstance(dset, h5py.Dataset):
+            violations.append(f"{group}: expected Dataset, got {type(dset).__name__}")
+            return violations
+
+        # Shape: (N, 2, *LATENT_SPATIAL) — 5 dimensions total.
+        if dset.ndim != 5 or tuple(dset.shape[1:]) != _AUG_SOFT_MASK_ROW_SHAPE:
+            violations.append(
+                f"{group}: per-row shape {tuple(dset.shape[1:])} != {_AUG_SOFT_MASK_ROW_SHAPE}"
+            )
+
+        # Dtype must be float32.
+        if dset.dtype != np.dtype("float32"):
+            violations.append(f"{group}: dtype {dset.dtype} != float32")
+
+        # Required self-describing attrs (principle 4).
+        for attr in _REQUIRED_DATASET_ATTRS:
+            if attr not in dset.attrs:
+                violations.append(f"{group}: missing dataset attr: {attr}")
+
+        # Nesting and range check on first row (cheap sanity).
+        if dset.ndim == 4 and dset.shape[0] > 0 and dset.dtype == np.dtype("float32"):
+            first_row = dset[0]  # (2, H, W, D)
+            tc_ch = first_row[0]
+            netc_ch = first_row[1]
+            # TC ≥ NETC elementwise (NETC is a subset of TC).
+            max_violation = float(np.maximum(netc_ch - tc_ch, 0.0).max())
+            if max_violation > 1e-4:
+                violations.append(
+                    f"{group}: nesting violated on row 0 — "
+                    f"max(NETC − TC) = {max_violation:.6f} > 1e-4"
+                )
+            # Values must be in [0, 1].
+            if float(first_row.min()) < -1e-4 or float(first_row.max()) > 1.0 + 1e-4:
+                violations.append(
+                    f"{group}: row 0 values outside [0, 1] "
+                    f"(min={first_row.min():.4f}, max={first_row.max():.4f})"
+                )
+
+    return violations
+
+
+def assert_aug_latent_soft_mask_group_valid(
+    path: Path | str,
+    *,
+    group: str = "masks/tumor_latent_soft",
+) -> None:
+    """Raise :class:`~vena.data.h5.shared.exceptions.H5ValidationError` on violations; succeed silently."""
+    from vena.data.h5.shared.exceptions import H5ValidationError as _H5Err
+
+    violations = validate_aug_latent_soft_mask_group(path, group=group)
+    if violations:
+        joined = "\n  - ".join(violations)
+        raise _H5Err(
+            f"Aug-latent soft-mask group {group!r} failed validation in {path}:\n  - {joined}"
+        )
+    logger.debug("aug-latent soft-mask group valid: %s / %s", path, group)

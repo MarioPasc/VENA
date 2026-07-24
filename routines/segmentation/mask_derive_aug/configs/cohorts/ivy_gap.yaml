@@ -1,0 +1,20 @@
+# GT soft-mask derivation for IvyGAP augmented latent H5 (Picasso).
+# Run via the SLURM array: task 4.
+
+corpus_registry: routines/segmentation/mask_derive_aug/configs/cohorts/registry_ivy_gap.json
+
+targets:
+  soft: true
+  sdt_sigma_vox: 3.0
+  netc_operator: euclidean_percomponent
+  clip_vox: 10.0
+
+derivation:
+  temperature: per_class
+  avg_pool_stride: 4
+  latent_grid: [48, 56, 48]
+  emit_variance: false
+
+artifact_dir: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/segmentation/mask_derive_aug
+
+log_level: INFO

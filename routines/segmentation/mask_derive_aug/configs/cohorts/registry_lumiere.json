@@ -1,0 +1,9 @@
+{
+  "cohorts": [
+    {
+      "name": "LUMIERE",
+      "image_aug_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/lumiere/h5/lumiere_image_aug.h5",
+      "latent_aug_h5": "/mnt/home/users/tic_163_uma/mpascual/fscratch/datasets/vena/lumiere/h5/lumiere_latents_aug.h5"
+    }
+  ]
+}
