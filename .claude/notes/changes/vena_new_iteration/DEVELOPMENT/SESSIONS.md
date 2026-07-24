@@ -812,6 +812,21 @@ stem correctly skipped — expected) but **Arm A BraTS = only 126/198 = 0.636** 
   - **`--time` raised 2 → 3 days** (skill: 3 standard / 7 max). 46 h left no margin against Lustre contention and
     SLURM bills actual use, not the request. Seg suite 393 → **402**.
 - **🚀 RESUBMITTED at `14c3da1`: UKB `1642748`, SegResNet `1642760`** (6 tasks each). Monitor armed on failure states.
+- **⚠ EMPTY TUMOUR CORE IS COMMON — benign for training, LOAD-BEARING for the gate (measured 2026-07-24).**
+  The training logs emit many `Num foregrounds 0 ... setting pos_ratio to 0` warnings from
+  `RandCropByPosNegLabeld`. Investigated: **not a defect.** Those patients carry BraTS labels `{0, 2}` only —
+  pure edema, no NETC, no ET — i.e. genuinely non-enhancing, non-necrotic gliomas. Sampled TC-empty rate:
+  UCSF-PDGM **50 %** of the dedup-kept subset (20 % over all 495 rows), BraTS-GLI / UPENN-GBM / IvyGAP / LUMIERE /
+  REMBRANDT **0 %**, BraTS-Africa-Other 2.5 %, BraTS-PED 12.5 %. Median TC volume: UCSF **1 000 vox** vs 21k-50k
+  elsewhere. The UCSF enrichment is a **dedup selection effect** — dedup keeps the UCSF patients *not* in
+  BraTS-GLI, and BraTS-GLI is GBM-heavy, so what survives skews lower-grade and non-enhancing. The sampler
+  correctly falls back to random patches there and the model should learn to predict empty; no fix needed.
+  - **🔴 CONSEQUENCE FOR `gseg_tc_dice`:** `metrics.overlap.dice` returns **1.0 when both masks are empty**
+    (documented convention), so on a TC-empty patient a model that correctly predicts nothing scores a free 1.0.
+    A pooled mean TC-Dice is therefore **inflated by roughly half the UCSF contribution**. When re-deriving the
+    gate from the trained models, compute it over **TC-bearing cases only**, and report the empty-TC rate plus
+    empty-case accuracy as separate numbers — they measure different abilities (localisation vs correct
+    abstention). Do not calibrate 0.75 against the pooled figure.
 - **STILL OPEN:** arrays `1642748` + `1642760` to finish; then **re-derive `gseg_tc_dice`** from measured per-cohort TC Dice (0.75
   is provisional and the gate is not trustworthy until then); then S6 (predicted-mask cache + T-06), which now needs
   no multiprocessing workaround thanks to the SDT fix.
