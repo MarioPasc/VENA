@@ -10,9 +10,14 @@ Leakage vectors guarded:
                        all folds when any of its aliases is an FM-val/test ID.
                        Suppressed via the optional ``dedup_duplicates`` mapping.
 
-Determinism guarantee: ``folds`` depend *only* on
-``(sorted(fm_train_ids), cfg.fold_seed, cfg.k_folds)``.  Two calls with the
-same inputs produce bit-identical results on any platform.
+Determinism guarantee:
+
+- When ``cohort_labels=None`` (default): ``folds`` depend *only* on
+  ``(sorted(fm_train_ids), cfg.fold_seed, cfg.k_folds)``.
+- When ``cohort_labels`` is provided: ``folds`` additionally depend on the
+  per-patient label values in ``cohort_labels``.
+
+Two calls with the same inputs produce bit-identical results on any platform.
 """
 
 from __future__ import annotations
@@ -143,12 +148,15 @@ def _assign_folds_stratified(
     sorted_ids: list[str],
     k: int,
     seed: int,
+    *,
+    labels: list[str] | None = None,
 ) -> list[list[str]]:
     """Assign patient IDs to K folds with cohort stratification.
 
     Uses :func:`sklearn.model_selection.StratifiedKFold` with ``shuffle=True``
-    and ``random_state=seed``.  Cohort labels are derived heuristically from
-    patient ID prefixes via :func:`_extract_cohort`.
+    and ``random_state=seed``.  Cohort labels are taken from *labels* when
+    provided; otherwise derived heuristically from patient ID prefixes via
+    :func:`_extract_cohort`.
 
     Parameters
     ----------
@@ -158,6 +166,10 @@ def _assign_folds_stratified(
         Number of folds.
     seed:
         RNG seed for reproducible shuffling.
+    labels:
+        Optional pre-resolved per-patient stratification labels (one per
+        element of *sorted_ids*, same order).  When ``None``, :func:`_extract_cohort`
+        is applied to each ID.
 
     Returns
     -------
@@ -167,7 +179,7 @@ def _assign_folds_stratified(
     """
     from sklearn.model_selection import StratifiedKFold
 
-    cohort_labels = [_extract_cohort(pid) for pid in sorted_ids]
+    cohort_labels = labels if labels is not None else [_extract_cohort(pid) for pid in sorted_ids]
     skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
 
     folds: list[list[str]] = [[] for _ in range(k)]
@@ -220,6 +232,7 @@ def build_fold_plan(
     fm_splits: Mapping[str, Sequence[str]],
     *,
     dedup_duplicates: Mapping[str, Sequence[str]] | None = None,
+    cohort_labels: Mapping[str, str] | None = None,
 ) -> FoldPlan:
     """Build a K-fold out-of-fold split plan from FM corpus splits.
 
@@ -251,6 +264,17 @@ def build_fold_plan(
         When provided, any FM-val/test ID *and all its transitive dedup
         aliases* are excluded from every fold (transitive leakage guard L2).
         ``None`` disables the transitive check (direct check L1 still runs).
+    cohort_labels:
+        Optional mapping from patient ID to its registry cohort name (e.g.
+        ``"UCSF-PDGM"``, ``"BraTS-GLI"``).  When provided, the exact cohort
+        name is used as the ``StratifiedKFold`` stratification label, replacing
+        the :func:`_extract_cohort` heuristic.  This eliminates spurious
+        singleton classes that arise when patient IDs contain unique substrings
+        (e.g. UPENN-GBM ``900-00-XXXX_YYYY.MM.DD`` or REMBRANDT accession
+        numbers).  Pass :attr:`FmSplitResolution.patient_to_cohort` here.
+        When ``None``, the heuristic is used unchanged (backward-compatible).
+        Any patient ID absent from the mapping falls back to
+        :func:`_extract_cohort` with a DEBUG log.
 
     Returns
     -------
@@ -322,12 +346,30 @@ def build_fold_plan(
         )
 
     # ---------------------------------------------------------------- fold assignment
+    # Resolve per-patient stratification labels: explicit mapping > heuristic fallback.
+    # Explicit labels (from FmSplitResolution.patient_to_cohort) give exactly one
+    # label per registry cohort, eliminating the singleton-class explosion that
+    # arises when patient IDs contain unique substrings (UPENN-GBM, REMBRANDT).
+    if cohort_labels is not None:
+        resolved_labels: list[str] = []
+        for pid in sorted_train:
+            if pid in cohort_labels:
+                resolved_labels.append(cohort_labels[pid])
+            else:
+                logger.debug(
+                    "pid %r absent from cohort_labels; falling back to _extract_cohort.", pid
+                )
+                resolved_labels.append(_extract_cohort(pid))
+    else:
+        # Heuristic: identical to pre-cohort_labels behaviour (backward-compatible).
+        resolved_labels = [_extract_cohort(pid) for pid in sorted_train]
+
     # Try cohort-stratified; fall back to uniform if all IDs share one cohort
     # (trivial stratification would degenerate StratifiedKFold).
-    cohorts = {_extract_cohort(pid) for pid in sorted_train}
-    if len(cohorts) >= 2:
+    distinct_cohorts = set(resolved_labels)
+    if len(distinct_cohorts) >= 2:
         try:
-            raw_folds = _assign_folds_stratified(sorted_train, k, seed)
+            raw_folds = _assign_folds_stratified(sorted_train, k, seed, labels=resolved_labels)
         except Exception as exc:
             logger.warning("Stratified KFold failed (%s); falling back to uniform split.", exc)
             raw_folds = _assign_folds_uniform(sorted_train, k, seed)

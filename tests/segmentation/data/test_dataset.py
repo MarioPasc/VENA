@@ -569,3 +569,246 @@ class TestBuildAugmentation:
         ds = SegImageDataset(ids, data_cfg, augment=False)
         sample = ds[0]
         assert "t1c" not in sample, "t1c must NOT be present in dataset output"
+
+
+# ---------------------------------------------------------------------------
+# Bug regression tests (Bug 1 + Bug 2 in _build_id_index)
+# ---------------------------------------------------------------------------
+
+
+def _write_schema2_h5(
+    path: Path,
+    scan_ids: list[str],
+    patient_keys: list[str],
+    offsets: list[int],
+    shape: tuple[int, int, int] = (4, 4, 4),
+    rng: np.random.Generator | None = None,
+) -> None:
+    """Write an H5 with the schema-2.0.0 layout: ``ids`` (not ``patient_ids``).
+
+    This is the layout of the real UCSF-PDGM / BraTS H5 files produced after
+    the 2026-05-19 schema bump.  The pre-fix ``_build_id_index`` would silently
+    skip every cohort because it looked for ``patient_ids`` and emitted a
+    WARNING — causing ``SegImageDataset`` to raise on every production run.
+    """
+    import h5py
+
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    n = len(scan_ids)
+    h, w, d = shape
+    dt = h5py.special_dtype(vlen=str)
+
+    with h5py.File(path, "w") as hf:
+        # Schema 2.0.0: scan-level 'ids', NOT 'patient_ids'
+        hf.create_dataset("ids", data=np.array(scan_ids, dtype=object), dtype=dt)
+        hf.create_dataset("patients/keys", data=np.array(patient_keys, dtype=object), dtype=dt)
+        hf.create_dataset("patients/offsets", data=np.array(offsets, dtype=np.int32))
+
+        for mod in ("t1pre", "t2", "flair"):
+            hf.create_dataset(
+                f"images/{mod}", data=rng.standard_normal((n, h, w, d)).astype(np.float32)
+            )
+        label = np.zeros((n, h, w, d), dtype=np.int8)
+        cx, cy, cz = h // 2, w // 2, d // 2
+        label[:, cx - 1 : cx + 1, cy - 1 : cy + 1, cz - 1 : cz + 1] = 4
+        hf.create_dataset("masks/tumor", data=label)
+        brain = np.zeros((n, h, w, d), dtype=np.float32)
+        brain[:, 1:-1, 1:-1, 1:-1] = 1.0
+        hf.create_dataset("masks/brain", data=brain)
+
+
+class TestBuildIdIndexBugRegressions:
+    """Regression tests for Bug 1 (wrong key name) and Bug 2 (path resolution)."""
+
+    def test_bug1_ids_key_preferred_over_patient_ids(self, tmp_path: Path) -> None:
+        """Bug 1: _build_id_index must read 'ids', not 'patient_ids'.
+
+        Pre-fix behaviour: every production H5 was silently skipped (WARNING
+        logged, empty index returned), causing SegImageDataset to raise
+        'N patient IDs not found in H5 index' on every real training run.
+        """
+        from vena.segmentation.data.dataset import _build_id_index
+
+        scan_ids = ["SCAN_A", "SCAN_B", "SCAN_C"]
+        patient_keys = scan_ids  # 1:1 for single-session
+        offsets = list(range(len(scan_ids) + 1))
+        h5_path = tmp_path / "SCHEMA2_image.h5"
+        _write_schema2_h5(h5_path, scan_ids, patient_keys, offsets)
+
+        registry = {
+            "schema_version": "1.0.0",
+            "name": "test_corpus",
+            "cohorts": [
+                {
+                    "name": "SCHEMA2",
+                    "pathology": "preoperative_glioma",
+                    "label_system": "BraTS2021",
+                    "role": "cv",
+                    "image_h5": str(h5_path),
+                }
+            ],
+        }
+        reg_path = tmp_path / "corpus.json"
+        reg_path.write_text(json.dumps(registry))
+
+        index = _build_id_index(reg_path, tmp_path)
+
+        # All scan IDs must be indexed — pre-fix would return {}
+        assert set(index.keys()) == set(scan_ids), (
+            f"Expected {set(scan_ids)}, got {set(index.keys())}. "
+            "Bug 1 not fixed: _build_id_index did not read 'ids' key."
+        )
+
+    def test_bug1_falls_back_to_patient_ids(self, tmp_path: Path) -> None:
+        """Legacy 'patient_ids' key still works as a fallback (schema <2.0.0)."""
+        import h5py
+
+        from vena.segmentation.data.dataset import _build_id_index
+
+        h5_path = tmp_path / "LEGACY_image.h5"
+        legacy_ids = ["OLD_000", "OLD_001"]
+        rng = np.random.default_rng(7)
+        dt = h5py.special_dtype(vlen=str)
+
+        with h5py.File(h5_path, "w") as hf:
+            hf.create_dataset("patient_ids", data=np.array(legacy_ids, dtype=object), dtype=dt)
+            for mod in ("t1pre", "t2", "flair"):
+                hf.create_dataset(
+                    f"images/{mod}",
+                    data=rng.standard_normal((2, 4, 4, 4)).astype(np.float32),
+                )
+            hf.create_dataset("masks/tumor", data=np.zeros((2, 4, 4, 4), dtype=np.int8))
+            hf.create_dataset("masks/brain", data=np.ones((2, 4, 4, 4), dtype=np.float32))
+
+        registry = {
+            "schema_version": "1.0.0",
+            "name": "test_corpus",
+            "cohorts": [
+                {
+                    "name": "LEGACY",
+                    "pathology": "preoperative_glioma",
+                    "label_system": "BraTS2021",
+                    "role": "cv",
+                    "image_h5": str(h5_path),
+                }
+            ],
+        }
+        reg_path = tmp_path / "corpus.json"
+        reg_path.write_text(json.dumps(registry))
+
+        index = _build_id_index(reg_path, tmp_path)
+        assert set(index.keys()) == set(legacy_ids)
+
+    def test_bug2_absolute_path_resolution(self, tmp_path: Path) -> None:
+        """Bug 2: _build_id_index must try the registry's absolute path first.
+
+        Pre-fix behaviour: ``image_h5_root / basename`` was always used,
+        which silently produced an empty index for any cohort whose H5 lives
+        in a nested subdirectory (BraTS-GLI, UPENN-GBM, etc.).
+        """
+        from vena.segmentation.data.dataset import _build_id_index
+
+        # H5 lives in a nested subdir — NOT directly in image_h5_root
+        nested_dir = tmp_path / "NESTED" / "subdir" / "h5"
+        nested_dir.mkdir(parents=True)
+        h5_path = nested_dir / "COH_image.h5"
+
+        scan_ids = ["NSCAN_000", "NSCAN_001"]
+        patient_keys = scan_ids
+        offsets = list(range(len(scan_ids) + 1))
+        _write_schema2_h5(h5_path, scan_ids, patient_keys, offsets)
+
+        registry = {
+            "schema_version": "1.0.0",
+            "name": "test_corpus",
+            "cohorts": [
+                {
+                    "name": "COH",
+                    "pathology": "preoperative_glioma",
+                    "label_system": "BraTS2021",
+                    "role": "cv",
+                    # Absolute path pointing to nested location
+                    "image_h5": str(h5_path),
+                }
+            ],
+        }
+        reg_path = tmp_path / "corpus.json"
+        reg_path.write_text(json.dumps(registry))
+
+        # image_h5_root = tmp_path (does NOT contain COH_image.h5 directly)
+        index = _build_id_index(reg_path, tmp_path)
+
+        assert set(index.keys()) == set(scan_ids), (
+            "Bug 2 not fixed: _build_id_index did not resolve the nested "
+            "absolute path from the registry."
+        )
+
+    def test_bug2_fallback_to_image_h5_root(self, tmp_path: Path) -> None:
+        """image_h5_root / filename fallback works when absolute path is absent."""
+        from vena.segmentation.data.dataset import _build_id_index
+
+        # H5 lives directly in image_h5_root (flat layout for this test)
+        h5_path = tmp_path / "COH_image.h5"
+        scan_ids = ["FLAT_000", "FLAT_001"]
+        patient_keys = scan_ids
+        offsets = list(range(len(scan_ids) + 1))
+        _write_schema2_h5(h5_path, scan_ids, patient_keys, offsets)
+
+        registry = {
+            "schema_version": "1.0.0",
+            "name": "test_corpus",
+            "cohorts": [
+                {
+                    "name": "COH",
+                    "pathology": "preoperative_glioma",
+                    "label_system": "BraTS2021",
+                    "role": "cv",
+                    # Absolute path that doesn't exist (different machine path)
+                    "image_h5": "/nonexistent/machine/path/COH_image.h5",
+                }
+            ],
+        }
+        reg_path = tmp_path / "corpus.json"
+        reg_path.write_text(json.dumps(registry))
+
+        # Fallback: image_h5_root / "COH_image.h5" exists → succeeds
+        index = _build_id_index(reg_path, tmp_path)
+        assert set(index.keys()) == set(scan_ids)
+
+    def test_bug1_and_bug2_together(self, tmp_path: Path) -> None:
+        """Combined: nested absolute path + 'ids' key (production scenario).
+
+        This is the exact failure mode hit on every local run before the fix:
+        BraTS-GLI at /nested/path/BraTS_GLI_image.h5 with schema-2.0.0 'ids'.
+        """
+        from vena.segmentation.data.dataset import _build_id_index
+
+        nested_dir = tmp_path / "BRATS_GLI" / "PRE_OPERATIVE" / "h5"
+        nested_dir.mkdir(parents=True)
+        h5_path = nested_dir / "BraTS_GLI_image.h5"
+
+        scan_ids = [f"BraTS-GLI-{i:05d}" for i in range(4)]
+        patient_keys = scan_ids
+        offsets = list(range(len(scan_ids) + 1))
+        _write_schema2_h5(h5_path, scan_ids, patient_keys, offsets)
+
+        registry = {
+            "schema_version": "1.0.0",
+            "name": "test_corpus",
+            "cohorts": [
+                {
+                    "name": "BraTS-GLI",
+                    "pathology": "preoperative_glioma",
+                    "label_system": "BraTS2021",
+                    "role": "cv",
+                    "image_h5": str(h5_path),
+                }
+            ],
+        }
+        reg_path = tmp_path / "corpus.json"
+        reg_path.write_text(json.dumps(registry))
+
+        index = _build_id_index(reg_path, tmp_path)
+        assert set(index.keys()) == set(scan_ids)

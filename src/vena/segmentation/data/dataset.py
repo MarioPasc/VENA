@@ -3,12 +3,15 @@
 Serves ``{t1pre, t2, flair}`` volumes z-scored on the brain mask plus GT soft
 targets ``(2, H, W, D) ∈ [0, 1]`` for ``[TC, NETC]``.
 
-H5 layout expected (per :mod:`vena.rules.h5-design-principles`):
+H5 layout expected (schema 2.0.0, per :mod:`vena.rules.h5-design-principles`):
 
 .. code-block:: text
 
     <cohort>_image.h5
-    ├── patient_ids          vlen-str  (N,)
+    ├── ids                  vlen-str  (N,)   scan-level IDs (schema ≥2.0.0)
+    ├── patients/
+    │   ├── keys             vlen-str  (P,)   patient-level keys
+    │   └── offsets          int32     (P+1,) CSR: patient k → ids[offsets[k]:offsets[k+1]]
     ├── images/
     │   ├── t1pre            float32   (N, H, W, D)
     │   ├── t2               float32   (N, H, W, D)
@@ -17,9 +20,13 @@ H5 layout expected (per :mod:`vena.rules.h5-design-principles`):
         ├── tumor            int8      (N, H, W, D)  BraTS integer labels
         └── brain            float32   (N, H, W, D)  binary skull-strip mask
 
-The H5 filename is resolved via ``cfg.image_h5_root / <filename from registry>``.
-This lets tests redirect to a temporary directory while the registry JSON keeps
-absolute production paths.
+Legacy H5s (schema <2.0.0) may use ``patient_ids`` instead of ``ids``;
+:func:`_build_id_index` falls back gracefully.
+
+H5 path resolution: the registry entry's absolute ``image_h5`` path is tried
+first; ``image_h5_root / filename`` is used as a fallback.  This lets tests
+redirect to a temporary directory while the registry JSON keeps absolute
+production paths.
 
 Normalisation convention: **z-score on brain** (nonzero voxels, per channel),
 independent of the VAE 99.95 percentile.  The ``downstream_seg`` convention.
@@ -62,11 +69,20 @@ def _build_id_index(
     corpus_registry_path: Path,
     image_h5_root: Path,
 ) -> dict[str, tuple[Path, int]]:
-    """Build a patient_id → (h5_path, row_index) mapping.
+    """Build a scan_id → (h5_path, row_index) mapping.
 
-    Reads the corpus registry JSON, locates per-cohort H5 files under
-    ``image_h5_root``, and scans the ``patient_ids`` dataset in each H5 to
-    build the reverse index.
+    Reads the corpus registry JSON, locates per-cohort H5 files, and scans the
+    ``ids`` dataset (or legacy ``patient_ids``) in each H5 to build the reverse
+    index used by :meth:`SegImageDataset.__getitem__`.
+
+    H5 path resolution (Bug 2 fix): the registry's absolute ``image_h5`` path
+    is tried first.  If absent, falls back to ``image_h5_root / basename``.
+    This handles per-cohort nested layouts (e.g.
+    ``BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_image.h5``) without requiring all
+    H5s to live in the same flat directory.
+
+    ID key resolution (Bug 1 fix): prefers ``ids`` (schema 2.0.0) and falls
+    back to ``patient_ids`` (schema <2.0.0) for forward-compatibility.
 
     Parameters
     ----------
@@ -74,15 +90,14 @@ def _build_id_index(
         Path to a corpus registry JSON following the
         ``routines/fm/train/configs/corpus/corpus_*.json`` schema.
     image_h5_root:
-        Directory under which per-cohort image H5 files reside.
-        The filename is taken from the ``"image_h5"`` field of each cohort
-        entry in the registry: ``image_h5_root / Path(cohort["image_h5"]).name``.
+        Fallback directory when the registry's absolute ``image_h5`` path does
+        not exist on the current host.
 
     Returns
     -------
     dict[str, tuple[Path, int]]
-        Mapping from patient ID string to ``(h5_path, row_index)`` where
-        ``row_index`` is the 0-based position in the H5 ``patient_ids`` array.
+        Mapping from scan ID string to ``(h5_path, row_index)`` where
+        ``row_index`` is the 0-based position in the H5 ``ids`` array.
 
     Raises
     ------
@@ -115,27 +130,54 @@ def _build_id_index(
             logger.debug("Cohort '%s' has no image_h5 — skipping.", name)
             continue
 
-        h5_path = image_h5_root / Path(raw_h5).name
+        # Bug 2 fix: try the registry's absolute path first; fall back to
+        # image_h5_root / filename only when the absolute path does not exist.
+        # The old behaviour (always use image_h5_root / name) silently failed
+        # for cohorts whose H5 files live in nested per-cohort subdirectories
+        # (e.g. BRATS_GLI/PRE_OPERATIVE/h5/BraTS_GLI_image.h5).
+        abs_h5 = Path(raw_h5)
+        if abs_h5.exists():
+            h5_path = abs_h5
+            logger.debug("Cohort '%s': H5 resolved via absolute path: %s", name, h5_path)
+        else:
+            h5_path = image_h5_root / abs_h5.name
+            if h5_path.exists():
+                logger.debug(
+                    "Cohort '%s': H5 resolved via image_h5_root fallback: %s", name, h5_path
+                )
+
         if not h5_path.exists():
             logger.warning("H5 not found for cohort '%s': %s — skipping.", name, h5_path)
             continue
 
         try:
             with h5py.File(h5_path, "r") as hf:
-                if "patient_ids" not in hf:
+                # Bug 1 fix: real H5 schema 2.0.0 uses 'ids' (scan-level),
+                # not 'patient_ids'.  Fall back to 'patient_ids' for
+                # forward-compatibility with any legacy single-session H5s
+                # that predate the 2026-05-19 schema.
+                if "ids" in hf:
+                    id_key = "ids"
+                elif "patient_ids" in hf:
+                    id_key = "patient_ids"
+                    logger.debug(
+                        "H5 '%s': using legacy 'patient_ids' key (schema <2.0.0).", h5_path
+                    )
+                else:
                     logger.warning(
-                        "H5 '%s' has no 'patient_ids' dataset — skipping cohort '%s'.",
+                        "H5 '%s' has neither 'ids' nor 'patient_ids' dataset — "
+                        "skipping cohort '%s'.",
                         h5_path,
                         name,
                     )
                     continue
                 # Read as decoded strings (h5py returns bytes for fixed-str, str for vlen)
-                raw_ids = hf["patient_ids"][:]
+                raw_ids = hf[id_key][:]
                 patient_ids = [
                     (pid.decode() if isinstance(pid, bytes) else str(pid)) for pid in raw_ids
                 ]
         except Exception as exc:
-            raise SegDataError(f"Failed to read patient_ids from '{h5_path}': {exc}") from exc
+            raise SegDataError(f"Failed to read ids from '{h5_path}': {exc}") from exc
 
         for row_idx, pid in enumerate(patient_ids):
             if pid in id_index:
