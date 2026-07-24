@@ -1,9 +1,18 @@
-# Picasso — S2 T-13 J0: v3a warm-start + 2-ch [TC,NETC] ControlNet, frozen trunk.
+# Picasso — S2 T-13 J4: v3a warm-start + 2-ch [TC,NETC] ControlNet, JOINT trunk, tc=20.
 #
-# J0 = ControlNet-only floor arm (trunk frozen); no trunk EMA needed.
-# This de-risks the warm-start: trunk weights are loaded read-only, so the
-# trunk-EMA restore issue (model-coding-standards.md §2 single-shot caveat)
-# does not apply.
+# J4 = top of the region-weight sweep. Sibling of J1 differing in exactly TWO keys:
+#   loss.cfm.region_weights.tc   1.0 -> 20.0
+#   run.tag
+#
+# ⚠ WATCH FP-SAFETY ON THIS ARM. At the top weight the objective is most
+# strongly pushed to put signal inside the conditioning mask, which is exactly
+# the regime where false enhancement on GT-ET≈0 cases is most likely. S3 must
+# check false-enhancement volume against v3a for J4 specifically before this
+# weight is carried forward.
+#
+# ⚠ trainable-trunk warm-start is SINGLE-SHOT / not resume-safe: trunk_ema is
+# built in setup() AFTER Lightning's checkpoint load, so it needs the
+# trunk_ema_snapshot.pt sibling of ema_best.ckpt (verified present, 722 MB).
 #
 # WARM_START from v3a ema_best.ckpt (read-only, verified present on Picasso):
 #   /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/
@@ -14,10 +23,6 @@
 # hint-net conditioning_in_channels == 2. A single 2-ch spec would silently
 # under-count total_channels — always use two 1-ch specs (A.8-§4).
 #
-# data.use_offline_augmented_data: false — the offline-aug H5s do NOT carry
-# masks/tumor_latent_soft and would raise MissingSoftMaskGroupError. Use the
-# clean H5s only for any run that sets mask_source: oracle_soft.
-#
 # patience: 450 — the harder objective transiently raises train/total_epoch
 # during the ControlNet warm-in phase; patience=250 risks a premature stop.
 #
@@ -25,11 +30,11 @@
 # grid (verified 2026-07-22 against Picasso disk and the manifest producer).
 #
 # Submit via:
-#   sbatch routines/fm/train/slurm/runs/launcher_picasso_s2_t13_j0_v3a_cn2ch_freeze.sh
+#   bash routines/fm/train/slurm/runs/launcher_picasso_s2_t13_j4.sh
 
 run:
   stage: s1
-  tag: s2_t13_j0_cn2ch_freeze_tc1
+  tag: s2_t13_j4_cn2ch_joint_tc20
   resume_from: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/2026-06-24_16-00-46_s1_v3a_concat_only_fft_ef000c9f/checkpoints/ema_best.ckpt
   seed: 1337
   device: cuda
@@ -69,7 +74,7 @@ model:
       in_channels: 16
     class_token: 9
     spacing_mm: [1.0, 1.0, 1.0]
-    trainable: false        # J0 freeze arm — ControlNet only; sidesteps trunk-EMA restore caveat
+    trainable: true         # J1-J4 joint arm — trunk fine-tuned with the ControlNet
     regime: fft
     # input_concat is verbatim from v3a; keeps the trunk conv_in shape byte-identical
     # at warm-start so no architecture mismatch on ckpt load.
@@ -109,12 +114,14 @@ loss:
     # Brain/TC partition: {BG, Brain = in_brain & ~TC, TC}, TC from m_tc_soft
     # (mask channel 0 = tumour core, edema EXCLUDED; edema falls in Brain and
     # is reconstructed from the inputs, which is intended).
-    # {brain: 1, tc: 1} is NUMERICALLY IDENTICAL to plain L1-mean (verified
-    # max-abs residual 0.0), so J0/J1 carry the mechanism at zero numerical cost.
+    # tc: 20.0 up-weights the tumour-core velocity error. Note the gradient
+    # up-weight is 20·N_tot/(N_tot + 19·N_TC); since TC is ~0.1 % of latent
+    # voxels the effective ratio is ~19.6 on real data (it only compresses when
+    # TC occupies a large fraction, as in the synthetic unit tests).
     region_weights:
       enabled: true
       brain: 1.0
-      tc: 1.0
+      tc: 20.0
       threshold: 0.5
 
 rflow:
