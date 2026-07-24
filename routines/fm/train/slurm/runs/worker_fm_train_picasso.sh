@@ -23,7 +23,14 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=256G
 #SBATCH --partition=gpu_partition
-#SBATCH --constraint=dgx
+# a100, NOT dgx: BOTH the A100 nodes (exa[01-04]) and the B200 nodes
+# (blk[01-02]) advertise the `dgx` feature, so a bare `--constraint=dgx`
+# silently schedules onto a B200 — observed on blk01 (2026-07-24). VENA FM
+# training fits comfortably in 40 GB, so there is no reason to take a B200
+# slot, and a matrix of runs split across two GPU generations is not
+# comparable. (`--gres=gpu:A100:2` matches NO node: the A100 nodes advertise
+# an UNTYPED `gpu:8`; only B200 is typed. `dgx&a100` is an invalid spec.)
+#SBATCH --constraint=a100
 #SBATCH --gres=gpu:2
 #SBATCH --output=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/%x_%j.out
 #SBATCH --error=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/%x_%j.err

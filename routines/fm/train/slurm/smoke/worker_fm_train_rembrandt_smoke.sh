@@ -4,7 +4,9 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
-#SBATCH --constraint=dgx
+# a100, NOT dgx — `dgx` is carried by the B200 nodes too and would silently
+# schedule there; VENA FM training fits in 40 GB. See the production worker.
+#SBATCH --constraint=a100
 #SBATCH --gres=gpu:2
 #SBATCH --output=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/rembrandt_smoke_%j.out
 #SBATCH --error=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/rembrandt_smoke_%j.err
