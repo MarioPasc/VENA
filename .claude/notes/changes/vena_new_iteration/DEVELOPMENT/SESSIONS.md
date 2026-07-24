@@ -455,6 +455,100 @@ stem correctly skipped — expected) but **Arm A BraTS = only 126/198 = 0.636** 
     Coverage Arm A: **0.919 ≥ 0.80** (confirmed). All 182 encoder keys transfer; the 16 SSL heads drop as designed.
     No action required from S5 — the fix is self-contained in the library layer.
 
+- **S5 CODE COMPLETE 2026-07-24 (`/orchestrate`, Opus 4.8 @ xhigh, 4 workers + orchestrator).** Base `3a224aa`;
+  7 commits `230aa86 → 91fd289`. Fast suite **1453 → 1560+** (segmentation area 389 pass / 0 fail), ruff clean on
+  every touched file. Lanes: A `data/fm_splits.py`+dataset ∥ B `metrics/visualize.py` panel ∥ C `engine/{train,predict}.py`,
+  then Wave-2 `routines/segmentation/train/`. **No worktrees** — the S4 stale-base incident recurs whenever the
+  session base predates an orchestrator commit, so lanes ran in the main tree on disjoint file sets.
+  **BSF load coverage re-derived from the checkpoints on disk: UKB 125/142 = 0.880, BraTS 182/198 = 0.919** — the
+  S4/ticket numbers hold, no drift.
+
+- **🔴 FIVE DEFECTS FOUND THAT THE S4 SUITE COULD NOT CATCH.** All were invisible to unit tests because those inject
+  `id_index=`, stub targets, or mock inference. Each is the "plausible artifact, wrong content" failure mode.
+  1. **`_build_id_index` read `hf["patient_ids"]`; the image H5 exposes `ids`.** Every cohort hit the
+     skip-this-cohort warning branch → empty index → `SegDataError` on every real construction. Fixed (`ids`,
+     `patient_ids` fallback).
+  2. **H5 paths were flattened to `image_h5_root / basename`.** The 9 cohorts live in 9 distinct directories on
+     BOTH local and Picasso (`BRATS_GLI/PRE_OPERATIVE/h5/`, `upenn_gbm/h5/`, …), so the path never existed. Fixed →
+     prefer the registry's absolute path, fall back to the flattened form.
+  3. **Soft targets cost 12.8-40.6 s/scan** (measured, UCSF rows 0/5/17) and `SegImageDataset.__getitem__` calls
+     `make_soft_targets` **per sample per epoch** → **10.4 CPU-h per epoch**, six K-fold trainings impossible.
+     Fixed in `targets/sdt.py` (`bfb36ee`): each component's EDT runs on its own bbox grown by `ceil(clip_vox)+1`,
+     all boxes from one `find_objects` pass, accumulator pre-filled with `-clip_vox`. **Exact, not approximate** —
+     verified **bit-identical (max |diff| = 0.0)** on 8 real TC/NETC masks + 5 synthetic geometries incl. edge/corner
+     clipping. Per-mask 10-268× faster; `make_soft_targets` **→ 0.45-0.55 s**. ⚠ **This also de-risks the S6
+     predicted-mask re-cache**, which runs the same operator over all 9 cohorts and hit the 8 h wall in S1.
+  4. **Nothing crops to `patch_size`.** `build_augmentation` has no crop transform and the dataset returns full
+     native `(240,240,155)`; SwinUNETR cannot forward it (dims must be ÷32). Training now crops tumour-aware
+     (`RandCropByPosNegLabeld`) — TC is only ~0.2-0.8 % of the volume, so uniform patches would train the model to
+     predict empty. Validation uses whole-volume `sliding_window_inference` so Dice is gate-comparable.
+  5. **🔴 THE BIG ONE — the per-cohort G-SEG evaluation could never execute.** `_infer_cohort_metrics` called
+     `get_segmentation_model(cfg.model)` against `get_segmentation_model(name, cfg)` (guaranteed `TypeError`)
+     inside a broad `except Exception` that returned `_zero_metrics()`. Result: a **complete, well-formed
+     `decision.json` G-SEG table reading `tc_dice: 0.0` for every cohort incl. Ring-B**, behind one WARNING line in
+     a multi-day log. Its own schema test passed because it mocks inference. Fixed **structurally**: `_zero_metrics`
+     deleted; unmeasured metrics are JSON `null` with a per-cohort `status` + `n_evaluated`; the exception is
+     narrowed so a programming error crashes; the gate fails with a distinct **`missing-data`** reason, never a
+     number that reads as a measurement. Verified on a real smoke — see below.
+
+- **Cross-machine split-layout trap (LOAD-BEARING for S6 and anything reading splits).** LOCAL
+  `REMBRANDT_image.h5` still has the legacy flat `splits/{train,val,test}` and **no `splits/cv`**; PICASSO's has
+  `splits/cv` with **only `fold_0`**. Both carry root attr `split_role='internal'` while the registry says
+  `role='cv'` — **trust the registry**. `resolve_fm_splits` prefers `splits/cv/fold_{fm_fold}`, falls back to flat
+  with a WARNING, and raises `SegDataError` naming the available folds otherwise. Resolving only `splits/cv` kills
+  every local run while Picasso silently works.
+
+- **Split ground truth at `fm_fold=0` (re-derived by the orchestrator, then independently by lane A):**
+  `fm_train = 1224 patients / 1664 scans`, `fm_val = 290`, `fm_test = 579`; `k_folds=5, fold_seed=1337` →
+  **`[245,245,245,245,244]`**. Per-cohort (n_h5 / kept / train / val / test): UCSF-PDGM 495/202/147/34/21 ·
+  BraTS-GLI 1133/1133/815/204/114 · UPENN-GBM 611/164/121/26/17 · IvyGAP 34/34/24/5/5 · LUMIERE 91/91/64/16/11
+  (**longitudinal: 64 train patients → 420 scans**) · REMBRANDT 63/63/53/5/5 (flat fallback) · Ring-B
+  BraTS-Africa-Glioma 95 / -Other 51 / BraTS-PED 260, all test. **Corroborated twice**: 1224/1664 equals the
+  recorded fold-0 offline-aug pool, and `patient_to_scans` has 2093 entries = the recorded post-dedup total.
+  **OOF guarantee checked exhaustively over all 2093 patients: 0 self-prediction violations, 0 train∩(val∪test).**
+- **Dedup contract clarified:** the preflight emits an **allow-list** (`cohorts.<name>.kept_patient_ids`), not the
+  symmetric alias map `build_fold_plan(dedup_duplicates=)` expects. Apply the allow-list in the resolver exactly as
+  `MultiCohortLatentDataModule` does (required for cv, tolerated-if-absent for test_only), then pass
+  **`dedup_duplicates=None`**. The S4 note "S5 must plumb the real dedup map" is superseded.
+- **Stratification made exact:** `_extract_cohort` (trailing-digit heuristic) produced **178 label classes, 174 of
+  them singletons**; fold balance was fine but only emergently, via sklearn's round-robin. `build_fold_plan` now
+  takes optional `cohort_labels` and the resolver threads `patient_to_cohort` → **6 classes** (the 6 cv cohorts),
+  no sklearn warning, **byte-identical folds**.
+
+- **Deliverables (all three user requirements verified on real artifacts).** `K=5`; **`splits.json`** written every
+  run, carrying per-cohort patient lists, per-fold assignment, dedup counts, `patient_to_scans`, and an
+  `is_capped_subset` marker; **prediction panel at epoch 0 then every `viz.every_epochs`** — confirmed
+  `epoch_000/010/020.png` for `every_epochs=10`. Panel = 5 rows (descending by metric) × 10 GT-derived tumour
+  slices; composite order is **anatomy → hard GT (dark red) → soft TC (YlGn) → soft NETC (RdPu) → contours**, i.e.
+  **GT UNDER the predictions so bare red = false negative** (verified on real UCSF with the prediction ablated to
+  100/75/50/25/0 % of TC). Overlay alpha ∝ probability so the 0.034 SDT floor does not haze the brain.
+
+- **Smoke now exercises the REAL path.** It previously pointed at `corpus_picasso.json` and could not run at all
+  locally, and would never have touched the H5 reader where defects 1-2 lived. `DataConfig.max_patients_per_cohort`
+  (post-dedup, deterministic lexicographic head, no RNG) lets it run the real registry + reader + resolver in
+  **202 s**: index of **3459 patient IDs across 9 cohorts**, real panel rendered, `seg-train completed` +
+  `RUN_DIR=` printed. Its `decision.json` shows the honest-reporting fix working: `status:"ok"` with measured
+  values where patients exist (UCSF tc=0.0085, IvyGAP tc=0.1212 — correctly low for 2 epochs from random init) and
+  `null` + `status:"error: no patients assigned"` for the four cohorts with no fold-0 patients, surfaced as
+  `missing-data` gate failures. **No temperature keys, no `temperatures.json`.**
+
+- **Ops facts for the launch.** Picasso: all 9 image H5s present (BraTS-GLI at the deeper
+  `BRATS_GLI/PRE_OPERATIVE/h5/`), all 6 BSF ckpts present, `vena` = torch 2.12.0 / MONAI 1.5.2, `vena-v100` =
+  torch 2.7.1 / MONAI 1.5.2, both with `SwinUNETR`/`SegResNet`/`RandCropByPosNegLabeld`/`sliding_window_inference`.
+  `torch.cuda.amp.GradScaler` still exists on 2.6/2.7.1/2.12 (deprecated only), but the code uses
+  `torch.amp.GradScaler(device, …)` whose signature is identical across all three. Measured data path:
+  **0.40 s/sample H5 read** (125 MB decompressed, gzip-4) + **0.5 s soft target** ⇒ ~5-6 min/epoch at 8 workers ⇒
+  `--time=2-00:00:00` per array task. Launcher: `--array=0-5` (0-4 = folds, 5 = `all_train`),
+  `--gres=gpu:A100:1 --constraint=dgx --cpus-per-task=8 --mem=80G`, worker renders the per-task YAML so the routine
+  keeps its one-positional-arg contract.
+  ⚠ **`gseg_tc_dice=0.75` REMAINS PROVISIONAL** — it can only be re-derived from measured per-cohort TC Dice after
+  the array trains. Do not treat the gate as meaningful until then.
+  ⚠ Local `/home` (separate 600 G partition) was **85 % full with 296 GB of stale pytest basetemp** across 47 dirs.
+
+- **STILL OPEN at the end of this session:** loginexa smoke on the real UKB checkpoint (blocked only on the S1
+  mask-derive job `1631539_2` releasing `fscratch/repos/VENA-validation`), then the K+1 Picasso array, then the
+  G-SEG re-derivation of the TC-Dice gate.
+
 ---
 
 ## S6 — Predicted-mask cache + deployable T-06  *(Phase 2c)*

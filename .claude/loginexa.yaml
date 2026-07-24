@@ -69,3 +69,61 @@ process_anchor: 'vena-v100/bin/python -m routines.fm.train.cli'
 
 # Poll cadence while the smoke runs. 90s is fine for a 25-min budget.
 poll_interval_seconds: 90
+
+# ---------------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------------
+# Everything above is the DEFAULT profile (the FM trainer, `routines.fm.train`).
+# A profile below overrides only the keys it names; every unnamed key falls back
+# to the default above. Invoke as: /test-picasso-loginexa --profile segmentation
+#
+# `poll_interval_seconds` note (see memory `reference_loginexa_poll_selfmatch_bug`):
+# poll with `pgrep -af '<anchor>'`, NOT `pgrep -f ... | grep -v 'bash -c'` — the
+# latter never exits (pgrep -f prints PIDs only, so the grep filters nothing) and
+# leaks an orphan bash loop per run. `pkill -f 'until ! pgrep'` after a PASS.
+profiles:
+
+  segmentation:
+    # S5 — tumour segmenter (BSF-SwinUNETR / SegResNet), image-domain, 3-ch
+    # {T1pre, T2, FLAIR} -> soft [TC, NETC]. Never sees T1c (label leakage).
+    # One model per invocation; `run.fold` selects fold i or "all_train".
+
+    # Run from VENA-validation, NOT the shared VENA repo the FM profile uses.
+    # Both are real git repos, but the shared one carries a stale HEAD and every
+    # artifact would record that as `git_sha`. The S1 mask-derive array already
+    # runs `vena.segmentation` from here, so the two stay on one deployment.
+    repo_path_remote: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA-validation
+
+    smoke_cmd_template: '{python} -m routines.segmentation.train.cli {config}'
+    smoke_config_glob: 'routines/segmentation/train/configs/smoke/*.yaml'
+    process_anchor: 'vena-v100/bin/python -m routines.segmentation.train.cli'
+
+    # SwinUNETR fs=48 at a 96^3 patch fits a V100-32GB at batch 2 with AMP.
+    # Single GPU: the segmenter has no async second-GPU validation job.
+    n_gpus_needed: 1
+
+    # Lighter import set than the FM trainer — no MAISI VAE, no Lightning.
+    warm_imports: ['torch', 'monai', 'h5py']
+
+    experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/VENA/segmentation
+
+    pass_criteria:
+      log_pattern: 'seg-train completed'
+      required_artifacts:
+        - '{run_dir}/checkpoints/last.pt'
+        - '{run_dir}/metrics/train_epoch.csv'
+        - '{run_dir}/fold_plan.json'
+        - '{run_dir}/splits.json'
+        - '{run_dir}/decision.json'
+      required_csv_min_rows:
+        '{run_dir}/metrics/train_epoch.csv': 1
+      # `temperatures.json` MUST NOT exist — iter-9 Q5 dropped temperature
+      # scaling (calibration is measured, never corrected). Its presence means
+      # a stale code path was resurrected.
+      forbidden_artifacts:
+        - '{run_dir}/temperatures.json'
+      forbidden_log_patterns:
+        - 'Traceback'
+        - 'CUDA out of memory'
+        - 'SegDataError'
+        - 'no kernel image is available'
