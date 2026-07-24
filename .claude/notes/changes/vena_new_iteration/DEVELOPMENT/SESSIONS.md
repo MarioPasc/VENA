@@ -485,12 +485,18 @@ jobs RUNNING** (job ids recorded, `Dependency` clean); exhaustive-val cadence wr
   4. The aug launcher shipped pointing at the **stale shared repo** (where the routine does not exist) and at a
      partition spec that did not match the S1 precedent.
 
-- **⚠ MY MISTAKE, recorded.** I `rsync --delete`'d over `fscratch/repos/VENA-validation` **twice while the S5
-  segmenter arrays were running out of that same tree** — after having explicitly identified that hazard for
-  `repos/VENA` and routed my own jobs away from it. Arrays `1640255`/`1640256` went `CANCELLED by 11228` (the user's
-  own uid, `ExitCode 0:0`, `Reason None`, task logs ending cleanly after `Launching:`), which is the signature of an
-  explicit `scancel` rather than a crash — so I do not believe the rsync killed them, but the risk was real and
-  avoidable. **Rule: check `squeue` for jobs running out of a tree before rsyncing over it.**
+- **⚠ MY MISTAKE, recorded — with the cause since RESOLVED (not mine).** I `rsync --delete`'d over
+  `fscratch/repos/VENA-validation` **twice while the S5 segmenter arrays were running out of that same tree** —
+  after having explicitly identified that hazard for `repos/VENA` and routed my own jobs away from it.
+  **Attribution, established afterwards:** arrays `1640255`/`1640256` went `CANCELLED by 11228` because a *parallel
+  session* deliberately `scancel`led them to land commit `14c3da1` (`perf(segmentation): crop before augmenting`) —
+  epoch 0 was spending `data_wait_s=1287.7` vs `step_s=173.2`, so a 300-epoch run needed 122 h against a 48 h limit.
+  They were resubmitted as **`1642748` / `1642760`**. **My rsync did not cause the cancellation.** The risk I took
+  was nevertheless real and avoidable. **Rule stands: `squeue` for jobs running out of a tree before rsyncing over
+  it** — I applied it correctly later, waiting for `1642818_1` (BraTS-GLI) to finish before the pre-launch sync.
+  *(Lesson about attribution: I initially wrote this note speculating my rsync might be at fault. Check `git log`
+  for concurrent sessions before assuming a cluster event is yours — the unexplained `+2` in my final test count
+  had the same origin.)*
 
 - **✅ AUG CACHE COMPLETE — all 6 cv cohorts, array `1642818` (+ pilot `1642663`).** Elapsed times are *plausible for
   the work claimed* (the check that catches a silent skip): UCSF 724 rows/6:23 = 0.53 s/row · BraTS-GLI 4496/54:16 =
