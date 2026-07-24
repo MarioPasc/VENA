@@ -17,9 +17,11 @@ from vena.segmentation.config import (
     LossConfig,
     MetricsConfig,
     ModelConfig,
+    RunConfig,
     SegmentationConfig,
     TargetConfig,
     TrainConfig,
+    VizConfig,
 )
 from vena.segmentation.exceptions import (
     SegDataError,
@@ -42,6 +44,7 @@ __all__ = [
     "LossConfig",
     "MetricsConfig",
     "ModelConfig",
+    "RunConfig",
     "SegDataError",
     "SegDerivationError",
     "SegLossError",
@@ -52,6 +55,7 @@ __all__ = [
     "SegmentationError",
     "TargetConfig",
     "TrainConfig",
+    "VizConfig",
     "get_segmentation_model",
     "register_segmentation_model",
     "registered_model_names",

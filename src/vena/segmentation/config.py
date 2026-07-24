@@ -88,6 +88,19 @@ class DataConfig(BaseModel):
         ``CacheDataset``.  Set to 0.0 to disable caching.
     num_workers:
         DataLoader worker count.
+    fm_fold:
+        Which **FM** cross-validation fold defines the generator's
+        ``train``/``val`` partition (``splits/cv/fold_<fm_fold>/{train,val}``
+        in each cohort H5).  The v3a warm-start run used fold 0, so the
+        segmenter must read the same fold or the OOF guarantee is void.
+        Distinct from ``k_folds``/``fold_seed``, which define the segmenter's
+        *own* K-fold partition **inside** the FM train split.
+    dedup_decision_path:
+        Path to the ``cohort_dedup`` preflight ``decision.json`` whose
+        ``cohorts.<name>.kept_patient_ids`` allow-lists drop cross-cohort
+        duplicate patients.  Mirrors ``MultiCohortLatentDataModule``: the same
+        allow-list filter must run here or the segmenter trains on patients the
+        generator excluded.  ``None`` disables the filter (tests only).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -97,6 +110,8 @@ class DataConfig(BaseModel):
     modalities: tuple[str, ...] = ("t1pre", "t2", "flair")
     k_folds: int = 5
     fold_seed: int = 1337
+    fm_fold: int = 0
+    dedup_decision_path: Path | None = None
     patch_size: tuple[int, int, int]
     cache_rate: float
     num_workers: int
@@ -222,6 +237,11 @@ class DerivationConfig(BaseModel):
         ``"per_class"`` scales each channel separately;
         ``"global"`` uses a single scalar;
         ``"none"`` skips calibration.
+        **Default is ``"none"`` (iter-9 decision Q5, 2026-07-23): temperature
+        scaling is DROPPED.**  Calibration is *measured* (ECE / Brier, reported
+        in ``decision.json``) and never *corrected*, so the oracle and predicted
+        soft maps stay produced by the same operator chain.  The other two modes
+        are retained only for a future ablation.
     avg_pool_stride:
         Spatial stride for the average-pool that maps image-space soft masks
         to the latent grid.  The default 4 corresponds to the MAISI VAE 4×
@@ -240,10 +260,92 @@ class DerivationConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    temperature: Literal["per_class", "global", "none"] = "per_class"
+    temperature: Literal["per_class", "global", "none"] = "none"
     avg_pool_stride: int = 4
     latent_grid: tuple[int, int, int] = (48, 56, 48)
     emit_variance: bool = False
+
+
+class VizConfig(BaseModel):
+    """Training-time prediction-panel rendering settings.
+
+    Drives the qualitative panel written by the trainer: one row per patient,
+    ``n_cols`` tumour-bearing axial slices per row, each slice showing the
+    anatomy with the **hard GT** mask (dark red) and the **soft predicted**
+    ``[TC, NETC]`` probabilities overlaid.  Rows are sorted **descending** by
+    the per-patient selection metric so the best case is the top row.
+
+    Attributes
+    ----------
+    enabled:
+        Render the panel at all.  Disable for throughput benchmarking.
+    every_epochs:
+        Render cadence.  The panel is *always* rendered at the first epoch
+        (epoch 0) and then every ``every_epochs`` epochs thereafter.
+    n_patients:
+        Number of validation patients shown (one per row).
+    n_cols:
+        Number of tumour-bearing slices per patient (one per column).  Slices
+        are selected from the **GT label**, spread over the lesion's axial
+        extent.
+    patient_ids:
+        Explicit patient IDs to pin.  ``None`` selects deterministically from
+        the fold's validation set (spanning the tumour-volume range) so the
+        same patients are tracked across every epoch and the panel shows
+        learning rather than resampling noise.
+    gt_alpha:
+        Alpha of the hard GT overlay.
+    soft_alpha:
+        Alpha of the soft predicted-probability overlay.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = True
+    every_epochs: int = 10
+    n_patients: int = 5
+    n_cols: int = 10
+    patient_ids: tuple[str, ...] | None = None
+    gt_alpha: float = 0.6
+    soft_alpha: float = 0.6
+
+
+class RunConfig(BaseModel):
+    """Run identity and output-location settings.
+
+    Attributes
+    ----------
+    experiments_root:
+        Directory under which ``<run_id>/`` is created.  On Picasso this is
+        ``/mnt/home/users/tic_163_uma/mpascual/execs/vena/experiments_seg``.
+    tag:
+        Short recipe label baked into the run id (e.g. ``ukb_k5``).
+    fold:
+        Which model this invocation trains — a segmenter fold index in
+        ``[0, k_folds)``, or the literal ``"all_train"`` model that trains on
+        the whole FM-train split and predicts the FM val/test patients.
+        **One model per invocation** so a SLURM array trains all K+1.
+    seed:
+        Per-run RNG seed.  Defaults to the top-level :attr:`SegmentationConfig.seed`
+        when ``None``.
+    device:
+        Torch device string.
+    log_level:
+        Root logging level for the run.
+    resume_from:
+        Optional checkpoint to warm-start from.  ``None`` trains from the
+        configured ``model.checkpoint`` initialisation.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    experiments_root: Path
+    tag: str
+    fold: int | Literal["all_train"]
+    seed: int | None = None
+    device: str = "cuda"
+    log_level: str = "INFO"
+    resume_from: Path | None = None
 
 
 class MetricsConfig(BaseModel):
@@ -302,6 +404,11 @@ class SegmentationConfig(BaseModel):
         Latent-space mask derivation settings.
     metrics:
         Evaluation metric thresholds and selection criterion.
+    run:
+        Run identity and output location.  ``None`` is allowed only for
+        library/unit use where no run directory is created.
+    viz:
+        Training-time prediction-panel settings.
     seed:
         Global RNG seed for reproducibility.
     """
@@ -315,6 +422,8 @@ class SegmentationConfig(BaseModel):
     train: TrainConfig
     derivation: DerivationConfig = DerivationConfig()
     metrics: MetricsConfig = MetricsConfig()
+    run: RunConfig | None = None
+    viz: VizConfig = VizConfig()
     seed: int = 1337
 
     @classmethod
@@ -352,7 +461,9 @@ __all__ = [
     "LossConfig",
     "MetricsConfig",
     "ModelConfig",
+    "RunConfig",
     "SegmentationConfig",
     "TargetConfig",
     "TrainConfig",
+    "VizConfig",
 ]
