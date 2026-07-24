@@ -52,6 +52,23 @@ class ExhaustiveValConfigError(Exception):
     """Raised on a malformed exhaustive-validation job config."""
 
 
+class ExhaustiveValAllSkippedError(Exception):
+    """Raised when every patient in an exhaustive-val epoch was skipped.
+
+    A 100 % skip rate indicates a wiring or schema error (e.g. the
+    ConditioningAssembler cannot find a batch key that the dataset was not
+    configured to serve), not a transient per-patient data problem.  The engine
+    raises rather than logging "complete" and leaving a header-only
+    ``metrics.csv`` that looks like a successful run.
+    """
+
+
+# Skip fraction at which the patient-loop logs at ERROR (not yet a hard raise).
+# A fraction below this produces a WARNING per skipped patient; at or above it
+# an additional ERROR summarises the damage before the run continues.
+_SKIP_FRACTION_ERROR_THRESHOLD: float = 0.5
+
+
 class _TrunkJobCfg(BaseModel):
     model_config = ConfigDict(extra="forbid")
     checkpoint: Path
@@ -112,6 +129,12 @@ class ExhaustiveValJobConfig(BaseModel):
     corpus_registry: Path | None = None
 
     fold: int = 0
+    # S2 T-13 (task-20): soft 2-channel mask serving policy — must mirror
+    # ``data.mask_source`` from the training config so the exhaustive-val
+    # dataset serves the same batch keys the ConditioningAssembler expects.
+    # Default ``"none"`` preserves back-compat with job YAMLs written before
+    # this field was introduced.
+    mask_source: str = "none"
 
     # S1 v3 Variant A (no ControlNet) has no CN EMA shadow to load; the
     # launcher writes a ``None`` here and the sub-process skips the load.
@@ -409,6 +432,17 @@ class ExhaustiveValEngine:
                 pid_to_image_h5=pid_to_image_h5,
             )
 
+        # Guard: if zero patients produced metric rows the run produced nothing
+        # useful — a header-only CSV looks indistinguishable from a successful
+        # empty run and masks wiring errors (e.g. mask_source mismatch).
+        if not metric_rows:
+            raise ExhaustiveValAllSkippedError(
+                f"exhaustive-val epoch={cfg.epoch}: every patient was skipped — "
+                "no metric rows collected. Check that conditioning wiring is "
+                f"consistent: mask_source={cfg.mask_source!r} must match the "
+                "conditioning_inputs specs written in the job YAML."
+            )
+
         self._write_metrics_csv(out_dir / "metrics.csv", metric_rows)
         self._write_timing_csv(out_dir / "timing.csv", metric_rows)
         # S1 v3 (2026-06-22): per-(cohort, nfe, region) aggregate.csv summarises
@@ -486,10 +520,12 @@ class ExhaustiveValEngine:
             cohort_name = str(f.attrs.get("cohort", "unknown"))
 
         patient_ids = self._val_patient_ids()
-        dataset = LatentH5Dataset(cfg.latents_h5, patient_ids)
+        dataset = LatentH5Dataset(cfg.latents_h5, patient_ids, mask_source=cfg.mask_source)
         ssim_by_pid.update({pid: [] for pid in patient_ids})
         pid_to_image_h5.update({pid: cfg.image_h5 for pid in patient_ids})
 
+        n_ok = 0
+        n_skip = 0
         for i, pid in enumerate(patient_ids):
             try:
                 self._process_patient(
@@ -509,10 +545,23 @@ class ExhaustiveValEngine:
                     image_h5=cfg.image_h5,
                     cohort=cohort_name,
                 )
+                n_ok += 1
             except Exception as exc:
                 logger.warning("exhaustive-val: patient '%s' failed (%s); skipping.", pid, exc)
+                n_skip += 1
                 continue
             logger.info("  [%d/%d] %s done", i + 1, len(patient_ids), pid)
+
+        total = n_ok + n_skip
+        if n_skip > 0 and total > 0 and n_skip / total >= _SKIP_FRACTION_ERROR_THRESHOLD:
+            logger.error(
+                "exhaustive-val single-cohort: %.0f%% of patients skipped (%d/%d); "
+                "check conditioning wiring (mask_source=%r matches conditioning_inputs?).",
+                100.0 * n_skip / total,
+                n_skip,
+                total,
+                cfg.mask_source,
+            )
 
     def _run_multi_cohort(
         self,
@@ -554,6 +603,8 @@ class ExhaustiveValEngine:
             len(all_cohorts),
         )
 
+        n_ok_total = 0
+        n_skip_total = 0
         for cohort_idx, (cohort, budget) in enumerate(zip(all_cohorts, budgets, strict=True)):
             if budget <= 0:
                 logger.info(
@@ -576,7 +627,7 @@ class ExhaustiveValEngine:
                     cohort.name,
                 )
                 continue
-            dataset = LatentH5Dataset(cohort.latent_h5, patient_ids)
+            dataset = LatentH5Dataset(cohort.latent_h5, patient_ids, mask_source=cfg.mask_source)
             ssim_by_pid.update({pid: [] for pid in patient_ids})
             pid_to_image_h5.update({pid: cohort.image_h5 for pid in patient_ids})
 
@@ -604,6 +655,7 @@ class ExhaustiveValEngine:
                         image_h5=cohort.image_h5,
                         cohort=cohort.name,
                     )
+                    n_ok_total += 1
                 except Exception as exc:
                     logger.warning(
                         "exhaustive-val: patient '%s' (cohort %s) failed (%s); skipping.",
@@ -611,10 +663,26 @@ class ExhaustiveValEngine:
                         cohort.name,
                         exc,
                     )
+                    n_skip_total += 1
                     continue
                 logger.info(
                     "  cohort=%s [%d/%d] %s done", cohort.name, i + 1, len(patient_ids), pid
                 )
+
+        grand_total = n_ok_total + n_skip_total
+        if (
+            n_skip_total > 0
+            and grand_total > 0
+            and (n_skip_total / grand_total >= _SKIP_FRACTION_ERROR_THRESHOLD)
+        ):
+            logger.error(
+                "exhaustive-val multi-cohort: %.0f%% of patients skipped (%d/%d); "
+                "check conditioning wiring (mask_source=%r matches conditioning_inputs?).",
+                100.0 * n_skip_total / grand_total,
+                n_skip_total,
+                grand_total,
+                cfg.mask_source,
+            )
 
     def _process_patient(
         self,

@@ -1167,6 +1167,10 @@ class FMTrainRoutineEngine:
             "rflow": cfg.rflow.model_dump(),
             "ema": cfg.ema.model_dump(),
             "fold": cfg.data.fold,
+            # S2 T-13 (task-20): mirror the training data path's mask_source so
+            # the exhaustive-val subprocess builds its LatentH5Dataset with the
+            # same mask-serving policy that the ConditioningAssembler expects.
+            "mask_source": cfg.data.mask_source,
             "nfe_levels": list(ev.nfe_levels),
             "integrator": ev.integrator,
             "n_patients": ev.n_patients,

@@ -90,8 +90,13 @@ model:
 loss:
   cfm:
     weight: 1.0
-    reduction: mean
+    reduction: none
     norm: l1
+    region_weights:
+      enabled: true
+      brain: 1.0
+      tc: 1.0
+      threshold: 0.5
 
 rflow:
   num_train_timesteps: 1000
