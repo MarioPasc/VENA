@@ -26,7 +26,7 @@ from vena.segmentation.data.kfold import FoldPlan, oof_assignment
 from vena.segmentation.exceptions import SegDataError
 from vena.segmentation.models import get_segmentation_model
 
-__all__ = ["oof_model_key", "predict_oof"]
+__all__ = ["load_seg_checkpoint", "oof_model_key", "predict_oof"]
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ def oof_model_key(plan: FoldPlan, patient_id: str) -> int | Literal["all_train"]
 # ---------------------------------------------------------------------------
 
 
-def _load_model(
+def load_seg_checkpoint(
     cfg: SegmentationConfig,
     ckpt_path: Path,
     device: torch.device,
@@ -357,7 +357,7 @@ def predict_oof(
             len(pids),
             tta,
         )
-        model = _load_model(cfg, ckpt_path, dev)
+        model = load_seg_checkpoint(cfg, ckpt_path, dev)
 
         # ---- dataset for this group ---------------------------------------
         if dataset_factory is not None:

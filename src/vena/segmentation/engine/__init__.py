@@ -9,6 +9,7 @@ from vena.segmentation.engine.loss import (
     tversky_term,
 )
 from vena.segmentation.engine.predict import (
+    load_seg_checkpoint,
     oof_model_key,
     predict_oof,
 )
@@ -23,6 +24,7 @@ __all__: list[str] = [
     "SegmentationLoss",
     "ce_term",
     "dice_semimetric_loss",
+    "load_seg_checkpoint",
     "oof_model_key",
     "predict_oof",
     "tversky_term",

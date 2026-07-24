@@ -598,7 +598,7 @@ class TestPredictOof:
     def _make_stub_checkpoint(self, tmp_path: Path, name: str = "best.pt") -> Path:
         """Write a checkpoint that mirrors SegTrainer.fit() output format.
 
-        Includes ``model_meta`` so _load_model uses the embedded metadata
+        Includes ``model_meta`` so load_seg_checkpoint uses the embedded metadata
         rather than the caller's cfg, keeping save/load symmetric.
         ``model_name="segresnet"`` is patched to _TinySegResNet via monkeypatch
         before this checkpoint is loaded.
@@ -765,7 +765,7 @@ class TestPredictOof:
         """Round-trip: fit() → predict_oof() on the same checkpoint.
 
         Asserts strict=True load succeeds with 0 unexpected keys — i.e. the model
-        saved by fit() and loaded by _load_model are identical in key structure.
+        saved by fit() and loaded by load_seg_checkpoint are identical in key structure.
         """
         import vena.segmentation.engine.predict as _pred_mod
         import vena.segmentation.engine.train as _train_mod
