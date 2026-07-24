@@ -563,9 +563,10 @@ class FMTrainRoutineConfig(BaseModel):
         """
         cfm = (self.loss or {}).get("cfm") or {}
         rw = cfm.get("region_weights") or {}
-        if rw.get("enabled", False) and cfm.get("reduction", "mean") != "none":
+        rw_enabled = rw.get("enabled", True if ("brain" in rw or "tc" in rw) else False)
+        if rw_enabled and cfm.get("reduction", "mean") != "none":
             raise ValueError(
-                "loss.cfm.region_weights.enabled=true requires loss.cfm.reduction='none' "
+                "loss.cfm.region_weights enabled=true requires loss.cfm.reduction='none' "
                 f"(got reduction={cfm.get('reduction', 'mean')!r}). Set "
                 "loss.cfm.reduction: none in the YAML."
             )

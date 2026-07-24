@@ -19,16 +19,25 @@ from .base import AbstractFMLoss, CompositeLoss, LossInputs
 from .builder import build_loss
 from .cfm import CFMLoss
 from .contrastive import ContrastiveTumourLoss, RegionTerm
-from .region_weights import RegionWeights, build_region_weight_tensor
+from .region_weights import (
+    BrainTCMissingMaskError,
+    BrainTCWeights,
+    RegionWeights,
+    build_brain_tc_weight_tensor,
+    build_region_weight_tensor,
+)
 
 __all__ = [
     "AbstractFMLoss",
+    "BrainTCMissingMaskError",
+    "BrainTCWeights",
     "CFMLoss",
     "CompositeLoss",
     "ContrastiveTumourLoss",
     "LossInputs",
     "RegionTerm",
     "RegionWeights",
+    "build_brain_tc_weight_tensor",
     "build_loss",
     "build_region_weight_tensor",
 ]

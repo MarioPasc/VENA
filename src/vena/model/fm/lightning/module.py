@@ -680,6 +680,10 @@ class FMLightningModule(pl.LightningModule):
         )
         m_brain = batch.get("m_brain")
         m_tumor = batch.get("m_tumor")
+        # Task 20 adds m_tc_soft (channel 0 of masks/tumor_latent_soft).
+        # Absent until that batch key lands; CFMLoss raises if brain/tc mode
+        # is active and this is None — never silently fall back.
+        m_tc_soft = batch.get("m_tc_soft")
         inputs = LossInputs(
             x_clean=x1,
             noise=x0,
@@ -692,6 +696,7 @@ class FMLightningModule(pl.LightningModule):
             m_bg=m_bg,
             m_brain=m_brain,
             m_tumor=m_tumor,
+            m_tc_soft=m_tc_soft,
         )
         total_steps = self._estimated_total_steps()
         total, per_term = self.composite(
