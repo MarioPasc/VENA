@@ -30,7 +30,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --constraint=cpu
+#SBATCH --partition=cpu_partition
 
 set -euo pipefail
 

@@ -54,10 +54,15 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-# Picasso's sbatch wrapper emits ANSI colour codes even with --parsable; an
-# unstripped id interpolated into a later flag is ACCEPTED by sbatch and then
-# silently ignored. Strip, then assert numeric.
-_clean_job_id() { sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/[^0-9]//g' <<<"$1"; }
+# Picasso's sbatch wrapper emits ANSI colour codes AND a multi-line Lua
+# "No constraint specified" WARNING on stdout, even with --parsable. Stripping
+# non-digits alone is NOT enough: sed works line-by-line, so the warning's
+# newlines survive and the "id" comes back multi-line. Measured 2026-07-24 —
+# the job submits, then the guard rejects the id, leaving an untracked job.
+# Take the LAST line first, then strip ANSI, then assert numeric.
+_clean_job_id() {
+    tail -n 1 <<<"$1" | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/[^0-9]//g'
+}
 
 [[ "${MODE}" == "dry" ]] || mkdir -p "${LOGS_DIR}"
 

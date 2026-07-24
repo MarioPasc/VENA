@@ -24,7 +24,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---- Configurable ----------------------------------------------------------
-REPO_DIR="/mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA"
+# VENA-validation, NOT the shared repos/VENA: the shared repo carries a stale
+# HEAD (this routine does not exist there at all), and `vena` is pip-installed
+# EDITABLE pointing at repos/VENA/src — so the worker's PYTHONPATH export is
+# what keeps `vena` and `routines` on the same tree. See the memory
+# `reference_picasso_split_brain_imports`.
+REPO_DIR="/mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA-validation"
 CONDA_ENV_PATH="/mnt/home/users/tic_163_uma/mpascual/fscratch/conda_envs/vena"
 LOGS_DIR="/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs_seg"
 # ---------------------------------------------------------------------------
