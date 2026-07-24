@@ -854,7 +854,28 @@ stem correctly skipped — expected) but **Arm A BraTS = only 126/198 = 0.636** 
     gate from the trained models, compute it over **TC-bearing cases only**, and report the empty-TC rate plus
     empty-case accuracy as separate numbers — they measure different abilities (localisation vs correct
     abstention). Do not calibrate 0.75 against the pooled figure.
-- **STILL OPEN:** arrays `1642748` + `1642760` to finish; then **re-derive `gseg_tc_dice`** from measured per-cohort TC Dice (0.75
+- **🔴 CPU-RAM OOM — validation cached every patient's full-volume prediction (fixed `0439864`).** `1642748`/
+  `1642760` started training fine (epoch-0 val dice 0.26-0.37, real learning) but tasks began OOM-killing:
+  MaxRSS **103.9 / 98.9 GB** against `--mem=80G`, exit `0:125`. **By cancel time 9 of 12 had OOM'd** — direct proof
+  it was systemic, not a fluke, and that "let them ride" would have lost the run piecemeal.
+  - **Cause:** `_run_val` stashed **every** val patient's `(2,240,240,155)` soft prediction AND target in CPU dicts
+    (~71 MB each), ~49 GB over ~300-357 val scans, held for the whole pass → baseline + 49 GB crossed 80 GB.
+  - **Not deterministic on fold size** (val=357 SURVIVED, val=301 DIED): a near-limit race every task re-runs on each
+    of its ~60 validation passes, and **every task had done only ONE** — so the survivors were not safe, just early.
+  - **Fix:** retain preds/targets **only for the pinned viz patients** (`_try_render_panel`, the sole consumer, reads
+    ≤ `cfg.viz.n_patients`=5). ~49 GB → ~0.7 GB/pass. **Numerically inert** — metrics are still computed over every
+    val patient in the same loop; only the panel cache shrinks. Regression test drives `_run_val` over 8 val patients
+    / 2 pinned and asserts metrics cover all 8 while only 2 are retained. Seg suite 402 → **403**.
+  - loginexa re-smoke at `0439864` PASSED (completed, 0 forbidden, all artifacts, data_wait 4.7 s). ⚠ The capped
+    smoke has tiny val sets so it **cannot reproduce this OOM** — same blind spot as the batch-size and perf bugs; the
+    memory contract is covered by the unit test, and the on-cluster proof is the epoch-5 val of the resubmit.
+- **🚀 RESUBMITTED at `0439864`: UKB `1643624`, SegResNet `1643630`** (6 tasks each). Monitor armed on OOM + failure.
+- **📌 THREE PICASSO RESTARTS THIS SESSION, each a smoke blind spot** — collate (batch=1 never stacks), perf
+  (augment-on-full-volume, only visible from data_wait/step split), OOM (val too small in the cap). The through-line:
+  **watch ONE real epoch of a real submission before trusting an array**; the first epoch's `train_epoch.csv` +
+  `MaxRSS` would have caught all three at zero GPU-day cost. See `[[feedback_smoke_must_exercise_failing_path]]`.
+- **STILL OPEN:** arrays `1643624` + `1643630` to finish (verify memory bounded at epoch-5 val); then **re-derive
+  `gseg_tc_dice`** over TC-bearing cases only. from measured per-cohort TC Dice (0.75
   is provisional and the gate is not trustworthy until then); then S6 (predicted-mask cache + T-06), which now needs
   no multiprocessing workaround thanks to the SDT fix.
 - **~~⚠ S1 STILL BLOCKED~~ → S1 IS CLOSED (2026-07-24).** mask-derive `1631539_2` (UPENN-GBM) hit TIMEOUT at 24 h
