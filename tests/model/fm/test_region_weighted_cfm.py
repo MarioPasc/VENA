@@ -2,7 +2,7 @@
 
 Covers the six deliverables in D3:
 
-1. L1-equivalence: brain/tc mode with equal weights == F.l1_loss(mean).
+1. L1-equivalence: brain/tc mode with equal weights == functional.l1_loss(mean).
 2. Back-compat: all 6 live YAML weight blocks produce byte-identical
    build_region_weight_tensor output before/after the task-21 changes.
 3. Strict partition: BG / Brain / TC are pairwise disjoint and cover
@@ -17,9 +17,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
-
-pytestmark = pytest.mark.fm
+from torch.nn import functional
 
 from vena.model.fm.controlnet.losses import (
     BrainTCMissingMaskError,
@@ -31,6 +29,8 @@ from vena.model.fm.controlnet.losses import (
     build_loss,
     build_region_weight_tensor,
 )
+
+pytestmark = pytest.mark.fm
 
 # ---------------------------------------------------------------------------
 # Shared geometry (CPU tensors, no checkpoint needed)
@@ -77,7 +77,7 @@ def _rand_inputs(error_scale: float = 1.0, seed: int = 42) -> LossInputs:
 
 
 def test_brain_tc_equal_weights_equals_mean_l1() -> None:
-    """brain=1.0, tc=1.0 → identical to F.l1_loss(reduction='mean').
+    """brain=1.0, tc=1.0 → identical to functional.l1_loss(reduction='mean').
 
     With every voxel carrying weight 1.0, (loss*w).sum()/w.sum() = loss.mean().
     This is the load-bearing guarantee: ship the mechanism, change nothing
@@ -88,7 +88,7 @@ def test_brain_tc_equal_weights_equals_mean_l1() -> None:
     inputs = _rand_inputs()
 
     actual = cfm(inputs)
-    expected = F.l1_loss(inputs.v_orig, inputs.u_target, reduction="mean")
+    expected = functional.l1_loss(inputs.v_orig, inputs.u_target, reduction="mean")
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
     residual = (actual - expected).abs().item()
