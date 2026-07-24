@@ -666,7 +666,31 @@ stem correctly skipped — expected) but **Arm A BraTS = only 126/198 = 0.636** 
   but the UKB 1-ch stem cannot map onto 3 channels, so it is **skipped and re-initialised** (MONAI default) while
   encoder stages 1-4 transfer — that is exactly the 17 skipped keys (stem weight+bias + 16 SSL heads) behind
   125/142 = 88.0 %. So: representation transfers, input projection is learned from scratch on all three modalities.
-- **STILL OPEN:** arrays `1635802` + `1636072` to finish; then **re-derive `gseg_tc_dice`** from measured per-cohort TC Dice (0.75
+- **🔴 BOTH FIRST ARRAYS FAILED IN ~90 s — cross-cohort collate crash (fixed `34a2710`).** `1635802` and `1636072`
+  both died with
+  `RuntimeError: stack expects each tensor to be equal size, but got [3, 182, 218, 182] at entry 0 and [3, 240, 240, 155] at entry 1`.
+  The tumour-aware crop ran on an **already-collated batch**, so `default_collate` had to stack raw native volumes —
+  and **cohorts do not share a native shape** (UCSF-PDGM `(240,240,155)` vs `(182,218,182)` elsewhere). Any batch
+  drawn from two cohorts is unstackable, so training could never start. No GPU-days lost (both failed in 90 s).
+  - **Fix:** crop per-sample inside the DataLoader workers via `_CropCollate`, a **picklable class** collate_fn (a
+    closure breaks `num_workers>0`). It and the retained batch helper both route through one `_crop_one_sample`, so
+    they cannot drift. Cropping in workers also parallelises it and cuts IPC from a full volume to one 96³ patch.
+    Validation untouched (whole-volume sliding-window, so its metrics stay G-SEG-comparable).
+  - **🔑 THE REAL DEFECT WAS THE SMOKE.** Both smokes used `batch_size: 1`, which never stacks two samples, so
+    neither could reproduce it — green smoke, unrunnable production job. **Both smokes raised to `batch_size: 2`
+    (production value).** Rule: shrink epochs/patients/patch to make a smoke fast, **never** shrink a dimension to
+    the value that disables the path (batch→1, folds→1, cohorts→1, GPUs→1). Memory
+    `[[feedback_smoke_must_exercise_failing_path]]`. +4 regression tests, incl. one pinning the raw
+    `default_collate` failure so the guard keeps its meaning, and an end-to-end `fit()` at `batch_size=2` over
+    mismatched shapes. Seg suite 389 → **393**.
+- **✅ LOGINEXA RE-SMOKE AT `batch_size=2` PASSED** (`34a2710`): `seg-train completed`, **0** hits for
+  `equal size|Traceback|CUDA out of memory`, 5/5 artifacts, no `temperatures.json`, `figures/epoch_00{0,1}.png`.
+  G-SEG honest: 6/9 cohorts `status:"ok"` with real values (BraTS-GLI tc=0.136, UPENN-GBM 0.319, REMBRANDT 0.239,
+  Ring-B BraTS-Africa-Glioma 0.245 / -Other 0.091 / BraTS-PED 0.157), 3 cohorts `null` + `missing-data`.
+- **🚀 RESUBMITTED at `34a2710`: UKB `1640255`, SegResNet `1640256`** (6 tasks each). Monitor armed on **failure
+  states as well as terminal** — the previous monitor only fired on all-terminal, which still caught it, but a
+  failure-aware filter reports sooner.
+- **STILL OPEN:** arrays `1640255` + `1640256` to finish; then **re-derive `gseg_tc_dice`** from measured per-cohort TC Dice (0.75
   is provisional and the gate is not trustworthy until then); then S6 (predicted-mask cache + T-06), which now needs
   no multiprocessing workaround thanks to the SDT fix.
 - **⚠ S1 STILL BLOCKED:** mask-derive `1631539_2` (UPENN-GBM) hit **TIMEOUT** at 24 h. The H5 is byte-clean (schema
