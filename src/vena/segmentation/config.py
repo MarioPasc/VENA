@@ -50,6 +50,15 @@ class ModelConfig(BaseModel):
         loading (e.g. encoder-only SSL weights missing decoder parameters).
     deep_supervision:
         Enable auxiliary losses on intermediate decoder heads.
+    init_from_ssl:
+        Attempt SSL encoder initialisation when the model is built.  Set
+        ``False`` when the caller is about to overwrite every weight from a
+        trained checkpoint — reconstruction for inference, in particular.  It
+        skips a pointless load and, more importantly, suppresses the builder's
+        "checkpoint not found — using MONAI random init" WARNING, which is
+        accurate for a fresh build but reads as "this model is untrained" when
+        it is emitted moments before ``load_state_dict(strict=True)`` restores
+        the trained weights.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -61,6 +70,7 @@ class ModelConfig(BaseModel):
     checkpoint: Path | None = None
     strict_load: bool = False
     deep_supervision: bool = True
+    init_from_ssl: bool = True
 
 
 class DataConfig(BaseModel):

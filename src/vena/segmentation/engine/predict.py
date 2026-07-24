@@ -115,6 +115,11 @@ def load_seg_checkpoint(
             in_channels=meta.get("in_channels", cfg.model.in_channels),
             out_channels=meta.get("out_channels", cfg.model.out_channels),
             deep_supervision=meta.get("deep_supervision", cfg.model.deep_supervision),
+            # Every weight is about to be replaced from the checkpoint below, so
+            # skip SSL init: it would be discarded, and its "checkpoint not found
+            # — using MONAI random init" WARNING would make a fully-trained model
+            # look untrained in the log.
+            init_from_ssl=False,
         )
     else:
         # Legacy checkpoint without embedded metadata — trust the caller's cfg
@@ -122,7 +127,7 @@ def load_seg_checkpoint(
             "Checkpoint %s lacks 'model_meta'; falling back to cfg.model for reconstruction.",
             ckpt_path,
         )
-        model_cfg = cfg.model
+        model_cfg = cfg.model.model_copy(update={"init_from_ssl": False})
 
     model = get_segmentation_model(model_cfg.name, model_cfg).to(device)
     model.load_state_dict(state["model_state_dict"], strict=True)

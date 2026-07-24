@@ -32,6 +32,13 @@ data:
   patch_size: [96, 96, 96]    # real production patch — exercises the memory path
   cache_rate: 0.0
   num_workers: 4              # fewer workers than production to stay in time
+  # Loginexa has a HARD 30-min wallclock. Uncapped this trains on all 1224
+  # patients and validates whole-volume sliding-window on 290 — hours, not
+  # minutes. The cap keeps every real component in the path (registry, H5
+  # reader, split resolver, BSF load, optimiser step, sliding-window val, viz,
+  # G-SEG, decision.json) while bounding the work. splits.json records
+  # is_capped_subset so this run can never be read as a full one.
+  max_patients_per_cohort: 2
 
 targets:
   soft: true

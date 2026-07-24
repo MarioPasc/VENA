@@ -436,6 +436,10 @@ def build_bsf_swinunetr_brats(cfg: ModelConfig) -> nn.Module:  # type: ignore[mi
     Spatial divisibility: H, W, D must each be divisible by 32.
     """
     model = _VenaSwinUNETR(cfg, swinunetr_kwargs=_BSF_BRATS_SWIN_KW)
+    if not cfg.init_from_ssl:
+        # Caller supplies every weight from a trained checkpoint; skip SSL init
+        # so no misleading "random init" WARNING is emitted (see ModelConfig).
+        return model
     ckpt = Path(cfg.checkpoint) if cfg.checkpoint is not None else _BSF_BRATS_CKPT
 
     if not ckpt.exists():
@@ -469,6 +473,10 @@ def build_bsf_swinunetr_ukb(cfg: ModelConfig) -> nn.Module:  # type: ignore[misc
     Spatial divisibility: H, W, D must each be divisible by 32.
     """
     model = _VenaSwinUNETR(cfg, swinunetr_kwargs=_BSF_UKB_SWIN_KW)
+    if not cfg.init_from_ssl:
+        # Caller supplies every weight from a trained checkpoint; skip SSL init
+        # so no misleading "random init" WARNING is emitted (see ModelConfig).
+        return model
     ckpt = Path(cfg.checkpoint) if cfg.checkpoint is not None else _BSF_UKB_CKPT
 
     if not ckpt.exists():
