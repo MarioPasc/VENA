@@ -83,6 +83,15 @@ poll_interval_seconds: 90
 # leaks an orphan bash loop per run. `pkill -f 'until ! pgrep'` after a PASS.
 profiles:
 
+  fm_validation:
+    # Same FM trainer as the default profile, but run from VENA-validation.
+    # WHY: a long production job (the v3a-a6 ablation) is executing out of the
+    # shared repos/VENA, and its async exhaustive-val subprocess re-imports the
+    # tree at every cadence epoch — so rsyncing a smoke over that repo would
+    # change a running job's code and drift its recorded git_sha. Both are real
+    # git repos, so provenance resolves either way; this one is simply not in use.
+    repo_path_remote: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA-validation
+
   segmentation:
     # S5 — tumour segmenter (BSF-SwinUNETR / SegResNet), image-domain, 3-ch
     # {T1pre, T2, FLAIR} -> soft [TC, NETC]. Never sees T1c (label leakage).

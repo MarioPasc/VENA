@@ -4,8 +4,6 @@
 # under loginexa constraints (1× V100-DGXS-32GB, 30-min hard wallclock).
 #
 # Smoke-only differences:
-#   * resume_from=null — smokes always start fresh (validates model build,
-#     not warm-start loading; ema_best.ckpt is not required on loginexa).
 #   * max_epochs=2 + total_steps=400 (total_steps binds PL max_steps; > 2-epoch
 #     step count so max_epochs binds first).
 #   * warmup_steps=40 (was 1000) — cosine decay completes inside the smoke.
@@ -27,8 +25,14 @@
 
 run:
   stage: s1
-  tag: s2_t13_j0_cn2ch_freeze
-  resume_from: null          # fresh start — smokes never warm-start
+  tag: s2_t13_smoke_cn2ch
+  # WARM_START from the real v3a ema_best.ckpt — deliberately NOT null.
+  # Every production arm warm-starts from this file, and warm-start is exactly
+  # where a fresh 2-ch ControlNet on a 16-ch-conv_in trunk would blow up on a
+  # shape mismatch. A smoke that skips it cannot catch that class of failure —
+  # the same blind spot that killed both S5 arrays in 90 s.
+  # Read-only, weights-only (fresh optimiser/EMA/RNG); nothing is written here.
+  resume_from: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/vena_project/2026-06-24_16-00-46_s1_v3a_concat_only_fft_ef000c9f/checkpoints/ema_best.ckpt
   seed: 1337
   device: cuda
   precision: bf16-mixed
