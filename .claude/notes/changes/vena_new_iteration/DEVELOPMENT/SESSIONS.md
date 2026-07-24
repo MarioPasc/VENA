@@ -492,6 +492,27 @@ jobs RUNNING** (job ids recorded, `Dependency` clean); exhaustive-val cadence wr
   explicit `scancel` rather than a crash — so I do not believe the rsync killed them, but the risk was real and
   avoidable. **Rule: check `squeue` for jobs running out of a tree before rsyncing over it.**
 
+- **✅ AUG CACHE COMPLETE — all 6 cv cohorts, array `1642818` (+ pilot `1642663`).** Elapsed times are *plausible for
+  the work claimed* (the check that catches a silent skip): UCSF 724 rows/6:23 = 0.53 s/row · BraTS-GLI 4496/54:16 =
+  0.72 · UPENN-GBM 588/9:24 = 0.96 · IvyGAP 116/1:36 = 0.83 · LUMIERE 2108/24:30 = 0.70 · REMBRANDT 232/3:35 = 0.93.
+  **Total 8264 rows**, matching the recorded aug-bank size. Verified on disk in all 6: schema **0.3.0**,
+  `masks/tumor_latent_soft (N,2,48,56,48)` float32, `tumor_region='tc'`, row count == `ids` == `latents`,
+  range `[0.03445, 0.96555]`, **0 nesting violations**, oracle `masks/tumor_latent` intact. I ran the smallest
+  cohort (IvyGAP) as a pilot and verified its written group before releasing the other five — worth repeating for
+  any job that writes into a 353 GB bank.
+
+- **🚀 5-JOB ORACLE MATRIX SUBMITTED (2026-07-24), repo HEAD `c2b3ab0`:**
+  **J0 `1643042`** (freeze, tc=1) · **J1 `1643044`** (joint, tc=1) · **J2 `1643046`** (joint, tc=5) ·
+  **J3 `1643048`** (joint, tc=10) · **J4 `1643050`** (joint, tc=20).
+  All five: `Features=a100` (NOT dgx/B200), `TresPerNode=gres/gpu:2`, `Dependency=(null)` — which is the *intended*
+  state here since no dependency was requested; the trap is a dependency that was requested and silently dropped.
+  `sbatch --test-only` accepted all five onto **exa04** before any live submission.
+  **⚠ They are PENDING, not RUNNING** — exit criterion 4 says RUNNING and it is NOT yet met. SLURM's start estimate
+  is weeks out (heavy queue pressure; 12 pending `vena-seg-train` tasks from the S5 resubmit compete for the same
+  A100 pool). Monitor armed on start transitions, every failure state, and completion. **S3 must confirm the arms
+  actually started and that an early cadence epoch wrote non-empty `exhaustive_val/epoch_NNN/metrics.csv` on the
+  REAL runs** — the smoke proved the wiring, not these jobs.
+
 - **What S3 must know:** use **PSNR_ET**, never PSNR_WT. J0 is the ControlNet-only floor; **J0→J1 is the
   freeze→joint gain** and is only interpretable because lr and the loss path are shared. Watch **FP-safety on J4**
   (top weight). The oracle→predicted gap must be reported **per cohort** — BraTS-PED's oracle ceiling is already
