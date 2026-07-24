@@ -116,7 +116,16 @@ profiles:
     # runs `vena.segmentation` from here, so the two stay on one deployment.
     repo_path_remote: /mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA-validation
 
-    smoke_cmd_template: '{python} -m routines.segmentation.train.cli {config}'
+    # 🔴 PYTHONPATH IS LOAD-BEARING — same split-brain trap documented in the
+    # `fm_validation` profile above. `vena` is pip-installed EDITABLE and
+    # path-pinned to repos/VENA/src, so launching from VENA-validation without
+    # PYTHONPATH silently mixes `routines` from here with `vena` from the STALE
+    # shared repo — no error, wrong library. The SLURM worker already exports it
+    # (`worker_picasso_seg.sh`); an interactive loginexa launch must too, or it
+    # validates code that is not the code you are about to submit.
+    # Assert, don't assume:
+    #   PYTHONPATH=$PWD/src:$PWD python -c "import vena; print(vena.__file__)"
+    smoke_cmd_template: 'PYTHONPATH=/mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA-validation/src:/mnt/home/users/tic_163_uma/mpascual/fscratch/repos/VENA-validation {python} -m routines.segmentation.train.cli {config}'
     smoke_config_glob: 'routines/segmentation/train/configs/smoke/*.yaml'
     process_anchor: 'vena-v100/bin/python -m routines.segmentation.train.cli'
 
