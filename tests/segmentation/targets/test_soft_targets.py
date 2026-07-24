@@ -590,3 +590,98 @@ class TestGeodesicSanity:
         wrong_image = np.zeros((99, 99, 99), dtype=np.float32)
         with pytest.raises(SegTargetError, match="shape"):
             signed_distance(mask, mode="geodesic", image=wrong_image, clip_vox=10.0)
+
+
+# ---------------------------------------------------------------------------
+# Bounding-box-restricted EDT (performance fix, 2026-07-24)
+# ---------------------------------------------------------------------------
+
+
+def _reference_percomponent_clipped(mask: np.ndarray, clip_vox: float) -> np.ndarray:
+    """Full-volume per-component SDT — the pre-optimisation reference.
+
+    Reproduces the original ``_euclidean_percomponent`` (two whole-volume
+    Euclidean transforms per connected component, unioned by element-wise max)
+    so the bounding-box implementation can be checked against it exactly.
+    """
+    from scipy.ndimage import label as nd_label
+
+    from vena.segmentation.targets.sdt import _edt_single_mask
+
+    labelled, n_comps = nd_label(mask, structure=np.ones((3, 3, 3), dtype=bool))
+    union = np.full(mask.shape, -np.inf, dtype=np.float32)
+    for comp_idx in range(1, n_comps + 1):
+        np.maximum(union, _edt_single_mask(labelled == comp_idx), out=union)
+    return np.clip(union, -clip_vox, clip_vox).astype(np.float32)
+
+
+class TestBoundingBoxEquivalence:
+    """The bbox-restricted EDT must be bit-identical to the full-volume form.
+
+    ``signed_distance`` evaluates each component's Euclidean transform on the
+    component's bounding box grown by ``ceil(clip_vox) + 1`` voxels rather than
+    on the whole volume.  Every voxel outside that box is further than
+    ``clip_vox`` from the component, so its true SDT clips to ``-clip_vox`` —
+    which is what the accumulator is pre-filled with.  The clipped result is
+    therefore exactly equal, not merely close.
+
+    This matters for throughput, not just tidiness: on a native
+    ``(240, 240, 155)`` label the full-volume form costs 13-41 s per scan and
+    ``SegImageDataset.__getitem__`` calls it **per sample, per epoch**.
+    """
+
+    CLIP = 10.0
+    SHAPE = (64, 64, 48)
+
+    @pytest.mark.parametrize(
+        ("centres", "radii"),
+        [
+            pytest.param([(32, 32, 24)], [8.0], id="single-component"),
+            pytest.param([(14, 14, 12), (50, 50, 36)], [5.0, 6.0], id="two-far-apart"),
+            pytest.param(
+                [(20, 20, 20), (26, 26, 24), (48, 12, 34)],
+                [4.0, 3.0, 5.0],
+                id="three-mixed-spacing",
+            ),
+            pytest.param([(1, 1, 1)], [3.0], id="component-clipped-by-volume-edge"),
+            pytest.param([(62, 62, 46)], [4.0], id="component-at-far-corner"),
+        ],
+    )
+    def test_identical_to_full_volume(
+        self, centres: list[tuple[int, int, int]], radii: list[float]
+    ) -> None:
+        mask = np.zeros(self.SHAPE, dtype=bool)
+        for centre, radius in zip(centres, radii, strict=True):
+            mask |= _sphere_mask(self.SHAPE, centre, radius)
+
+        fast = signed_distance(
+            mask, mode="euclidean_percomponent", image=None, clip_vox=self.CLIP
+        )
+        reference = _reference_percomponent_clipped(mask, self.CLIP)
+
+        assert np.array_equal(fast, reference), (
+            "bbox-restricted SDT diverged from the full-volume reference; "
+            f"max |diff| = {np.abs(fast - reference).max()}"
+        )
+
+    def test_empty_mask_is_uniform_far_field(self) -> None:
+        empty = np.zeros(self.SHAPE, dtype=bool)
+        out = signed_distance(
+            empty, mode="euclidean_percomponent", image=None, clip_vox=self.CLIP
+        )
+        assert np.all(out == -self.CLIP)
+        assert np.isfinite(out).all(), "empty mask must clip to -clip_vox, never -inf"
+
+    def test_gap_between_components_is_not_interior(self) -> None:
+        """The load-bearing per-component property survives the optimisation."""
+        mask = _sphere_mask(self.SHAPE, (18, 32, 24), 5.0) | _sphere_mask(
+            self.SHAPE, (46, 32, 24), 5.0
+        )
+        out = signed_distance(
+            mask, mode="euclidean_percomponent", image=None, clip_vox=self.CLIP
+        )
+        midpoint = out[32, 32, 24]
+        assert midpoint < 0.0, (
+            f"midpoint between two disjoint lesions scored as interior ({midpoint});"
+            " one component 'reached across' to the other"
+        )
