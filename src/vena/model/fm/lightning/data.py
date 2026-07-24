@@ -1,29 +1,46 @@
 """HDF5-backed dataset + LightningDataModule for FM training.
 
-Reads ``UCSFPDGM_latents.h5`` (schema 0.1.0, produced by
-``vena.data.h5.ucsf_pdgm.latent_domain.convert``). Per-patient single-chunk
-reads keep streaming cheap.
+Reads cohort latent H5s (schema 2.1.0, produced by ``vena-encode-*``).
+Per-patient single-chunk reads keep streaming cheap.
 
 Each item is a dict::
 
     {
         "patient_id": str,
-        "z_t1pre": Tensor(4, 60, 60, 40),
-        "z_t2": Tensor(4, 60, 60, 40),
-        "z_flair": Tensor(4, 60, 60, 40),
-        "z_t1c": Tensor(4, 60, 60, 40),  # target
-        "m_wt": Tensor(1, 60, 60, 40),  # binary WT mask (legacy, kept for back-compat)
-        "m_tumor": Tensor(3, 60, 60, 40),  # soft per-class masks (NETC, ED, ET)
-        "m_netc": Tensor(1, 60, 60, 40),  # m_tumor[0:1] view
-        "m_ed": Tensor(1, 60, 60, 40),  # m_tumor[1:2] view
-        "m_et": Tensor(1, 60, 60, 40),  # m_tumor[2:3] view
+        "z_t1pre": Tensor(4, 48, 56, 48),
+        "z_t2": Tensor(4, 48, 56, 48),
+        "z_flair": Tensor(4, 48, 56, 48),
+        "z_t1c": Tensor(4, 48, 56, 48),  # target
+        "m_wt": Tensor(1, 48, 56, 48),  # binary WT mask (legacy, kept for back-compat)
+        "m_tumor": Tensor(3, 48, 56, 48),  # soft per-class masks (NETC, ED, ET)
+        "m_netc": Tensor(1, 48, 56, 48),  # m_tumor[0:1] view
+        "m_ed": Tensor(1, 48, 56, 48),  # m_tumor[1:2] view
+        "m_et": Tensor(1, 48, 56, 48),  # m_tumor[2:3] view
+        # --- optional, when data.mask_source != "none" ---
+        "m_tc_soft": Tensor(1, 48, 56, 48),  # soft TC (tumour core = NETC+ET, edema excluded)
+        "m_netc_soft": Tensor(1, 48, 56, 48),  # soft NETC
     }
+
+Grid shape: ``(48, 56, 48)`` (MAISI 4× spatial compression of the
+``(192, 224, 192)`` brain-box crop; ``48*56*48 = 129024``).
 
 The WT mask is derived from ``masks/tumor_latent[i]`` (3 soft NETC/ED/ET maps)
 by ``m_wt = (clip(c0+c1+c2, 0, 1) >= 0.5).float()`` per proposal §2.2. The
 sum-then-threshold semantics are preserved for back-compat with the v0.4
 contrastive loss; ``m_tumor`` and the per-class slices are new (2026-06-22,
 S1 v3) and consumed by the region-weighted L1 loss and per-region metrics.
+
+Soft 2-channel mask serving (task-20 / S2 T-13):
+  - ``mask_source="none"`` (default) — ``m_tc_soft`` / ``m_netc_soft`` absent;
+    behaviour byte-identical to prior releases.
+  - ``mask_source="oracle_soft"`` — reads ``masks/tumor_latent_soft``
+    (schema 2.1.0 ``tumor_region="tc"``); raises
+    :class:`MissingSoftMaskGroupError` if absent. Never silently falls back.
+  - ``mask_source="predicted"`` — reads ``masks/tumor_latent_pred``; raises if
+    absent.
+  - ``mask_source="derived"`` — computes ``m_tc_soft = clip(NETC+ET, 0, 1)``
+    from the existing ``masks/tumor_latent``; use for aug-H5 runs where the
+    oracle_soft group was not back-filled.
 
 Additional modalities (ADC, SWI) or priors (vessel, perfusion) are loaded on
 demand: pass their names through ``extra_latents`` / ``extra_priors`` and the
@@ -51,6 +68,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Valid values for the ``mask_source`` parameter.
+_VALID_MASK_SOURCES: frozenset[str] = frozenset({"none", "oracle_soft", "predicted", "derived"})
+
+
+class MissingSoftMaskGroupError(RuntimeError):
+    """Raised when a requested soft-mask H5 group is absent.
+
+    Surfaces the H5 path and missing group name so the operator knows
+    exactly which cache step has not been run for this cohort.  Never
+    returns zeros or a warning — a missing group is a hard error.
+    """
+
 
 class MissingFoldSplitError(RuntimeError):
     """Raised when a cohort's latent H5 lacks the requested CV fold splits.
@@ -60,6 +89,101 @@ class MissingFoldSplitError(RuntimeError):
     cohort's image-domain converter) or re-copy the canonical artifact from
     a host that has the correct schema.
     """
+
+
+def _read_soft_masks(
+    h5: h5py.File,
+    row: int,
+    h5_path: Path,
+    mask_source: str,
+    m_netc_np: np.ndarray | None = None,
+    m_et_np: np.ndarray | None = None,
+) -> dict[str, torch.Tensor]:
+    """Serve the 2-channel soft mask [TC, NETC] according to ``mask_source``.
+
+    This is the single shared implementation for both :class:`LatentH5Dataset`
+    and :class:`OfflineAugmentedLatentH5Dataset`.  Routing both paths through
+    here makes divergence structurally impossible.
+
+    Parameters
+    ----------
+    h5 : h5py.File
+        Open H5 file handle (any of clean or aug latent H5).
+    row : int
+        Row index into the H5 datasets.
+    h5_path : Path
+        H5 file path; used in error messages only.
+    mask_source : str
+        One of ``"none"``, ``"oracle_soft"``, ``"predicted"``, ``"derived"``.
+    m_netc_np : np.ndarray | None
+        Pre-read NETC channel from ``masks/tumor_latent`` (channel 0),
+        shape ``(1, H, W, D)``.  Required when ``mask_source="derived"``.
+    m_et_np : np.ndarray | None
+        Pre-read ET channel from ``masks/tumor_latent`` (channel 2),
+        shape ``(1, H, W, D)``.  Required when ``mask_source="derived"``.
+
+    Returns
+    -------
+    dict[str, torch.Tensor]
+        Keys ``"m_tc_soft"`` (channel 0) and ``"m_netc_soft"`` (channel 1),
+        each ``(1, H, W, D)`` float32 in [0, 1], satisfying
+        ``m_netc_soft <= m_tc_soft``.  Empty dict when ``mask_source="none"``.
+
+    Raises
+    ------
+    MissingSoftMaskGroupError
+        When the requested H5 group (``oracle_soft`` or ``predicted``) is
+        absent.  Never returns zeros or falls back silently.
+    ValueError
+        On an unrecognised ``mask_source`` value.
+    """
+    if mask_source == "none":
+        return {}
+
+    if mask_source == "oracle_soft":
+        group = "masks/tumor_latent_soft"
+        if group not in h5:
+            raise MissingSoftMaskGroupError(
+                f"H5 file {h5_path} is missing group {group!r}. "
+                f"Set data.mask_source='none' or 'derived' if the oracle "
+                f"soft-mask cache (schema 2.1.0) has not been written for "
+                f"this cohort, or re-run task-19 mask derivation."
+            )
+        soft_np = np.ascontiguousarray(h5[group][row])  # (2, H, W, D)
+
+    elif mask_source == "predicted":
+        group = "masks/tumor_latent_pred"
+        if group not in h5:
+            raise MissingSoftMaskGroupError(
+                f"H5 file {h5_path} is missing group {group!r}. "
+                f"Run the predicted-mask routine (task-18) before setting "
+                f"data.mask_source='predicted'."
+            )
+        soft_np = np.ascontiguousarray(h5[group][row])  # (2, H, W, D)
+
+    elif mask_source == "derived":
+        # Explicit opt-in derivation: m_tc_soft = clip(NETC+ET, 0, 1).
+        # Produces a *different* soft map from the SDT-cache used by
+        # oracle_soft — use only when the oracle group is unavailable
+        # (e.g. offline-aug H5s that were never back-filled).
+        if m_netc_np is None or m_et_np is None:
+            raise ValueError(
+                "mask_source='derived' requires pre-read m_netc_np and "
+                "m_et_np arrays from masks/tumor_latent"
+            )
+        tc_soft = np.clip(m_netc_np + m_et_np, 0.0, 1.0)  # (1, H, W, D)
+        soft_np = np.concatenate([tc_soft, m_netc_np], axis=0)  # (2, H, W, D)
+
+    else:
+        raise ValueError(
+            f"Unknown mask_source={mask_source!r}; expected one of {sorted(_VALID_MASK_SOURCES)}"
+        )
+
+    soft_t = torch.from_numpy(soft_np).float()
+    return {
+        "m_tc_soft": soft_t[0:1],  # (1, H, W, D) TC = NETC+ET, edema excluded
+        "m_netc_soft": soft_t[1:2],  # (1, H, W, D) NETC alone
+    }
 
 
 def _assert_cohort_splits_present(
@@ -117,7 +241,7 @@ def _seed_worker(worker_id: int) -> None:
 
 
 class LatentH5Dataset(Dataset):
-    """Per-patient view over ``UCSFPDGM_latents.h5``.
+    """Per-patient view over a cohort latent H5 (schema 2.x.0).
 
     Parameters
     ----------
@@ -136,6 +260,10 @@ class LatentH5Dataset(Dataset):
     extra_priors : Sequence[str] | None
         Names under ``/priors/<name>``; emitted as ``prior_<name>``. Empty by
         default since ``priors/`` is currently empty in the H5.
+    mask_source : str
+        Controls whether and how the 2-channel soft mask ``[TC, NETC]`` is
+        served.  One of ``"none"`` (default, back-compat), ``"oracle_soft"``,
+        ``"predicted"``, ``"derived"``.  See module docstring for semantics.
     """
 
     DEFAULT_LATENTS: tuple[str, ...] = ("t1pre", "t2", "flair", "t1c")
@@ -148,8 +276,14 @@ class LatentH5Dataset(Dataset):
         wt_threshold: float = 0.5,
         extra_priors: Sequence[str] | None = None,
         transform: AugmentationPipeline | None = None,
+        mask_source: str = "none",
     ) -> None:
         super().__init__()
+        if mask_source not in _VALID_MASK_SOURCES:
+            raise ValueError(
+                f"mask_source={mask_source!r} is not valid; "
+                f"expected one of {sorted(_VALID_MASK_SOURCES)}"
+            )
         self.h5_path = Path(h5_path)
         if not self.h5_path.is_file():
             raise FileNotFoundError(f"latents H5 not found: {self.h5_path}")
@@ -157,6 +291,7 @@ class LatentH5Dataset(Dataset):
         self.latents: tuple[str, ...] = tuple(latents)
         self.wt_threshold = float(wt_threshold)
         self.extra_priors: tuple[str, ...] = tuple(extra_priors or ())
+        self.mask_source = mask_source
         # Optional latent-space augmentation pipeline. When set, the dataset
         # invokes it at the end of ``_read_one`` so augmentation runs inside
         # the DataLoader worker (CPU-parallel, no GPU blocking).
@@ -198,10 +333,10 @@ class LatentH5Dataset(Dataset):
 
         out: dict[str, torch.Tensor | str] = {"patient_id": pid}
         for name in self.latents:
-            arr = h5[f"latents/{name}"][row]  # (4, 60, 60, 40) float32
+            arr = h5[f"latents/{name}"][row]  # (4, 48, 56, 48) float32
             out[f"z_{name}"] = torch.from_numpy(np.ascontiguousarray(arr)).float()
 
-        tumor_lat = h5["masks/tumor_latent"][row]  # (3, 60, 60, 40), soft NETC/ED/ET
+        tumor_lat = h5["masks/tumor_latent"][row]  # (3, 48, 56, 48), soft NETC/ED/ET
         soft_union = np.clip(tumor_lat.sum(axis=0, keepdims=True), 0.0, 1.0)
         m_wt = (soft_union >= self.wt_threshold).astype(np.float32)
         out["m_wt"] = torch.from_numpy(np.ascontiguousarray(m_wt))
@@ -217,6 +352,19 @@ class LatentH5Dataset(Dataset):
         out["m_netc"] = m_tumor_t[0:1]
         out["m_ed"] = m_tumor_t[1:2]
         out["m_et"] = m_tumor_t[2:3]
+
+        # S2 T-13 (task-20): optional 2-channel soft mask [TC, NETC].
+        # Routed through the shared helper so both dataset paths stay in sync.
+        out.update(
+            _read_soft_masks(
+                h5,
+                row,
+                self.h5_path,
+                self.mask_source,
+                m_netc_np=np.ascontiguousarray(tumor_lat[0:1]),
+                m_et_np=np.ascontiguousarray(tumor_lat[2:3]),
+            )
+        )
 
         # Brain mask in latent space — produced by `vena-encode-brain-to-latent`
         # (`masks/brain_latent`, shape (1, h, w, d), int8). Required by the v0.4
@@ -286,6 +434,13 @@ class OfflineAugmentedLatentH5Dataset(Dataset):
         construction; missing variants get weight 0.
     latents, wt_threshold, extra_priors, transform : forwarded to
         :class:`LatentH5Dataset` for the v0 read.
+    mask_source : str
+        Controls soft-mask serving — forwarded to the wrapped clean
+        :class:`LatentH5Dataset` (v0 reads) and also applied in
+        :meth:`_read_aug` (v1+ reads).  **Note**: aug H5s do NOT carry
+        ``masks/tumor_latent_soft``; use ``"derived"`` or ``"none"`` when
+        ``use_offline_augmented_data=True``.  ``"oracle_soft"`` on the aug
+        path raises :class:`MissingSoftMaskGroupError`.
 
     Raises
     ------
@@ -305,15 +460,23 @@ class OfflineAugmentedLatentH5Dataset(Dataset):
         extra_priors: Sequence[str] | None = None,
         transform=None,  # AugmentationPipeline | None — string-annotated to skip import
         seed: int = 0,
+        mask_source: str = "none",
     ) -> None:
         super().__init__()
+        if mask_source not in _VALID_MASK_SOURCES:
+            raise ValueError(
+                f"mask_source={mask_source!r} is not valid; "
+                f"expected one of {sorted(_VALID_MASK_SOURCES)}"
+            )
         self.aug_h5_path = Path(aug_h5_path)
         if not self.aug_h5_path.is_file():
             raise FileNotFoundError(f"aug-latent H5 not found: {self.aug_h5_path}")
         self.patient_ids: list[str] = list(patient_ids)
         # Hot-path lookup for the fallback in _read_aug; avoids O(N) list.index.
         self._pid_to_idx: dict[str, int] = {p: i for i, p in enumerate(self.patient_ids)}
+        self._mask_source = mask_source
         # The clean reader handles v0 (and also owns the online transform).
+        # Passes mask_source so v0 reads use the same soft-mask policy.
         self._clean = LatentH5Dataset(
             clean_h5_path,
             patient_ids,
@@ -321,6 +484,7 @@ class OfflineAugmentedLatentH5Dataset(Dataset):
             wt_threshold=wt_threshold,
             extra_priors=extra_priors,
             transform=transform,
+            mask_source=mask_source,
         )
         # For v1..vK we still want the online transform; do it after the
         # aug read via the *same* pipeline. We share self._clean.transform.
@@ -420,6 +584,19 @@ class OfflineAugmentedLatentH5Dataset(Dataset):
         out["m_netc"] = m_tumor_t[0:1]
         out["m_ed"] = m_tumor_t[1:2]
         out["m_et"] = m_tumor_t[2:3]
+        # S2 T-13 (task-20): optional soft mask — same helper as clean path.
+        # Note: aug H5s do NOT carry masks/tumor_latent_soft (never back-filled);
+        # oracle_soft raises MissingSoftMaskGroupError; use "derived" or "none".
+        out.update(
+            _read_soft_masks(
+                h5,
+                row,
+                self.aug_h5_path,
+                self._mask_source,
+                m_netc_np=np.ascontiguousarray(tumor_lat[0:1]),
+                m_et_np=np.ascontiguousarray(tumor_lat[2:3]),
+            )
+        )
         # Parity with LatentH5Dataset.__getitem__: load `masks/brain_latent` when
         # the aug H5 carries it. Without this, a mixed batch (v0 emits m_brain,
         # v1+ does not) collapses in default_collate with KeyError 'm_brain'.
@@ -677,8 +854,14 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
         dedup_allowlists: dict[str, set[str]] | None = None,
         use_offline_augmented_data: bool = False,
         variant_weights: dict[str, float] | None = None,
+        mask_source: str = "none",
     ) -> None:
         super().__init__()
+        if mask_source not in _VALID_MASK_SOURCES:
+            raise ValueError(
+                f"mask_source={mask_source!r} is not valid; "
+                f"expected one of {sorted(_VALID_MASK_SOURCES)}"
+            )
         self.registry = registry
         self.fold = int(fold)
         self.batch_size = int(batch_size)
@@ -687,6 +870,7 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
         self.pin_memory = bool(pin_memory)
         self.seed = int(seed)
         self.max_train_patients_per_cohort = max_train_patients_per_cohort
+        self.mask_source = mask_source
         # Augmentation runs on training samples only; validation / test never
         # see augmented data so metrics remain comparable across runs.
         self.train_transform = train_transform
@@ -889,15 +1073,17 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
                     variant_weights=self.variant_weights,
                     transform=self.train_transform,
                     seed=self.seed,
+                    mask_source=self.mask_source,
                 )
             else:
                 train_ds = LatentH5Dataset(
                     cohort.latent_h5,
                     train_scan_ids,
                     transform=self.train_transform,
+                    mask_source=self.mask_source,
                 )
-            val_ds = LatentH5Dataset(cohort.latent_h5, val_scan_ids)
-            test_ds = LatentH5Dataset(cohort.latent_h5, test_scan_ids)
+            val_ds = LatentH5Dataset(cohort.latent_h5, val_scan_ids, mask_source=self.mask_source)
+            test_ds = LatentH5Dataset(cohort.latent_h5, test_scan_ids, mask_source=self.mask_source)
 
             train_cohort_datasets.append((cohort.name, train_ds))
             val_cohort_datasets.append((cohort.name, val_ds))
@@ -940,7 +1126,7 @@ class MultiCohortLatentDataModule(pl.LightningDataModule):
                 len(all_patient_keys),
                 len(all_scan_ids),
             )
-            test_ds = LatentH5Dataset(cohort.latent_h5, all_scan_ids)
+            test_ds = LatentH5Dataset(cohort.latent_h5, all_scan_ids, mask_source=self.mask_source)
             test_cohort_datasets.append((cohort.name, test_ds))
 
         if not train_cohort_datasets:
