@@ -695,7 +695,29 @@ stem correctly skipped — expected) but **Arm A BraTS = only 126/198 = 0.636** 
 - **🚀 RESUBMITTED at `34a2710`: UKB `1640255`, SegResNet `1640256`** (6 tasks each). Monitor armed on **failure
   states as well as terminal** — the previous monitor only fired on all-terminal, which still caught it, but a
   failure-aware filter reports sooner.
-- **STILL OPEN:** arrays `1640255` + `1640256` to finish; then **re-derive `gseg_tc_dice`** from measured per-cohort TC Dice (0.75
+- **🔴 PERF DEFECT — augmentation ran on FULL native volumes (fixed `14c3da1`).** `1640255`/`1640256` started fine
+  but epoch 0 logged **`data_wait_s=1287.7` vs `step_s=173.2`** — 88 % of wallclock in the loader, **24.4 min/epoch**.
+  At that rate 300 epochs needs **122 h against a 48 h limit** (~118 epochs reachable), and EarlyStopping
+  (patience 30 at val-every-5) needs ≥150 epochs before it can fire — so the run could neither converge nor stop
+  cleanly, only be truncated. **Cancelled all 12 tasks** (user decision) and fixed.
+  - **Cause:** `build_augmentation` ran inside `SegImageDataset.__getitem__` on the full native volume, with the
+    crop applied *afterwards*. Measured in isolation: the pipeline costs **2.38 s on `(240,240,155)` vs 0.20 s on
+    `(96,96,96)` — 12×** (`Rand3DElasticd`/`RandAffined`/`RandBiasFieldd` over 8.9 M voxels).
+  - **Fix:** `SegImageDataset(crop_transform=…)` applied **before** the augmentation pipeline
+    (`build_presample_crop` builds it: `EnsureChannelFirstd` → `RandCropByPosNegLabeld` → `SqueezeDimd`; note
+    `target` and `label_tc` already carry a channel axis — adding another gives MONAI 4 spatial dims and
+    `Sequence must have length 4, got 3`). **Train split only** — validation keeps the full volume for
+    whole-volume sliding-window scoring so its Dice stays G-SEG-comparable.
+  - **Measured end-to-end on real UCSF data: 2.98 → 0.87 s/sample (3.4×)**, shapes `(3,96,96,96)`/`(2,96,96,96)`/
+    `(1,96,96,96)`, target range `[0.034,0.966]` preserved. loginexa re-smoke **inverted the profile**:
+    `data_wait_s` 1287.7 → **4.1**, `step_s` 35.6 → loader now ~10 % of wallclock. Projected 300 epochs ≈ 27–46 h.
+  - `_CropCollate` retained and now **passes through samples already at patch size** — no longer the primary crop,
+    but still the guarantee of uniform shapes for datasets that do not crop (injected test doubles, future callers),
+    which is what stops `default_collate` failing on heterogeneous native shapes.
+  - **`--time` raised 2 → 3 days** (skill: 3 standard / 7 max). 46 h left no margin against Lustre contention and
+    SLURM bills actual use, not the request. Seg suite 393 → **402**.
+- **🚀 RESUBMITTED at `14c3da1`: UKB `1642748`, SegResNet `1642760`** (6 tasks each). Monitor armed on failure states.
+- **STILL OPEN:** arrays `1642748` + `1642760` to finish; then **re-derive `gseg_tc_dice`** from measured per-cohort TC Dice (0.75
   is provisional and the gate is not trustworthy until then); then S6 (predicted-mask cache + T-06), which now needs
   no multiprocessing workaround thanks to the SDT fix.
 - **~~⚠ S1 STILL BLOCKED~~ → S1 IS CLOSED (2026-07-24).** mask-derive `1631539_2` (UPENN-GBM) hit TIMEOUT at 24 h
