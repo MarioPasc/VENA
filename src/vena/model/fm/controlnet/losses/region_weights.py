@@ -1,5 +1,21 @@
 """Per-region weight tensor for the S1 v3 region-weighted L1 velocity loss.
 
+Two modes
+---------
+
+**Sub-region mode** (legacy S1 v3, :class:`RegionWeights`)
+    Five disjoint regions: BG, Brain-not-WT, NETC, ED, ET.  Used by the
+    retired v3b_rw arm.  ``RegionWeights(enabled=False)`` collapses to
+    standard ``F.l1_loss(reduction="mean")``.
+
+**Brain/TC mode** (:class:`BrainTCWeights`)
+    Three strict-partition regions: BG (``~in_brain``), Brain
+    (``in_brain & ~TC``), TC (tumour core, ``in_brain & m_tc_hard``).
+    Edema falls in Brain — reconstructed from inputs, intended.  Default
+    ``{brain: 1.0, tc: 1.0}`` is *numerically identical* to unweighted
+    mean L1.  Select by putting ``brain`` / ``tc`` keys in the
+    ``loss.cfm.region_weights`` YAML block.
+
 Why this exists
 ---------------
 S1 v2's mean-reduction L1 over the 4-channel velocity field gave WT-region
@@ -27,13 +43,8 @@ Easy disable
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 from pydantic import BaseModel, ConfigDict, Field
-
-if TYPE_CHECKING:
-    pass
 
 
 class RegionWeights(BaseModel):
@@ -152,4 +163,123 @@ def build_region_weight_tensor(
     )  # (B, 1, h, w, d)
 
     # Broadcast across the velocity-field channels.
+    return w.expand(-1, channels, -1, -1, -1)
+
+
+# ---------------------------------------------------------------------------
+# Brain / TC mode (S2 v3a+)
+# ---------------------------------------------------------------------------
+
+
+class BrainTCWeights(BaseModel):
+    """Per-region weight config for the three-partition Brain/TC loss mode.
+
+    Regions (strict partition — every voxel gets exactly one weight):
+
+    * **BG** (``~in_brain``): weight ``brain``.
+    * **Brain** (``in_brain & ~m_tc_hard``): weight ``brain``. Edema falls here
+      and is reconstructed from the input modalities — this is intended.
+    * **TC** (tumour core, ``in_brain & m_tc_hard``): weight ``tc``.
+
+    With ``{brain: 1.0, tc: 1.0}`` every voxel gets weight 1.0 and the
+    weighted loss is numerically identical to ``F.l1_loss(reduction="mean")``.
+    This is the load-bearing guarantee: ship the mechanism, change nothing
+    numerically until ``tc`` is deliberately raised.
+
+    Attributes
+    ----------
+    enabled : bool
+        Master switch. ``False`` falls back to standard mean L1.
+    brain : float
+        Weight applied to BG and Brain-not-TC voxels. Default 1.0.
+    tc : float
+        Weight applied to tumour-core (TC = NETC + ET) voxels. Default 1.0.
+    threshold : float
+        Soft-mask threshold τ. Voxels with ``m_tc_soft >= τ`` belong to TC.
+        Default 0.5.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = True
+    brain: float = Field(default=1.0, ge=0.0)
+    tc: float = Field(default=1.0, ge=0.0)
+    threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class BrainTCMissingMaskError(ValueError):
+    """Raised when TC-soft mask is absent but brain/tc mode is active.
+
+    A silent fallback would silently change the training objective for GPU-days.
+    """
+
+
+def build_brain_tc_weight_tensor(
+    rw: BrainTCWeights,
+    m_brain: torch.Tensor | None,
+    m_tc_soft: torch.Tensor | None,
+    *,
+    channels: int = 4,
+) -> torch.Tensor | None:
+    """Build a per-voxel weight tensor for the brain/TC three-region loss.
+
+    Parameters
+    ----------
+    rw : BrainTCWeights
+        Configuration.  ``rw.enabled == False`` returns ``None`` so the
+        caller can fall back to standard mean-L1.
+    m_brain : Tensor | None
+        Brain mask, shape ``(B, 1, h, w, d)``.  Voxels ``> 0.5`` are brain.
+    m_tc_soft : Tensor | None
+        Soft tumour-core probability map, shape ``(B, 1, h, w, d)``, in
+        ``[0, 1]``.  Channel 0 of ``masks/tumor_latent_soft`` (TC = NETC+ET;
+        edema excluded).  **Must be non-None when ``rw.enabled``** — absence
+        raises :class:`BrainTCMissingMaskError`.
+    channels : int
+        Velocity-field channel count (4 for MAISI latent). The returned
+        tensor broadcasts to ``(B, channels, h, w, d)``.
+
+    Returns
+    -------
+    Tensor of shape ``(B, channels, h, w, d)`` or ``None`` when disabled.
+
+    Raises
+    ------
+    BrainTCMissingMaskError
+        When ``rw.enabled`` but ``m_tc_soft`` is ``None``.
+    ValueError
+        When ``rw.enabled`` but ``m_brain`` is ``None``.
+    """
+    if not rw.enabled:
+        return None
+    if m_tc_soft is None:
+        raise BrainTCMissingMaskError(
+            "build_brain_tc_weight_tensor: brain/tc mode enabled but "
+            "m_tc_soft is None. Task 20 must have landed (batch['m_tc_soft'] "
+            "served from masks/tumor_latent_soft channel 0). Never fall back "
+            "to m_tumor — a silent fallback trains the wrong objective."
+        )
+    if m_brain is None:
+        raise ValueError(
+            "build_brain_tc_weight_tensor: brain/tc mode enabled but "
+            "m_brain is None; cannot partition BG from Brain without it."
+        )
+
+    τ = rw.threshold
+    in_brain = m_brain > 0.5  # (B, 1, h, w, d) bool
+    m_tc_hard = m_tc_soft >= τ  # (B, 1, h, w, d) bool — TC = NETC + ET
+
+    # Strict partition: every voxel is assigned to exactly one region.
+    # BG and Brain-not-TC both receive weight ``brain``; only TC gets ``tc``.
+    # Implementation: start from a uniform ``brain`` tensor and overlay ``tc``
+    # on TC voxels — exactly one assignment per voxel, no double-counting.
+    region_tc = m_tc_hard & in_brain  # (B, 1, h, w, d)
+
+    w = torch.where(
+        region_tc,
+        torch.tensor(rw.tc, dtype=m_brain.dtype, device=m_brain.device),
+        torch.tensor(rw.brain, dtype=m_brain.dtype, device=m_brain.device),
+    )  # (B, 1, h, w, d)
+
+    # Broadcast across velocity-field channels.
     return w.expand(-1, channels, -1, -1, -1)

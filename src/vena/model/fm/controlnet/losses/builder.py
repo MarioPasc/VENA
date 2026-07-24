@@ -46,7 +46,7 @@ from typing import Any
 from .base import AbstractFMLoss, CompositeLoss
 from .cfm import CFMLoss
 from .contrastive import ContrastiveTumourLoss, RegionTerm
-from .region_weights import RegionWeights
+from .region_weights import BrainTCWeights, RegionWeights
 from .schedule import (
     WeightSchedule,
     build_schedule,
@@ -136,16 +136,25 @@ def build_loss(stage: str, cfg: dict[str, Any]) -> CompositeLoss:
 
     # S1 v3 (2026-06-22): optional region-weighted reduction.
     # ``region_weights`` block absent ⇒ None ⇒ legacy mean-reduction.
+    # Mode selection: ``brain``/``tc`` keys → BrainTCWeights (three-partition);
+    # anything else → RegionWeights (legacy five-region sub-region mode).
+    # This is explicit: the two modes use non-overlapping field names and
+    # ``extra="forbid"`` on each model prevents accidental cross-assignment.
     rw_block = cfm_cfg.get("region_weights")
     region_weights: RegionWeights | None = None
+    brain_tc_weights: BrainTCWeights | None = None
     if rw_block is not None:
-        region_weights = RegionWeights(**rw_block)
+        if "brain" in rw_block or "tc" in rw_block:
+            brain_tc_weights = BrainTCWeights(**rw_block)
+        else:
+            region_weights = RegionWeights(**rw_block)
 
     terms: dict[str, AbstractFMLoss] = {
         "cfm": CFMLoss(
             reduction=_get(cfm_cfg, "reduction", "mean"),
             norm=_get(cfm_cfg, "norm", "l2"),
             region_weights=region_weights,
+            brain_tc_weights=brain_tc_weights,
         )
     }
     weights: dict[str, WeightSchedule] = {

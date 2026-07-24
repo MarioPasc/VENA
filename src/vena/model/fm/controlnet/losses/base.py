@@ -66,6 +66,12 @@ class LossInputs:
         (avg-pooled from image-domain one-hot). Consumed by the S1 v3
         region-weighted L1 loss to apply per-sub-region weights. ``None``
         on legacy callers that pre-date v3.
+    m_tc_soft : Tensor | None
+        Soft tumour-core probability map, shape ``(B, 1, h, w, d)``, float32
+        in ``[0, 1]``.  Channel 0 of ``masks/tumor_latent_soft`` (TC = NETC+ET;
+        edema excluded).  Added by task 20 (``data.mask_source: oracle_soft``).
+        Required when ``loss.cfm.region_weights`` uses brain/TC mode
+        (``BrainTCWeights``).  ``None`` on all pre-task-20 callers.
     """
 
     x_clean: torch.Tensor
@@ -79,6 +85,7 @@ class LossInputs:
     m_bg: torch.Tensor | None = None
     m_brain: torch.Tensor | None = None
     m_tumor: torch.Tensor | None = None
+    m_tc_soft: torch.Tensor | None = None
 
 
 class AbstractFMLoss(nn.Module, ABC):
