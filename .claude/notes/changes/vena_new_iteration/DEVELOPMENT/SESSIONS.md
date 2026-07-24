@@ -18,8 +18,14 @@
 4. At session end: tick the row, and append to that session's **Orchestrator notes** (append-only) — what closed,
    what didn't and why, premises refuted, baseline numbers, and anything the *next* session must know.
 
-**Notation.** `A ∥ B` — parallel (isolated worktrees, disjoint lanes, ≤3 workers). `A → B` — B starts only after A
+**Notation.** `A ∥ B` — parallel (disjoint lanes, ≤3 concurrent workers). `A → B` — B starts only after A
 is merged green. `[O]` — orchestrator-only, main tree, no workers running. `(gate)` — a human/quantitative gate.
+Checklist marks: `☐` not started · `◐` in progress (code merged, compute still running) · `☑` closed.
+
+> **⚠ Worktree caveat (S4 + S5).** `Agent(isolation:"worktree")` cuts from the **session base commit**, so any commit
+> the orchestrator lands mid-session is invisible to later workers — this silently reverted merged code in S4. S5
+> therefore ran its lanes **in the main tree on disjoint file sets** with the orchestrator owning every commit, which
+> worked cleanly. Prefer that unless the lanes genuinely need isolated checkouts.
 
 ## The arc
 
@@ -74,7 +80,7 @@ gap. **Phase 3:** deferred ablations (CFG, WT up-weight sweep, SPADE).
 | ☐ | **S2 — Injection + launch oracle** | v3a + fresh 2-ch ControlNet wired; **5 oracle runs** launched + monitored | { **20** ∥ **21** } → **40**(injection sanity) → `[O]` loginexa smoke → `[O]` launch the 5-job matrix + Monitor | S1 masks cached+validated; v3a ckpt (+`trunk_ema_snapshot.pt` for J1–J4) on Picasso |
 | ☐ | **S3 — Oracle verdict** | Injection-sufficiency verdict + region-weight/trunk pick + go/no-go for the segmenter | `[O]` harvest → `[O]` analysis (PSNR_ET / no-regression / FP-safety) → `[O]` verdict | S2 jobs terminal |
 | ☑ | **S4 — Segmenter library** *(runs parallel to S1–S3, iter-9)* | BSF-SwinUNETR + SegResNet, loss, data/K-fold, metrics — built + unit-green | { **11** ∥ **13** ∥ **14** ∥ **15** } | S1 task 10 merged ✓; **BSF SSL located+pinned (UKB-SSL=headline)**; ~~S3=GO~~ removed → **FULLY UNBLOCKED** |
-| ☐ | **S5 — Segmenter training + ensemble** *(may overlap S2 oracle on Picasso)* | K+1 models trained; G-SEG report; **calibration MEASURED (Q5: no temperature)** | **17** → **18** → `[O]` K+1 Picasso array + Monitor | S4 merged green |
+| ◐ | **S5 — Segmenter training + ensemble** *(may overlap S2 oracle on Picasso)* | K+1 models trained; G-SEG report; **calibration MEASURED (Q5: no temperature)** | **17** ✓ → **18** ✓ → `[O]` K+1 Picasso array **SUBMITTED `1635802`** + Monitor armed | S4 merged green ✓ |
 | ☐ | **S6 — Predicted mask + deployable T-06** | `masks/tumor_latent_pred` cached; T-06 arm trained; oracle→predicted gap reported | { **19**(source:predicted) ∥ **22** } → `[O]` cache → `[O]` T-06 launch (reuse 20, `mask_source:predicted`) + Monitor | S5 G-SEG passed |
 | ☐ | **S7 — Deferred levers & ablations** | CFG / WT-weight sweep / SPADE-T07 — optional, post-validation | { **30** ∥ WT-weight sweep ∥ SPADE-T07 } (any/none) | explicit human opt-in |
 
@@ -270,6 +276,20 @@ on touched files. *(grid corrected (60,60,40)→(48,56,48) — see 🔴 note bel
   **edema excluded** — the strongest visual confirmation of the channel-0=TC semantics and the mask-on-enhancement check.
   Three QC backgrounds now available for the human gate: default (`2026-07-22T21-53-06Z`), flair (`t2f/2026-07-22T22-11-15Z`),
   t1c (`t1c/2026-07-23T08-41-50Z`). (t1pre left unrendered — not requested.)
+- **Cache round-2 outcome: 8/9 after 1631539 (2026-07-24).** `1631539_1` **BraTS-GLI COMPLETED in 11:18:02** (the ~10-11 h
+  serial estimate was right) → corpus went 7/9 → **8/9 SOFT-OK**. `1631539_2` **UPENN-GBM TIMEOUT again at 1-00:00:25
+  (24 h)** — it is by far the most expensive cohort (**>24 h / 611 scans ⇒ ~141 s/scan**, vs ~16 s/scan for BraTS-PED);
+  H5 left byte-clean again (sv 2.0.0, no soft group, oracle `(611,3,…)` intact), confirming the write-at-end design twice over.
+- **✅ `bfb36ee` (bbox-clipped SDT) BIT-IDENTITY VERIFIED — not merely assumed** (2026-07-24). The 8 cached cohorts were
+  derived at `1b9f946`; the repo is now `0f5ba32` (⊃ `bfb36ee`, per-component EDT on a bbox grown by `ceil(clip_vox)+1`).
+  Risk = UPENN-GBM alone on a different numerical path ("two code paths → arms drift"). **Test:** re-derive with the NEW
+  code and compare to the OLD-code cache → `BraTS-SSA-00018-000` and `BraTS-SSA-00040-000` both give
+  **MAE(cache,TC) = 0.00000** (exact). ⇒ the optimisation is genuinely value-preserving; a mixed-vintage corpus is safe.
+  Speedup corroborated: the same 2-patient re-derive that previously blew a 120 s timeout now runs in **9.8 s total**.
+  *(Method note: re-running a cached-vs-fresh MAE check after a repo bump is the cheap general way to prove an
+  "optimisation is bit-identical" claim — reuse it before the S6 predicted re-cache.)*
+- **UPENN-GBM re-submitted = job `1635814`** (`sbatch --array=2 --time=04:00:00`), HEAD `0f5ba32` (fast path), RUNNING.
+  Expected ~25 min instead of >24 h. Monitor armed (`bghy0f4ab`). **This is the last item for S1 exit-criterion-1.**
 
 ---
 
