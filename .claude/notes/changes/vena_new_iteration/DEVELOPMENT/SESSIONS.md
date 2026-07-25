@@ -77,7 +77,7 @@ gap. **Phase 3:** deferred ablations (CFG, WT up-weight sweep, SPADE).
 | ✓ | Session | Goal | Task structure | Gates |
 |---|---|---|---|---|
 | ☑ | **S1 — Oracle soft-mask + validation** *(CLOSED 2026-07-24)* | SDT-soft GT `[TC,NETC]` cached + audited in all 9 latent H5s (3,459 scans); QC + embedding figures reviewed; **human gate CLOSED** | `[O]` preflight → **10** → { **12** ∥ **16** } → **19**(source:gt) → **40**(mask QC + latent embedding) → `(gate)` human mask review ✓ | latent H5s writable; scaffold decision |
-| ◐ | **S2 — Injection + launch oracle** *(code CLOSED 2026-07-24; compute QUEUED)* | v3a + fresh 2-ch ControlNet wired; **5 oracle runs** submitted (`1643042/44/46/48/50`) — **PENDING, not yet RUNNING** | { **20** ∥ **21** } → **19b**(aug soft-mask cache) → `[O]` loginexa smoke → `[O]` launch the 5-job matrix + Monitor | S1 masks cached+validated ✓; v3a ckpt + `trunk_ema_snapshot.pt` verified present ✓ |
+| ☑ | **S2 — Injection + launch oracle** *(CLOSED 2026-07-25)* | v3a + fresh 2-ch ControlNet wired; **all 5 oracle runs RUNNING on A100** (`1643042/44/46/48/50`, exa02/03/04, none on B200) | { **20** ∥ **21** } → **19b**(aug soft-mask cache) → `[O]` loginexa smoke → `[O]` launch the 5-job matrix + Monitor | S1 masks cached+validated ✓; v3a ckpt + `trunk_ema_snapshot.pt` verified present ✓ |
 | ☐ | **S3 — Oracle verdict** | Injection-sufficiency verdict + region-weight/trunk pick + go/no-go for the segmenter | `[O]` harvest → `[O]` analysis (PSNR_ET / no-regression / FP-safety) → `[O]` verdict | S2 jobs terminal |
 | ☑ | **S4 — Segmenter library** *(runs parallel to S1–S3, iter-9)* | BSF-SwinUNETR + SegResNet, loss, data/K-fold, metrics — built + unit-green | { **11** ∥ **13** ∥ **14** ∥ **15** } | S1 task 10 merged ✓; **BSF SSL located+pinned (UKB-SSL=headline)**; ~~S3=GO~~ removed → **FULLY UNBLOCKED** |
 | ◐ | **S5 — Segmenter training + ensemble** *(may overlap S2 oracle on Picasso)* | K+1 models trained; G-SEG report; **calibration MEASURED (Q5: no temperature)** | **17** ✓ → **18** ✓ → `[O]` K+1 Picasso array **SUBMITTED `1635802`** + Monitor armed | S4 merged green ✓ |
@@ -401,6 +401,17 @@ jobs RUNNING** (job ids recorded, `Dependency` clean); exhaustive-val cadence wr
 `metrics.csv` (not the empty-CSV `use_timestep_transform` trap — verify one early epoch); monitor armed.
 
 **Orchestrator notes (append-only).**
+
+- **✅ S2 CLOSED 2026-07-25 — all 7 exit criteria met.** All 5 arms RUNNING on A100 (exa02/03/04, **zero on B200** —
+  the `--constraint=a100` pin held live, not just in `--test-only`). **Per-arm config verified from each run's
+  `decision.json` on disk** (not the launch log, which formats the weight differently): J0 tc=1.0/frozen, J1 tc=1.0,
+  J2 tc=5.0, J3 tc=10.0, J4 tc=20.0, all joint except J0 — the intended one-variable sweep, not five jobs silently
+  sharing a weight. All built clean (cn=2, WARM_START, init_from_trunk=179, 0 errors); J1–J4 loaded
+  `trunk_ema_snapshot.pt` (optimiser `trunk=435`, 361 M `trunk_ema`). `offline augmentation ENABLED` with no
+  `MissingSoftMaskGroupError` on every arm. Exit criterion 5 verified on the REAL run at TWO cadences (J0
+  `epoch_000` and `epoch_025`, each 580 rows = 116 patients × 5 NFE × 9 cohorts; `psnr_db` 580/580 finite,
+  `psnr_db_et` 550/580 — the 30 NaN are BraTS-PED sub-latent cores with no ET, correctly NaN not 0). **S3 owns the
+  results.**
 
 - **2026-07-24 — S2 (`/orchestrate`, Opus 4.8 @ xhigh, 3 workers + orchestrator).** Base `b821f27`; docs committed
   first as `4bfd2c8` so worktree agents cut a current spec. **Baseline: pytest `1569 passed / 1 skipped /
