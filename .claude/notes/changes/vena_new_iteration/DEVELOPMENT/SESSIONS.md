@@ -885,7 +885,26 @@ stem correctly skipped — expected) but **Arm A BraTS = only 126/198 = 0.636** 
   (augment-on-full-volume, only visible from data_wait/step split), OOM (val too small in the cap). The through-line:
   **watch ONE real epoch of a real submission before trusting an array**; the first epoch's `train_epoch.csv` +
   `MaxRSS` would have caught all three at zero GPU-day cost. See `[[feedback_smoke_must_exercise_failing_path]]`.
-- **STILL OPEN:** arrays `1643624` + `1643630` to finish (verify memory bounded at epoch-5 val); then **re-derive
+- **✅ MEMORY FIX CONFIRMED ON-CLUSTER (`0439864`).** `1643624`/`1643630` ran ~20 h through **30-40 validation
+  passes** each (vs the 1 pass that OOM'd the leaky code), cgroup **current 13.5 GB**, 0 fatal — the val-memory fix
+  holds. Dice climbing steadily (UKB fold-2 0.60, SegResNet 0.61). Augmentation verified live: all 13 transforms
+  applied on the 96³ patch, two draws of one index differ (stochastic), val deterministic + full-volume.
+- **🔴🔴 SELF-INFLICTED: A STALE-CLEANUP `mv` KILLED 10 OF 12 RUNNING JOBS (2026-07-25).** Asked to clean stale
+  `experiments_seg` dirs, my loop moved **all 52** to trash — including the 12 live ones — because the guard
+  `find -maxdepth 0 -mmin -45` checks the DIR's own mtime (hours old; jobs write into `checkpoints/`/`metrics/`
+  subdirs). Moved the 12 back in ~1 min, but the write-during-the-window was fatal: a process resolves its output
+  path on every `open()`, so an unguarded `torch.save` hit the vanished path → `FileNotFoundError` → death. Result:
+  **UKB folds 0,1 survived; UKB 2-5 + all 6 SegResNet FAILED.** Nothing was deleted-then-lost (mv, not rm) and every
+  `best.pt` survived, but the 10 were unconverged. **RESUBMITTED at `0439864`: UKB folds 2-5 = job `1648441`,
+  SegResNet folds 0-5 = job `1648442`; survivors `1643624_0/1` kept.** Monitor `b7sogpdg4` watches the recovery set.
+  Lesson pinned: `[[feedback_never_mv_running_run_dirs]]` — build the protect-set from RUNNING job logs, dry-run
+  destructive cleanup, and gate cleanup on terminal job state, never on filename/mtime heuristics.
+- **🧹 CLEANUP COMPLETED (correctly, after recovery):** `experiments_seg` 52→12 dirs, 5.4 G→1.6 G (40 stale removed:
+  3 cancelled arrays + 4 loginexa smokes). `mask_derive`/`mask_derive_cfg` config leftovers removed. `mask_audit`
+  (37 M) KEPT — it is the current audit and is byte-identical to the local gt archive `mask_audit_2026-07-24`
+  (verified: 4/4 report hashes match, 92/92 figures). **Part (1) was already satisfied** — the only finished result
+  (mask_audit) was already archived to gt; the seg arrays are not finished so nothing else to copy.
+- **STILL OPEN:** recovery jobs `1648441` + `1648442` + survivors `1643624_0/1` to finish; then **re-derive
   `gseg_tc_dice`** over TC-bearing cases only. from measured per-cohort TC Dice (0.75
   is provisional and the gate is not trustworthy until then); then S6 (predicted-mask cache + T-06), which now needs
   no multiprocessing workaround thanks to the SDT fix.
