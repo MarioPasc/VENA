@@ -121,13 +121,13 @@ A downstream consumer never reads `report.md` programmatically. It loads `decisi
 
 ## `decision.json` for training routines
 
-Phase-3 routines also emit `decision.json` so external-validation and reader-study routines can verify exactly which weights and gates produced a given run. The canonical schema (`routines.fm.train` v0.8.0) is:
+Phase-3 routines also emit `decision.json` so external-validation and reader-study routines can verify exactly which weights and gates produced a given run. The canonical schema (`routines.fm.train` v0.12.0) is (fields with ★ are written post-training by `_record_termination_reason`; all others are written before `trainer.fit()`):
 
 ```json
 {
-  "schema_version": "0.8.0",
+  "schema_version": "0.11.0 → patched to 0.12.0 post-training",
   "produced_at": "<ISO-8601-UTC>",
-  "producer": "routines.fm.train:0.8.0",
+  "producer": "routines.fm.train:0.12.0",
   "run_id": "<UTC>_<stage>_<tag>_<short-sha>",
   "run_dir": "/abs/path/to/experiments/<run_id>",
   "stage": "s1|s2|s3",
@@ -145,12 +145,21 @@ Phase-3 routines also emit `decision.json` so external-validation and reader-stu
   "vae_checkpoint": "/abs/path/to/autoencoder_v2.pt",
   "vae_checkpoint_sha256": "<sha256>",
   "loss_stage": "s1",
+  "loss_cfm_norm": "l1|l2|huber",
+  "loss_cfm_delta": 0.90,
   "ema_decay": 0.9999,
   "augmentation_config_path": "routines/fm/train/configs/augmentations/<name>.yaml",
   "augmentation_preflight_path": "/abs/path/to/.../decision.json",
   "exhaustive_val_enabled": true,
+  "exhaustive_val_aggregation": "patient_mean_then_cohort_mean",
+  "latent_preds_every_n": 4,
+  "gradient_clip_val": 5.0,
   "conditioning_dropout_p": 0.0,
-  "conditioning_dropout_keys": ["wt"]
+  "conditioning_dropout_keys": ["wt"],
+  "termination_reason": "total_steps | max_epochs | early_stopping | unknown",
+  "final_global_step": 800000,
+  "final_epoch": 3851,
+  "early_stopping_stopped_epoch": null
 }
 ```
 
@@ -158,6 +167,10 @@ Schema bumps to date:
 - **0.6.0** added `trunk_regime` / `trunk_peft_variant` / `trunk_peft_params` (PEFT recipes).
 - **0.7.0** added `conditioning_dropout_p` / `conditioning_dropout_keys` (CFG training-time dropout).
 - **0.8.0** added `tag` / `resume_mode` / `resume_source` / `resume_source_run_id`, and extended the run_id from `<UTC>_<stage>_<sha>` to `<UTC>_<stage>_<tag>_<sha>`. The schema bump is the audit-trail half of the 2026-06-10 Picasso fix: an s2 job that was supposed to start fresh from the MAISI FM base trunk silently latched onto a sibling s1 `last.ckpt` because `resume_from: latest` was workspace-wide rather than recipe-scoped. The new `tag` makes the recipe explicit in the run_id and lets the resume resolver glob `*_{stage}_{tag}_*/` to keep recipes isolated. See `.claude/rules/preflight-pattern.md` and `routines/fm/train/engine.py::_classify_resume_from` for the three resume modes (BASELINE / CONTINUE / WARM_START).
+- **0.9.0** added `loss_cfm_norm` (B9: pseudo-Huber support) and `loss_cfm_delta`.
+- **0.10.0** added `exhaustive_val_aggregation: "patient_mean_then_cohort_mean"` (B1: unbiased multi-cohort aggregate), `latent_preds_every_n` (B12: disk-saving H5 gate), and `gradient_clip_val` (B3: default raised to 5.0).
+- **0.11.0** is the consolidated v3a-retraining schema: merges 0.9.0 and 0.10.0 into a single bump to avoid mid-run schema drift. All three new fields (`loss_cfm_norm`, `loss_cfm_delta`, `exhaustive_val_aggregation`, `latent_preds_every_n`, `gradient_clip_val`) are present. `loss_cfm_delta` is `null` when `loss_cfm_norm != "huber"`.
+- **0.12.0** (B17, 2026-07-29) adds post-training termination metadata, patched into `decision.json` by `_record_termination_reason` at the end of `Engine.run()`. New fields: `termination_reason` (`"total_steps" | "max_epochs" | "early_stopping" | "unknown"`), `final_global_step` (int), `final_epoch` (int), and `early_stopping_stopped_epoch` (int, only present when `termination_reason == "early_stopping"`). These fields are absent from the pre-training write (schema 0.11.0) and added in-place after `trainer.fit()` completes. `early_stopping` is a divergence guard that should normally never fire; if it appears in a run's `decision.json`, investigate before accepting those checkpoints.
 
 Bump `schema_version` on any breaking change. Add fields freely; never repurpose an existing key.
 

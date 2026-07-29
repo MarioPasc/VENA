@@ -12,12 +12,13 @@ The differentiator versus prior work (Kleesiek 2019, Preetha 2021, McCaD 2024, C
 
 | Asset | Path |
 |---|---|
-| Proposal (method, losses, evaluation, ablations, timeline) | `/media/mpascual/Sandisk2TB/research/vena/docs/proposal.md` |
+| Training routine spec (method, losses, architecture, evaluation) | `/media/mpascual/Sandisk2TB/research/vena/docs/training_routine.md` |
+| Archived original proposal (superseded 2026-05-26) | `/media/mpascual/Sandisk2TB/research/vena/docs/proposal_deprecated_26052026.md` |
 | Literature review (CNN/GAN → diffusion → flow-matching → vessel methods) | `/media/mpascual/Sandisk2TB/research/vena/docs/literature.md` |
 | External code, checkpoints, datasets — canonical paths | `src/external/LINKS.md` |
 | Project rules (enforced) | `.claude/rules/` |
 
-Whenever this file drifts from the proposal, **the proposal wins**.
+> **B16 (2026-07-29):** `proposal.md` no longer exists; `training_routine.md` is now authoritative for architecture and loss details. Whenever this file drifts from `training_routine.md`, **`training_routine.md` wins**.
 
 ## Project rules
 
