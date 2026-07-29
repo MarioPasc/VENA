@@ -1,0 +1,143 @@
+# Loginexa 4-epoch smoke — S1 v4 §18 arm A (L1, FFT trunk + ControlNet).
+#
+# Exercises all new code paths introduced in v3a_retraining.md (B1-B16):
+#   * aggregate_cv.csv (B1: patient-mean then cohort-mean)
+#   * role column + test_only guard (B2)
+#   * psnr_db_brain / ssim_brain / ms_ssim_brain / intensity stats (B7/B8/B13)
+#   * latent_preds_every_n=1 so the H5 gate fires every pass (B12)
+#   * gradient_clip_val: 5.0 (B3)
+#   * retention_n_checkpoints: 40 (B5)
+#   * patience: null (B4: fixed-length, post-hoc selection)
+#   * conditioning_dropout_p: 0.1 (§18 CFG)
+#
+# Pass criteria:
+#   * Training completes 4 epochs without error
+#   * exhaustive_val/epoch_NNN/aggregate_cv.csv exists with >= 1 row
+#   * exhaustive_val/epoch_NNN/metrics.csv contains columns:
+#     psnr_db_brain, ssim_brain, ms_ssim_brain, p995_pred_brain
+#   * No test_only rows in aggregate_cv.csv (B2 guard)
+#   * latent_preds.h5 written at epoch 0 (B12: pass_count=1, every_n=1 → write)
+#
+# Run: vena-fm-train routines/fm/train/configs/smoke/loginexa_s1_v4_4ep_l1.yaml
+
+run:
+  stage: s1
+  tag: fft_cfm_l1
+  resume_from: null
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
+
+data:
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  batch_size: 2
+  num_workers: 4
+  pin_memory: true
+  tau: 0.5
+  max_train_patients_per_cohort: 10
+  augmentation_config_path: null
+  preflight_decision_path: null
+  dedup_decisions_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
+  use_offline_augmented_data: true
+  variant_weights:
+    v0: 0.2
+    v1: 0.2
+    v2: 0.2
+    v3: 0.2
+    v4: 0.2
+  brain_mask_key: "masks/brain_latent"
+
+model:
+  trunk:
+    checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides: {}
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+    trainable: true
+    regime: fft
+  controlnet:
+    conditioning_inputs:
+      - latent:t1pre
+      - latent:t2
+      - latent:flair
+      - mask:wt:zero_out
+    arch_overrides: {}
+    perturb_keys: []
+    output_scale_ramp:
+      enabled: true
+      ramp_steps: 200
+      steepness: 10.0
+  vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+
+loss:
+  cfm:
+    weight: 1.0
+    reduction: mean
+    norm: l1
+
+rflow:
+  num_train_timesteps: 1000
+  use_discrete_timesteps: true
+  sample_method: logit-normal
+  use_timestep_transform: true
+  base_img_size_numel: 129024
+
+optim:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  warmup_steps: 40
+  scheduler: cosine
+
+ema:
+  decay: 0.9999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 600
+  max_epochs: 4
+  batch_size: 2
+  grad_accum: 1
+  checkpoint_every_epochs: 1
+  log_train_every_steps: 10
+  gradient_clip_val: 5.0
+  # B4: fixed-length smoke (patience: null). select_checkpoint.py is tested
+  # separately; here we just verify the disabled-EarlyStopping log fires.
+  patience: null
+  conditioning_dropout_p: 0.1
+  conditioning_dropout_keys: ["wt"]
+
+validation:
+  every_epochs: 0
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 999999
+  sweep_nfes: [1, 2, 5, 10, 20]
+  qualitative_every_epochs: 999999
+  image_metrics: false
+
+exhaustive_val:
+  enabled: true
+  every_epochs: 1
+  n_patients: 3
+  nfe_levels: [1, 5]
+  integrator: euler
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  device: cuda:1
+  block_until_complete: true
+  figure_top_k: 2
+  # B12: every_n=1 writes latent_preds.h5 on every cadence pass (smoke only).
+  # Production configs use every_n=4.
+  latent_preds_every_n: 1
+
+output:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/VENA
+  retention_n_checkpoints: 40
+  tensorboard: false
+  wandb: false
