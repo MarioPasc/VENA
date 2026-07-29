@@ -32,7 +32,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from vena.data.augment import AugmentationTracker, VariantTracker, build_pipeline_from_yaml
-from vena.data.h5.shared import now_iso_utc, sha256_file
+from vena.data.h5.shared import now_iso_utc, resolve_git_dirty, resolve_git_sha, sha256_file
 from vena.data.registry import load_registry
 from vena.model.fm.lightning import FMLightningModule, MultiCohortLatentDataModule
 from vena.model.fm.lightning.callbacks import (
