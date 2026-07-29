@@ -121,17 +121,22 @@ A downstream consumer never reads `report.md` programmatically. It loads `decisi
 
 ## `decision.json` for training routines
 
-Phase-3 routines also emit `decision.json` so external-validation and reader-study routines can verify exactly which weights and gates produced a given run. The canonical schema (`routines.fm.train` v0.12.0) is (fields with ★ are written post-training by `_record_termination_reason`; all others are written before `trainer.fit()`):
+Phase-3 routines also emit `decision.json` so external-validation and reader-study routines can verify exactly which weights and gates produced a given run. The canonical schema (`routines.fm.train` v0.13.0) is (fields with ★ are written post-training by `_record_termination_reason`; all others are written before `trainer.fit()`):
 
 ```json
 {
-  "schema_version": "0.11.0 → patched to 0.12.0 post-training",
+  "schema_version": "0.12.0 → patched to 0.13.0 post-training",
   "produced_at": "<ISO-8601-UTC>",
-  "producer": "routines.fm.train:0.12.0",
+  "producer": "routines.fm.train:0.13.0",
+  // B19 (2026-07-29): code provenance written at run start.
+  // git_sha == 40-char HEAD SHA; git_dirty == true when uncommitted changes were
+  // present (should be false on Picasso).  "unknown" / false are the safe fallbacks
+  // outside a git repo.  Complements the human-readable git_commit.txt in the run dir.
+  "git_sha": "<40-char HEAD SHA or \"unknown\">",
+  "git_dirty": false,
   "run_id": "<UTC>_<stage>_<tag>_<process-token>",
   // <process-token> = sha256(timestamp + pid + hostname)[:8]  — a per-process
   // uniqueness token, NOT a git short-SHA. Source: runner/run_id.py:73.
-  // Git provenance is in the separate "git_sha" field below.
   "run_dir": "/abs/path/to/experiments/<run_id>",
   "stage": "s1|s2|s3",
   "tag": "fft_cfm|lora_r16_cfm|fft_contrastive|lora_r16_contrastive|lora_r16_contrastive_cfg|...",
@@ -174,6 +179,7 @@ Schema bumps to date:
 - **0.10.0** added `exhaustive_val_aggregation: "patient_mean_then_cohort_mean"` (B1: unbiased multi-cohort aggregate), `latent_preds_every_n` (B12: disk-saving H5 gate), and `gradient_clip_val` (B3: default raised to 5.0).
 - **0.11.0** is the consolidated v3a-retraining schema: merges 0.9.0 and 0.10.0 into a single bump to avoid mid-run schema drift. All three new fields (`loss_cfm_norm`, `loss_cfm_delta`, `exhaustive_val_aggregation`, `latent_preds_every_n`, `gradient_clip_val`) are present. `loss_cfm_delta` is `null` when `loss_cfm_norm != "huber"`.
 - **0.12.0** (B17, 2026-07-29) adds post-training termination metadata, patched into `decision.json` by `_record_termination_reason` at the end of `Engine.run()`. New fields: `termination_reason` (`"total_steps" | "max_epochs" | "early_stopping" | "unknown"`), `final_global_step` (int), `final_epoch` (int), and `early_stopping_stopped_epoch` (int, only present when `termination_reason == "early_stopping"`). These fields are absent from the pre-training write (schema 0.11.0) and added in-place after `trainer.fit()` completes. `early_stopping` is a divergence guard that should normally never fire; if it appears in a run's `decision.json`, investigate before accepting those checkpoints.
+- **0.13.0** (B19, 2026-07-29) adds code provenance fields written at run start (before `trainer.fit()`): `git_sha` (the repo HEAD SHA at the moment `Engine.run()` was called, or `"unknown"` outside a git repo) and `git_dirty` (`true` when uncommitted changes were present, `false` otherwise). These complement the human-readable `git_commit.txt` already written to the run directory. The post-training patch by `_record_termination_reason` now bumps 0.12.0 → 0.13.0 (previously 0.11.0 → 0.12.0).
 
 Bump `schema_version` on any breaking change. Add fields freely; never repurpose an existing key.
 

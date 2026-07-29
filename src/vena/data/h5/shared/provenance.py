@@ -28,6 +28,25 @@ def resolve_git_sha(start: Path | None = None) -> str | None:
         return None
 
 
+def resolve_git_dirty(start: Path | None = None) -> bool | None:
+    """Return True if the repo containing ``start`` has uncommitted changes.
+
+    Returns ``None`` outside any repository or when ``git`` is unavailable;
+    callers should treat ``None`` as unknown rather than failing.
+    """
+    anchor = (start or Path(__file__)).resolve()
+    if anchor.is_file():
+        anchor = anchor.parent
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(anchor), "status", "--porcelain"],
+            stderr=subprocess.DEVNULL,
+        )
+        return bool(out.strip())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
 def now_iso_utc() -> str:
     """Return the current UTC time as ``YYYY-MM-DDTHH:MM:SSZ``."""
     return _dt.datetime.now(tz=_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

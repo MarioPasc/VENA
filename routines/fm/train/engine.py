@@ -1092,20 +1092,20 @@ def _record_termination_reason(
         )
 
     # Patch decision.json in-place: read existing payload → add termination
-    # fields → write back.  Bumps schema_version 0.11.0 → 0.12.0.
+    # fields → write back.  Bumps schema_version 0.12.0 → 0.13.0.
     try:
         payload = json.loads(decision_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("B17: cannot read %s to patch termination reason: %s", decision_path, exc)
         return
-    payload["schema_version"] = "0.12.0"
+    payload["schema_version"] = "0.13.0"
     payload["termination_reason"] = reason
     payload["final_global_step"] = final_step
     payload["final_epoch"] = final_epoch
     if stopped_epoch is not None:
         payload["early_stopping_stopped_epoch"] = stopped_epoch
     decision_path.write_text(json.dumps(payload, indent=2) + "\n")
-    logger.info("B17: decision.json updated (schema 0.12.0) at %s", decision_path)
+    logger.info("B17: decision.json updated (schema 0.13.0) at %s", decision_path)
 
 
 class _WarmStartCallback(pl.Callback):
@@ -1282,9 +1282,13 @@ class FMTrainRoutineEngine:
         cfm_block = (cfg.loss or {}).get("cfm") or {}
         rw_block = cfm_block.get("region_weights")
         return {
-            "schema_version": "0.11.0",
+            "schema_version": "0.12.0",
             "produced_at": now_iso_utc(),
-            "producer": "routines.fm.train:0.11.0",
+            "producer": "routines.fm.train:0.12.0",
+            # B19 (2026-07-29): code provenance in the machine-readable contract.
+            # git_commit.txt carries the same SHA as a human-readable record.
+            "git_sha": resolve_git_sha() or "unknown",
+            "git_dirty": resolve_git_dirty() or False,
             "run_id": run_id,
             "run_dir": str(run_dir),
             "stage": cfg.run.stage,
