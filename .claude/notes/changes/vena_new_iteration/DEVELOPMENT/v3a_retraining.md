@@ -1618,3 +1618,100 @@ PYTHONPATH=$PWD/src:$PWD ~/.conda/envs/vena/bin/python -m pytest \
 Recorded 2026-07-29:
 - Disk: `/dev/nvme1n1p2  137G   64G   66G  50% /` (66 G free)
 - Baseline: **1602 passed, 1 skipped, 23 deselected, 240 warnings** in 124s (full fast-suite run)
+
+---
+
+### 2026-07-29T21:14Z — GATE 2 APPROVED + SUBMITTED (agent, feature/v3a-retrain-instrumentation)
+
+#### Final HEAD
+
+```
+local  HEAD: 0a1d7bf5c2ee670bd2a7842170abdf246210a2ee   branch: feature/v3a-retrain-instrumentation   dirty: 0
+Picasso HEAD: 0a1d7bf5c2ee670bd2a7842170abdf246210a2ee   branch: feature/v3a-retrain-instrumentation   dirty: 0
+```
+
+Both sides verified clean at submission. **Picasso repo must not be touched until all three jobs are RUNNING** — SLURM reads the repo at start time, not submit time; any commit or rsync before start silently changes the code one or more arms run. If a fix becomes necessary before start, the procedure is: `scancel` all three, apply, resubmit together.
+
+#### Three §18 ablation arms — job IDs
+
+| Job ID | Name | Arm | Config | State at submit |
+|---|---|---|---|---|
+| 1679902 | vena-s1-v4-l1-fft | A — L1 (control) | `routines/fm/train/configs/runs/picasso_s1_v4_l1_fft.yaml` | PENDING / Priority |
+| 1679903 | vena-s1-v4-l2-fft | B — L2 | `routines/fm/train/configs/runs/picasso_s1_v4_l2_fft.yaml` | PENDING / Priority |
+| 1679904 | vena-s1-v4-huber-fft | C — Huber (δ=0.90) | `routines/fm/train/configs/runs/picasso_s1_v4_huber_fft.yaml` | PENDING / Priority |
+
+All three: `TimeLimit=6-00:00:00`, `ReqTRES=cpu=16,mem=256G,node=1,gres/gpu=2`, `Features=a100`, `Partition=gpu_partition`, `Dependency=(null)`. Independent — no chaining.
+
+Worker: `routines/fm/train/slurm/runs/worker_fm_train_picasso_v4_ablation.sh`  
+Launchers: `routines/fm/train/slurm/runs/launcher_picasso_s1_v4_{l1,l2,huber}.sh`
+
+#### First-start check (do this when each job transitions PENDING → RUNNING)
+
+Read the job's `.out` file:
+```
+/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/vena-s1-v4-{l1,l2,huber}-fft_167990{2,3,4}.out
+```
+
+Confirm line 61 (`Config: ${CONFIG_PATH}`) matches the expected per-arm YAML above, and that:
+```
+Git commit: 0a1d7bf5c2ee670bd2a7842170abdf246210a2ee
+```
+
+If any two arms print the same config, **`scancel` all three immediately** — `--export` propagation failure would make the ablation meaningless.
+
+#### Resource ask rationale
+
+`--mem=256G` is derived from `sacct` on all completed VENA FM training jobs: every completed run shows `ReqMem=256G`. The closest lower boundary that completed was never tested; 48 G (the prior default) OOM-killed inference benchmark shards. Do not "optimise" this without a completed run at the lower value.
+
+#### §18 primary endpoint — where to read it
+
+The §18 primary endpoint is `mean_et_pred − mean_et_real` (mean signed intensity error inside the enhancing-tumour region). It is written per epoch and per NFE to:
+
+```
+<run_dir>/exhaustive_val/epoch_NNN/metrics.csv
+```
+
+Column: `mean_et_pred` and `mean_et_real` (added by B8, `metrics_paired.py`). The signed difference is **not pre-computed** in the CSV — compute it post-hoc as `mean_et_pred − mean_et_real` per row. A value near zero means the model produces correct enhancement magnitude; a large positive value means over-enhancement; negative means under-enhancement.
+
+Run dirs will be under `/mnt/home/users/tic_163_uma/mpascual/execs/VENA/` on Picasso (format: `YYYY-MM-DD_HH-MM-SS_s1_fft_cfm_{l1,l2,huber}_<token>/`).
+
+The cohort-balanced aggregate (patient mean → cohort mean over CV cohorts only) is in:
+```
+<run_dir>/exhaustive_val/epoch_NNN/aggregate_cv.csv
+```
+Columns: `cohort, nfe, region, metric, value, n_patients, n_scans`. Filter `region == "et"` and `metric == "mean_et_pred"` / `"mean_et_real"` to derive the primary endpoint at the aggregate level.
+
+#### Post-hoc checkpoint selection
+
+Script: `scripts/select_checkpoint.py`
+
+Usage (after all three arms complete or at any intermediate epoch):
+```bash
+~/.conda/envs/vena/bin/python scripts/select_checkpoint.py \
+  --run-dirs <l1_run_dir> <l2_run_dir> <huber_run_dir> \
+  --metric ssim_brain \
+  --region brain
+```
+
+Reads each arm's per-epoch `aggregate_cv.csv`, applies the same patient-mean → cohort-mean as the training loop, returns the epoch with the highest `ssim_brain` for each arm. The selected checkpoint is `<run_dir>/checkpoints/epoch=NNN-*.ckpt`. `retention_n_checkpoints: 40` keeps all epochs in the quality-peak window (roughly epochs 600–1100 for a 1100-epoch run at the v3a convergence profile).
+
+#### Test suite at submission HEAD
+
+```
+0a1d7bf:  1696 passed, 0 failed, 1 skipped, 23 deselected  (fast suite, no GPU/slow)
+```
+
+The one test that moved since Gate-1 baseline (1602 → 1696): all B-series items (B1–B19) landed; the single fix in this Gate-2 window was `test_resume_modes_integration.py::test_baseline_creates_new_dir` asserting `schema_version == "0.12.0"` → `"0.13.0"` after B19 bumped the post-training patch target.
+
+#### Defects found and fixed during Gate-2 window
+
+| ID | Description | Commit |
+|---|---|---|
+| B18 | `run_id` suffix documented as `<short-sha>` but actually `sha256(timestamp+pid+hostname)[:8]` — docs-only fix in `preflight-pattern.md` | earlier session |
+| B19 | `decision.json` had no code provenance; added `git_sha` + `git_dirty`, bumped schema 0.12.0 → 0.13.0 | `5dcc0ab` |
+| B19 import | `resolve_git_sha`/`resolve_git_dirty` called but not imported in `engine.py`; caught by first B19 smoke | `c073e14` |
+| stale test | `test_baseline_creates_new_dir` asserted schema 0.12.0; fixed to 0.13.0 | `0a1d7bf` |
+
+#### Process note (carry forward)
+
+Re-run the fast suite after every change that touches a schema string, a contract field, or a Pydantic default. A stale green is indistinguishable from a real one until a Gate-2 review catches it. This burned us twice in this session (B19 import missing, schema assertion stale). Rule: `pytest -m "not slow and not gpu"` is a ≤3-minute operation; run it before reporting any gate status.
