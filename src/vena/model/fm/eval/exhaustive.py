@@ -241,6 +241,15 @@ def full_volume_psnr_ssim(
     -------
     tuple[float, float]
         ``(psnr_db, ssim)``.
+
+    Notes
+    -----
+    **These are MASK-FREE metrics** (``mask = torch.ones_like(p)``).  They
+    cover the entire intra-box volume — including background voxels outside
+    the skull-stripped brain — and are written to the ``psnr_db`` / ``ssim``
+    CSV columns.  Brain-masked equivalents (``psnr_db_brain`` / ``ssim_brain``)
+    are computed separately in the exhaustive-val engine using the precise
+    ``masks/brain_latent`` mask via :meth:`_v3_per_region_metrics`.
     """
     p = pred[None, None]
     r = real[None, None]

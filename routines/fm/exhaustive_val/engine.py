@@ -44,8 +44,28 @@ from vena.model.fm.inference import get_sampler
 from vena.model.fm.lightning import FMLightningModule, LatentH5Dataset
 from vena.model.fm.maisi.config import TrunkConfig
 from vena.model.fm.metrics import ImageMetrics, LatentMetrics
+from vena.validation.metrics_paired import ms_ssim_brain as _ms_ssim_brain
+from vena.validation.metrics_paired import ms_ssim_wt_bbox as _ms_ssim_wt_bbox
 
 logger = logging.getLogger(__name__)
+
+
+def _should_write_latent_preds(pass_count: int, every_n: int) -> bool:
+    """Return True if latent_preds.h5 should be written at this cadence pass.
+
+    Fires on passes 1, 1+every_n, 1+2*every_n, … (1-indexed so the first
+    cadence epoch always writes).  ``every_n <= 0`` means always write.
+
+    Parameters
+    ----------
+    pass_count : int
+        1-indexed cadence-pass counter populated by the launcher.
+    every_n : int
+        Write interval in cadence passes.  0 disables gating.
+    """
+    if every_n <= 0:
+        return True
+    return (pass_count - 1) % every_n == 0
 
 
 class ExhaustiveValConfigError(Exception):
@@ -163,11 +183,18 @@ class ExhaustiveValJobConfig(BaseModel):
     # Required (and only consumed) when ``export_per_block_figures`` is True.
     # The launcher populates this from the training config so the val job
     # matches the trainer's readout depth.
-    lpl_A: list[int] = Field(default_factory=list)
+    lpl_A: list[int] = Field(default_factory=list)  # noqa: N815 — LPL block-index list; name is load-bearing
     # Path to the frozen MAISI VAE checkpoint. Required when
     # ``export_per_block_figures`` is True (the decoder is loaded on
     # ``device`` to extract per-block features).
     vae_checkpoint: Path | None = None
+    # B12 (2026-07-29): write latent_preds.h5 only every N cadence passes to
+    # avoid filling the experiment dir with 2–3 GB H5s each epoch. Pass 1 always
+    # writes (pass_count=1 default).  Launcher increments latent_preds_pass_count
+    # and writes it into the job YAML; the engine reads it here.
+    # ``latent_preds_every_n <= 0`` disables the gate (always write).
+    latent_preds_every_n: int = 4
+    latent_preds_pass_count: int = 1
 
     @classmethod
     def from_yaml(cls, path: Path | str) -> ExhaustiveValJobConfig:
@@ -451,13 +478,25 @@ class ExhaustiveValEngine:
         # 17 % of UCSF-PDGM val has no latent WT voxels) do not pull the
         # average to NaN.
         self._write_aggregate_csv(out_dir / "aggregate.csv", metric_rows)
-        write_latent_preds_h5(
-            out_dir / "latent_preds.h5",
-            latent_entries,
-            epoch=cfg.epoch,
-            run_id=cfg.run_id,
-            extra_attrs={"nfe_levels_json": json.dumps(list(cfg.nfe_levels))},
-        )
+        # B1 (2026-07-29): patient-mean then cohort-mean aggregate restricted to
+        # cv cohorts. Used by select_checkpoint.py and the post-hoc monitor.
+        self._write_aggregate_cv_csv(out_dir / "aggregate_cv.csv", metric_rows)
+        # B12 (2026-07-29): latent_preds.h5 is 2-3 GB per epoch; gate writes to
+        # every N cadence passes to avoid filling the experiment dir.
+        if _should_write_latent_preds(cfg.latent_preds_pass_count, cfg.latent_preds_every_n):
+            write_latent_preds_h5(
+                out_dir / "latent_preds.h5",
+                latent_entries,
+                epoch=cfg.epoch,
+                run_id=cfg.run_id,
+                extra_attrs={"nfe_levels_json": json.dumps(list(cfg.nfe_levels))},
+            )
+        else:
+            logger.info(
+                "latent_preds.h5 skipped (pass_count=%d, every_n=%d)",
+                cfg.latent_preds_pass_count,
+                cfg.latent_preds_every_n,
+            )
         # Per-(patient, NFE) PSNR/SSIM index for the comparison figure's
         # per-row annotation (2026-06-20 global figure overhaul). Built once
         # from ``metric_rows`` and passed down to ``_render_best_worst``.
@@ -595,6 +634,9 @@ class ExhaustiveValEngine:
 
         registry = load_registry(cfg.corpus_registry)
         all_cohorts = registry.cv_cohorts() + registry.test_cohorts()
+        # B2 (2026-07-29): tag each row with "cv" / "test_only" so aggregate_cv.csv
+        # can restrict to cv cohorts only without post-hoc filtering on cohort names.
+        cv_names: set[str] = {c.name for c in registry.cv_cohorts()}
         budgets = self._split_n_patients(int(cfg.n_patients), len(all_cohorts))
         logger.info(
             "exhaustive-val: cohort budgets %s (total=%d, n_cohorts=%d)",
@@ -636,6 +678,7 @@ class ExhaustiveValEngine:
             # implementation passed a global running counter here, which both
             # mislabelled the first cross-cohort patient and raised
             # ``IndexError`` on every subsequent one.
+            cohort_role = "cv" if cohort.name in cv_names else "test_only"
             for i, pid in enumerate(patient_ids):
                 try:
                     self._process_patient(
@@ -654,6 +697,7 @@ class ExhaustiveValEngine:
                         gen_decode_time,
                         image_h5=cohort.image_h5,
                         cohort=cohort.name,
+                        cohort_role=cohort_role,
                     )
                     n_ok_total += 1
                 except Exception as exc:
@@ -702,6 +746,7 @@ class ExhaustiveValEngine:
         *,
         image_h5: Path,
         cohort: str,
+        cohort_role: str = "cv",
     ) -> None:
         """Process one patient: sample at each NFE, decode to box, compute metrics.
 
@@ -736,6 +781,21 @@ class ExhaustiveValEngine:
             batch, real_box.shape
         )
         brain_mask_source = "masks/brain_latent" if m_brain_img is not None else "real_box>0"
+        # §15 / B2 admissibility guard: the real_box>0 fallback is derived from
+        # the real T1c box and would contaminate ssim_brain used for model
+        # selection.  A row with brain_mask_source=="real_box>0" silently leaks
+        # target information into the selection metric — exactly the failure mode
+        # §15 argues cannot be in the methods section.  Raise here so the job
+        # fails loudly rather than producing poisoned aggregate_cv.csv rows.
+        if m_brain_img is None:
+            raise AssertionError(
+                f"[§15 brain_mask_source guard] Patient {pid!r} has no "
+                "'masks/brain_latent' dataset in the latent H5. "
+                "The real_box>0 fallback is derived from the real T1c and would "
+                "contaminate ssim_brain used for model selection. "
+                "Re-encode the latent H5 with vena-encode-brain-to-latent "
+                "before running exhaustive validation."
+            )
 
         # Stash the real T1c latent for the per-block feature render. Cheap
         # (one (B=1,C,h,w,d) CPU tensor per scored patient); only retained
@@ -777,6 +837,7 @@ class ExhaustiveValEngine:
             row: dict[str, Any] = {
                 "epoch": int(cfg.epoch),
                 "cohort": cohort,
+                "role": cohort_role,  # B2 (2026-07-29)
                 "patient_id": pid,
                 "nfe": int(nfe),
                 "psnr_db": psnr,
@@ -1269,10 +1330,64 @@ class ExhaustiveValEngine:
             out["mae_whole"] = _scalar(image_metrics.mae(p, r, whole_mask))
             out["mse_whole"] = _scalar(image_metrics.mse(p, r, whole_mask))
             out["n_voxels_brain"] = int(whole_mask.sum().item())
+            # B7 (2026-07-29) — brain-masked PSNR/SSIM to unblock ssim_brain monitor.
+            out["psnr_db_brain"] = _scalar(image_metrics.psnr(p, r, whole_mask))
+            out["ssim_brain"] = _scalar(image_metrics.ssim(p, r, whole_mask))
         else:
             out["mae_whole"] = float("nan")
             out["mse_whole"] = float("nan")
             out["n_voxels_brain"] = 0
+            out["psnr_db_brain"] = float("nan")
+            out["ssim_brain"] = float("nan")
+        # B8 (2026-07-29) — intensity statistics for §18 contrast readout.
+        et_bool = m_et_img.bool() if m_et_img is not None else None
+        bnwt_bool = bnwt.bool() if bnwt is not None else None
+        out["p995_pred_brain"] = (
+            float(torch.quantile(p[whole_mask], 0.995).item())
+            if whole_mask is not None and whole_mask.any()
+            else float("nan")
+        )
+        out["p995_real_brain"] = (
+            float(torch.quantile(r[whole_mask], 0.995).item())
+            if whole_mask is not None and whole_mask.any()
+            else float("nan")
+        )
+        out["mean_et_pred"] = (
+            float(p[et_bool].mean().item())
+            if et_bool is not None and et_bool.any()
+            else float("nan")
+        )
+        out["mean_et_real"] = (
+            float(r[et_bool].mean().item())
+            if et_bool is not None and et_bool.any()
+            else float("nan")
+        )
+        out["mean_bnwt_pred"] = (
+            float(p[bnwt_bool].mean().item())
+            if bnwt_bool is not None and bnwt_bool.any()
+            else float("nan")
+        )
+        out["mean_bnwt_real"] = (
+            float(r[bnwt_bool].mean().item())
+            if bnwt_bool is not None and bnwt_bool.any()
+            else float("nan")
+        )
+        # B13 (2026-07-29) — MS-SSIM (monai.metrics); NaN when WT bbox < 90 voxels.
+        # ms_ssim_brain/wt_bbox expect 3-D numpy arrays (squeezed from the
+        # (1,1,H,W,D) batched tensors used throughout this function).
+        _p_np = p.squeeze(0).squeeze(0).float().cpu().numpy()
+        _r_np = r.squeeze(0).squeeze(0).float().cpu().numpy()
+        _brain_np = (
+            whole_mask.squeeze(0).squeeze(0).cpu().numpy()
+            if whole_mask is not None
+            else (_r_np > 0)
+        )
+        out["ms_ssim_brain"] = _ms_ssim_brain(_p_np, _r_np, _brain_np)
+        if wt is not None:
+            _wt_np = wt.squeeze(0).squeeze(0).cpu().numpy()
+            out["ms_ssim_wt_bbox"] = _ms_ssim_wt_bbox(_p_np, _r_np, _wt_np)
+        else:
+            out["ms_ssim_wt_bbox"] = float("nan")
         # WT and BG MAE/MSE (paired with the legacy PSNR/SSIM).
         if wt is not None:
             out["mae_wt"] = _scalar(image_metrics.mae(p, r, wt))
@@ -1322,12 +1437,26 @@ class ExhaustiveValEngine:
         "n_voxels_netc",
         "n_voxels_ed",
         "n_voxels_et",
+        # B7 (2026-07-29): brain-masked PSNR/SSIM
+        "psnr_db_brain",
+        "ssim_brain",
+        # B8 (2026-07-29): intensity statistics
+        "p995_pred_brain",
+        "p995_real_brain",
+        "mean_et_pred",
+        "mean_et_real",
+        "mean_bnwt_pred",
+        "mean_bnwt_real",
+        # B13 (2026-07-29): MS-SSIM
+        "ms_ssim_brain",
+        "ms_ssim_wt_bbox",
     )
 
     @classmethod
     def _write_metrics_csv(cls, path: Path, rows: list[dict[str, Any]]) -> None:
         cols = [
             "cohort",
+            "role",  # B2 (2026-07-29): "cv" or "test_only"
             "epoch",
             "patient_id",
             "nfe",
@@ -1480,6 +1609,151 @@ class ExhaustiveValEngine:
                             "n_patients": max(
                                 len(psnr_vals), len(ssim_vals), len(mae_vals), len(mse_vals)
                             ),
+                            "psnr_db_mean": _mean(psnr_vals),
+                            "psnr_db_std": _std(psnr_vals),
+                            "ssim_mean": _mean(ssim_vals),
+                            "ssim_std": _std(ssim_vals),
+                            "mae_mean": _mean(mae_vals),
+                            "mae_std": _std(mae_vals),
+                            "mse_mean": _mean(mse_vals),
+                            "mse_std": _std(mse_vals),
+                        }
+                    )
+
+    @staticmethod
+    def _write_aggregate_cv_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+        """Patient-mean then cohort-mean aggregate, cv cohorts only (B1, 2026-07-29).
+
+        Fixes the scan-weighted bias of :meth:`_write_aggregate_csv`: longitudinal
+        cohorts (e.g. LUMIERE, ≈ 7 scans/patient) no longer dominate the aggregate.
+
+        Algorithm
+        ---------
+        1. Filter ``rows`` to those with ``role == "cv"``.  Raise if any
+           ``role == "test_only"`` row would have leaked into the aggregate.
+        2. Group by ``(cohort, patient_id, nfe)`` → per-patient mean of each metric.
+        3. Group patient means by ``(cohort, nfe, region)`` → cohort mean over
+           patients (unweighted — every patient counts once regardless of scan count).
+        4. Write one row per ``(cohort, nfe, region)``.
+
+        Raises
+        ------
+        AssertionError
+            If a ``test_only`` row's cohort is found in the cv subset
+            (indicates a role-tagging bug upstream).
+        """
+        import math
+        import statistics
+
+        # Defensive: verify no test_only rows slipped through (should be impossible
+        # because role is set from cv_names in _run_multi_cohort, but belt+braces).
+        test_only_in_cv = [r for r in rows if r.get("role") == "test_only"]
+        if test_only_in_cv:
+            cohorts = {r.get("cohort") for r in test_only_in_cv}
+            raise AssertionError(
+                f"B2 guard: test_only cohorts {cohorts} reached aggregate_cv.csv. "
+                "This leaks held-out test data into the training monitor. "
+                "Check cohort role tagging in _run_multi_cohort."
+            )
+
+        cv_rows = [r for r in rows if r.get("role", "cv") == "cv"]
+        if not cv_rows:
+            # No cv cohorts in this epoch; write a valid empty file.
+            with path.open("w", newline="") as f:
+                pass
+            return
+
+        regions = ("whole", "wt", "bg", "bnwt", "netc", "ed", "et", "brain")
+        metrics_4 = ("psnr_db", "ssim", "mae", "mse")
+
+        def _metric_key(region: str, metric: str) -> str:
+            if region == "whole" and metric in ("psnr_db", "ssim"):
+                return metric
+            if region == "brain" and metric == "psnr_db":
+                return "psnr_db_brain"
+            if region == "brain" and metric == "ssim":
+                return "ssim_brain"
+            if region == "brain" and metric == "mae":
+                return "mae_whole"  # brain MAE stored as mae_whole
+            if region == "brain" and metric == "mse":
+                return "mse_whole"  # brain MSE stored as mse_whole
+            return f"{metric}_{region}"
+
+        def _fv(v: object) -> float | None:
+            if v in ("", None):
+                return None
+            try:
+                fv = float(v)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
+            return None if math.isnan(fv) else fv
+
+        # Step 1: patient-level mean → group by (cohort, patient_id, nfe).
+        pat_key_to_rows: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+        for r in cv_rows:
+            key = (str(r.get("cohort", "")), str(r.get("patient_id", "")), int(r["nfe"]))
+            pat_key_to_rows.setdefault(key, []).append(r)
+
+        # Each patient-key collapses to a single averaged row.
+        pat_rows: list[dict[str, Any]] = []
+        for (cohort, _pid, nfe), scan_rows in pat_key_to_rows.items():
+            pat_row: dict[str, Any] = {"cohort": cohort, "nfe": nfe, "n_scans": len(scan_rows)}
+            for region in regions:
+                for metric in metrics_4:
+                    col = _metric_key(region, metric)
+                    vals = [fv for r in scan_rows if (fv := _fv(r.get(col))) is not None]
+                    pat_row[col] = statistics.fmean(vals) if vals else float("nan")
+            pat_rows.append(pat_row)
+
+        # Step 2: cohort mean over patients → group by (cohort, nfe, region).
+        by_cohort_nfe: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for pr in pat_rows:
+            by_cohort_nfe.setdefault((str(pr["cohort"]), int(pr["nfe"])), []).append(pr)
+
+        cols = [
+            "cohort",
+            "nfe",
+            "region",
+            "n_patients",
+            "n_scans_total",
+            "psnr_db_mean",
+            "psnr_db_std",
+            "ssim_mean",
+            "ssim_std",
+            "mae_mean",
+            "mae_std",
+            "mse_mean",
+            "mse_std",
+        ]
+        with path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            for (cohort, nfe), prs in sorted(by_cohort_nfe.items()):
+                n_patients = len(prs)
+                n_scans = sum(int(pr.get("n_scans", 1)) for pr in prs)
+                for region in regions:
+                    psnr_col = _metric_key(region, "psnr_db")
+                    ssim_col = _metric_key(region, "ssim")
+                    mae_col = _metric_key(region, "mae")
+                    mse_col = _metric_key(region, "mse")
+                    psnr_vals = [fv for pr in prs if (fv := _fv(pr.get(psnr_col))) is not None]
+                    ssim_vals = [fv for pr in prs if (fv := _fv(pr.get(ssim_col))) is not None]
+                    mae_vals = [fv for pr in prs if (fv := _fv(pr.get(mae_col))) is not None]
+                    mse_vals = [fv for pr in prs if (fv := _fv(pr.get(mse_col))) is not None]
+
+                    def _mean(v: list[float]) -> str:
+                        return f"{statistics.fmean(v):.6g}" if v else ""
+
+                    def _std(v: list[float]) -> str:
+                        return f"{(statistics.stdev(v) if len(v) > 1 else 0.0):.6g}" if v else ""
+
+                    w.writerow(
+                        {
+                            "cohort": cohort,
+                            "nfe": nfe,
+                            "region": region,
+                            "n_patients": n_patients,
+                            "n_scans_total": n_scans,
                             "psnr_db_mean": _mean(psnr_vals),
                             "psnr_db_std": _std(psnr_vals),
                             "ssim_mean": _mean(ssim_vals),
