@@ -49,6 +49,7 @@ class ExhaustiveValLauncher(pl.Callback):
         python_executable: str | None = None,
         block_until_complete: bool = False,
         prune_snapshots_keep: int = 0,
+        latent_preds_every_n: int = 4,
     ) -> None:
         super().__init__()
         self.run_dir = Path(run_dir)
@@ -56,6 +57,9 @@ class ExhaustiveValLauncher(pl.Callback):
         self.job_base = dict(job_base)
         self.every_epochs = int(every_epochs)
         self.device = device
+        # B12 — pass counter for latent_preds.h5 gating; injected into each
+        # job YAML so the subprocess can apply the every-N gate.
+        self._pass_count: int = 0
         # When True, join each launched validation before training continues, so
         # every cadence epoch gets a completed exhaustive pass (used for short
         # diagnostic runs where epochs are far faster than one validation, which
@@ -127,6 +131,7 @@ class ExhaustiveValLauncher(pl.Callback):
     # ------------------------------------------------------------------
 
     def _launch(self, trainer: pl.Trainer, pl_module: pl.LightningModule, epoch: int) -> None:
+        self._pass_count += 1
         epoch_dir = self.out_root / f"epoch_{epoch:03d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
 
@@ -149,6 +154,9 @@ class ExhaustiveValLauncher(pl.Callback):
                 "epoch": int(epoch),
                 "output_dir": str(epoch_dir),
                 "device": self.device,
+                # B12 — 1-indexed pass counter so the subprocess can gate
+                # latent_preds.h5 writes via _should_write_latent_preds().
+                "latent_preds_pass_count": self._pass_count,
             }
         )
 
