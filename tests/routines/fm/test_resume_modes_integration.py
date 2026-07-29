@@ -269,8 +269,8 @@ def test_baseline_creates_new_dir(stub_engine, tmp_path: Path) -> None:
 
     # Decision.json fields.
     d = _read_decision(run_dir)
-    # 0.12.0 (B17) patched post-training with termination_reason fields.
-    assert d["schema_version"] == "0.12.0"
+    # 0.13.0 (B19) adds git_sha + git_dirty; B17 post-training patch also bumps to 0.13.0.
+    assert d["schema_version"] == "0.13.0"
     assert d["tag"] == "smoke_resume"
     assert d["resume_mode"] == "baseline"
     assert d["resume_source"] == "baseline"
