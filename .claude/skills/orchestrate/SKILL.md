@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: Run a multi-agent VENA work session as the orchestrator — hold the plan, spawn Opus subagents to write the code, verify every number they report, and iterate until explicit acceptance criteria are met. Encodes the VENA-specific paths (Picasso repos, conda envs, inference tree, analyses roots), the worktree isolation rules for parallel agents, the SLURM traps that silently produce plausible wrong artifacts, and the verification discipline that caught every real defect on 2026-07-16/17. Invoke when a task is large enough to need 2+ agents, when spawning subagents to implement a spec, when the user says "orchestrate", "spawn agents", "run this with subagents", "parallelise this work", or at the start of any multi-hour VENA session with a written plan and acceptance criteria.
+description: Run a multi-agent VENA work session as the orchestrator — hold the plan, spawn Opus subagents to write the code, verify every number they report, and iterate until explicit acceptance criteria are met. If you spawn an agent to monitor a job, it should be Sonnet 4.6. Encodes the VENA-specific paths (Picasso repos, conda envs, inference tree, analyses roots), the worktree isolation rules for parallel agents, the SLURM traps that silently produce plausible wrong artifacts, and the verification discipline that caught every real defect on 2026-07-16/17. Invoke when a task is large enough to need 2+ agents, when spawning subagents to implement a spec, when the user says "orchestrate", "spawn agents", "run this with subagents", "parallelise this work", or at the start of any multi-hour VENA session with a written plan and acceptance criteria.
 ---
 
 # Orchestrating a VENA multi-agent session
@@ -60,7 +60,7 @@ Agent(
   run_in_background: true,   # default; several in ONE message run concurrently
 )
 ```
-Session effort is inherited — run the session at `xhigh`/`max` for this work.
+Run the session at `high` for this work.
 
 **Give each agent exactly:** its task-spec path, `01_SHARED_CONTRACTS.md` (or
 the project's equivalent fact sheet), its lane, and what it must not touch.
@@ -125,9 +125,18 @@ git merge-base --is-ancestor <fix-sha> HEAD && echo "HAS FIX"
 `vena` is an **editable install path-pinned to the main checkout**. From a
 worktree, a naive `python -m pytest` loads `routines` from the worktree and
 `vena` from main — half the agent's code, half someone else's, **no error**.
+
+⚠ **`PYTHONPATH=<repo>/src` is NOT sufficient**: `src/vena/` is under `src/` but
+**`routines/` is at the repo root**, so that form isolates `vena` and leaves
+`routines` on the stale editable install. Use **`<repo>/src:<repo>`**. The check
+below passes either way *only because it `cd`s to the repo first* (CWD is on
+`sys.path`) — a script launched as `python <repo>/scripts/foo.py` has
+`sys.path[0] = scripts/` and leaks. Killed job 1679494 on 2026-07-29; see
+`[[reference_vena_pythonpath_routines_leak]]`. Verify from a foreign CWD.
+
 The only correct invocation, which every agent must paste back as proof:
 ```bash
-cd $WORKTREE && PYTHONPATH=$WORKTREE/src ~/.conda/envs/vena/bin/python -c "
+cd $WORKTREE && PYTHONPATH=$WORKTREE/src:$WORKTREE ~/.conda/envs/vena/bin/python -c "
 import pathlib, vena, routines
 wt = pathlib.Path('$WORKTREE').resolve()
 for m in (vena, routines):
