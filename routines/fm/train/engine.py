@@ -39,6 +39,7 @@ from vena.model.fm.lightning.callbacks import (
     TRUNK_EMA_SNAPSHOT_FILENAME,
     BestCheckpointCallback,
     ExhaustiveValLauncher,
+    GradClipValidityCallback,
     SigtermHandler,
     TrainMetricsCSV,
     TrunkEMASnapshotCallback,
@@ -1735,6 +1736,11 @@ class FMTrainRoutineEngine:
             # ``pl_module.trunk_ema is None``); safe to attach unconditionally.
             TrunkEMASnapshotCallback(dirpath=run_dir / "checkpoints"),
             TrainMetricsCSV(out_dir=run_dir / "metrics"),
+            # §18 early-abort: raises AssertionError at step 10 000 if
+            # mean(grad_clip_active) ≥ 5 % over steps >5 000. Fires ~1 % into
+            # the 800 000-step budget — saves ~5 A100-days on an invalid arm.
+            # _assert_grad_clip_validity (post-fit) is kept as belt-and-braces.
+            GradClipValidityCallback(tag=cfg.run.tag),
             SigtermHandler(ckpt_dir=run_dir / "checkpoints", filename="ema_final.ckpt"),
         ]
         if train_transform is not None:

@@ -7,6 +7,7 @@ from .checkpointing import (
     VENACheckpointCallback,
 )
 from .exhaustive_launcher import ExhaustiveValLauncher
+from .grad_clip_validity import GradClipValidityCallback
 from .nfe_timing import NFETimingCSV
 from .output_scale_ramp import OutputScaleRampCallback
 from .qualitative import QualitativeH5Writer
@@ -18,6 +19,7 @@ __all__ = [
     "TRUNK_EMA_SNAPSHOT_FILENAME",
     "BestCheckpointCallback",
     "ExhaustiveValLauncher",
+    "GradClipValidityCallback",
     "NFETimingCSV",
     "OutputScaleRampCallback",
     "QualitativeH5Writer",

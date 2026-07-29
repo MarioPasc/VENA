@@ -1,49 +1,30 @@
-# Loginexa 4-epoch smoke — S1 v4 §18 arm A (L1, FFT trunk, concat-only).
+# Loginexa 4-epoch smoke — S1 v4 §18 arm C (Huber δ=0.90, FFT trunk, concat-only).
 #
-# Architecture: IDENTICAL to picasso_s1_v4_l1_fft.yaml (T1pre/T2/FLAIR
-# channel-concat at trunk first-conv; NO ControlNet).
-# Rebuilt from loginexa_s1_v3a_concat_only_2ep.yaml + §19 knobs (2026-07-29).
+# Architecture: IDENTICAL to picasso_s1_v4_huber_fft.yaml.
+# Differs from loginexa_s1_v4_4ep_l1.yaml in EXACTLY ONE field:
+#   loss.cfm.norm: huber  (+ delta: 0.90)
 #
-# Smoke differences from production (loginexa constraints — 1× V100-DGXS-32GB,
-# 30-min hard wallclock):
-#   * max_epochs=4, total_steps=600 (above 4-epoch step count so max_epochs binds)
-#   * warmup_steps=40 (was 1000) — cosine decay completes inside the smoke
-#   * max_train_patients_per_cohort=10 caps each CV cohort
-#   * batch_size=2 (was 4) for V100 32 GB headroom; grad_accum=1
-#   * exhaustive_val.device=cuda:0 (loginexa is single-V100; piggyback train GPU)
-#   * latent_preds_every_n=2 (was 4): writes at pass 1 and 3, skips at 2 and 4
-#     → demonstrates both write and skip paths of the B12 gate
-#   * retention_n_checkpoints=4 (enough for 4-epoch smoke; production=40)
-#   * patience=null (fixed-length smoke)
-#   * loss.cfm.reduction=mean (v4 has no region weights — unlike v3a which used none)
+# Purpose: exercise the CFMLoss pseudo-Huber forward path end-to-end on real
+# latent data.  The unit tests in tests/model/fm/test_cfm_loss_huber.py verify
+# the loss mathematics in isolation; this smoke confirms the full training loop
+# (gradient flow, optimiser step, EMA update, CSV logging) works with huber.
 #
-# Phase-2 coverage requirements (v3a_retraining.md):
-#   B12 latent_preds_every_n gate: every_n=2 → epoch_001 write, epoch_002 skip,
-#     epoch_003 write, epoch_004 skip. Verify via ls exhaustive_val/epoch_*/
-#   B1/B2 aggregate_cv.csv: paste first rows; confirm no test_only cohort
-#   B7/B8/B13 columns: psnr_db_brain, ssim_brain, ms_ssim_brain, intensity stats
-#   BLOCKER 2 A1: brain_mask_source guard fires if masks/brain_latent absent from H5
-#
-# Grad-clip validity callback (§18): check_step=10_000, warmup=5_000.
-# This smoke runs ~200 optimizer steps — guard never fires here.
-# Unit-test coverage: tests/model/fm/test_grad_clip_validity_callback.py
-#
-# Huber path coverage: run loginexa_s1_v4_4ep_huber.yaml alongside.
+# Smoke differences from production: same as loginexa_s1_v4_4ep_l1.yaml.
+# latent_preds_every_n=2 is not critical here (huber coverage is the goal),
+# but kept consistent with the L1 smoke for apples-to-apples comparison.
 #
 # Pass criteria:
-#   * 4 epochs complete without error
-#   * exhaustive_val/epoch_001/ and epoch_003/ contain latent_preds.h5
-#   * exhaustive_val/epoch_002/ and epoch_004/ do NOT contain latent_preds.h5
-#   * metrics.csv columns include psnr_db_brain, ssim_brain, ms_ssim_brain, role
-#   * aggregate_cv.csv: ≥1 row, no test_only cohort rows
+#   * 4 epochs complete without NaN loss or gradient error
+#   * train_step.csv column train/cfm shows finite values
+#   * exhaustive_val/epoch_001/metrics.csv exists with finite psnr_db values
 #
 # Run (on loginexa via SSH ProxyJump):
 #   ~/.conda/envs/vena-v100/bin/python -m routines.fm.train.cli \
-#     routines/fm/train/configs/smoke/loginexa_s1_v4_4ep_l1.yaml
+#     routines/fm/train/configs/smoke/loginexa_s1_v4_4ep_huber.yaml
 
 run:
   stage: s1
-  tag: fft_cfm_l1
+  tag: fft_cfm_huber
   resume_from: null
   seed: 1337
   device: cuda
@@ -99,7 +80,8 @@ loss:
   cfm:
     weight: 1.0
     reduction: mean
-    norm: l1
+    norm: huber
+    delta: 0.90
 
 rflow:
   num_train_timesteps: 1000
@@ -130,11 +112,8 @@ training:
   grad_accum: 1
   checkpoint_every_epochs: 1
   log_train_every_steps: 10
-  # B3: clip raised to 5.0 per §18 validity criterion.
   gradient_clip_val: 5.0
-  # Fixed-length smoke — no EarlyStopping.
   patience: null
-  # §18 CFG dropout — no-op in concat-only (no ControlNet branch to drop).
   conditioning_dropout_p: 0.1
   conditioning_dropout_keys: ["wt"]
 
@@ -153,17 +132,13 @@ exhaustive_val:
   nfe_levels: [1, 5]
   integrator: euler
   corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
-  # loginexa is single-V100 — exhaustive val piggybacks the train GPU.
   device: cuda:0
   block_until_complete: true
   figure_top_k: 2
-  # B12: every_n=2 → writes latent_preds.h5 at pass 1 (first-pass rule)
-  # and pass 3, skips at pass 2 and pass 4. Demonstrates both code paths.
   latent_preds_every_n: 2
 
 output:
   experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/VENA
-  # 4 checkpoints — one per epoch (smoke only; production=40).
   retention_n_checkpoints: 4
   tensorboard: false
   wandb: false
