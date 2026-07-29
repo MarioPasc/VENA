@@ -51,6 +51,13 @@ class _FakeRegistry:
     def cv_cohorts_with_aug(self):
         return []
 
+    def cv_cohorts(self):
+        return [_FakeCohort("UCSF-PDGM")]
+
+    def test_cohorts(self):
+        # No overlap with cv_cohorts — satisfies _assert_run_invariants B2 check.
+        return []
+
 
 def _write_registry(path: Path) -> Path:
     path.write_text(json.dumps({"cohorts": []}))
@@ -129,9 +136,6 @@ def _cfg_dict(
             "grad_accum": 1,
             "checkpoint_every_epochs": 1,
             "log_train_every_steps": 1,
-            "best_metric_name": "mse_latent",
-            "best_metric_region": "bg",
-            "best_metric_nfe": 5,
             "gradient_clip_val": 1.0,
         },
         "validation": {
@@ -180,7 +184,10 @@ def stub_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(FMLightningModule, "setup", lambda self, stage=None: None)
 
     # 2. Stub the registry loader.
-    monkeypatch.setattr("routines.fm.train.engine.load_registry", lambda p: _FakeRegistry())
+    monkeypatch.setattr(
+        "routines.fm.train.engine.load_registry",
+        lambda p, **kwargs: _FakeRegistry(),
+    )
 
     # 3. Stub MultiCohortLatentDataModule so it doesn't open any H5 files.
     class _FakeDM:
@@ -262,8 +269,8 @@ def test_baseline_creates_new_dir(stub_engine, tmp_path: Path) -> None:
 
     # Decision.json fields.
     d = _read_decision(run_dir)
-    # 0.11.0 (task-20) added mask_source to the decision.json payload.
-    assert d["schema_version"] == "0.11.0"
+    # 0.12.0 (B17) patched post-training with termination_reason fields.
+    assert d["schema_version"] == "0.12.0"
     assert d["tag"] == "smoke_resume"
     assert d["resume_mode"] == "baseline"
     assert d["resume_source"] == "baseline"

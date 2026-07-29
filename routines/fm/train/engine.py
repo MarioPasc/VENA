@@ -44,7 +44,6 @@ from vena.model.fm.lightning.callbacks import (
     TrunkEMASnapshotCallback,
     VENACheckpointCallback,
 )
-from vena.model.fm.lightning.data import MultiCohortLatentDataModule
 from vena.model.fm.maisi.config import TrunkConfig
 from vena.model.fm.metrics import RegionSpec
 from vena.preflight.cohort_dedup import (
@@ -96,7 +95,7 @@ logger = logging.getLogger(__name__)
 _RUN_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[a-z0-9_]+_[a-z0-9_]+_[0-9a-f]{6,}$")
 
 
-class ResumeMode(str, Enum):
+class ResumeMode(str, Enum):  # noqa: UP042 — keep str+Enum for PL ≤2.x compat
     """Classification of ``run.resume_from``; see comment block above."""
 
     BASELINE = "baseline"
@@ -220,6 +219,12 @@ class _DataCfg(BaseModel):
     # "derived"     → clip(NETC+ET, 0, 1) from masks/tumor_latent (aug-safe).
     # Absent group with oracle_soft/predicted → hard raise, never a warning.
     mask_source: Literal["none", "oracle_soft", "predicted", "derived"] = "none"
+    # HDF5 key for the brain foreground mask used in brain-masked metrics
+    # (psnr_db_brain, ssim_brain, etc.). The only valid value is
+    # "masks/brain_latent"; this field exists so ``_assert_run_invariants``
+    # can catch any attempt to switch to the real_box>0 fallback (which IS
+    # derived from the real T1c and leaks target information into metrics).
+    brain_mask_key: str = "masks/brain_latent"
 
     @model_validator(mode="before")
     @classmethod
@@ -408,10 +413,7 @@ class _TrainingCfg(BaseModel):
     grad_accum: int = 1
     checkpoint_every_epochs: int = 5
     log_train_every_steps: int = 100
-    best_metric_name: str = "mse_latent"
-    best_metric_region: str = "bg"
-    best_metric_nfe: int = 5
-    gradient_clip_val: float = 1.0
+    gradient_clip_val: float = 5.0
     # Epochs of plateau on ``train/total_epoch`` (mode=min) before Lightning
     # halts training. ``None`` disables EarlyStopping. Set to e.g. 100 for the
     # 1000-epoch Picasso runs so a converged + plateaued run releases the
@@ -482,6 +484,13 @@ class _ExhaustiveValCfg(BaseModel):
     # ``metrics.csv`` are NEVER pruned — they are the long-run diagnostic record.
     # 0 disables pruning.
     prune_snapshots_keep: int = 2
+    # Write ``latent_preds.h5`` only every N cadence passes (1-indexed: passes
+    # 1, N+1, 2N+1, …). 0 or 1 writes on every cadence epoch (default 4 →
+    # one H5 per ~80 epochs at every_epochs=20). The pass counter is tracked
+    # by ``ExhaustiveValLauncher`` and injected into the job YAML as
+    # ``latent_preds_pass_count``; the subprocess gates the write via
+    # ``_should_write_latent_preds(pass_count, every_n)``.
+    latent_preds_every_n: int = 4
 
     @model_validator(mode="before")
     @classmethod
@@ -498,7 +507,7 @@ class _ExhaustiveValCfg(BaseModel):
 class _OutputCfg(BaseModel):
     model_config = ConfigDict(extra="forbid")
     experiments_root: Path
-    retention_n_checkpoints: int = 3
+    retention_n_checkpoints: int = 40
     tensorboard: bool = False
     wandb: bool = False
 
@@ -855,6 +864,79 @@ def _assert_dedup_gate(cfg: FMTrainRoutineConfig) -> None:
         )
 
 
+def _assert_module_paths_in_repo_root() -> None:
+    """B11 — verify ``routines`` and ``vena`` are imported from inside this repo.
+
+    A stale editable install pointing at a different checkout or a wrong
+    PYTHONPATH silently trains against different code.  This check is
+    CWD-independent: it resolves the imported module ``__file__`` and
+    asserts it falls under the same repository root as this engine.
+    """
+    import routines
+    import vena
+
+    repo_root = Path(__file__).resolve().parents[3]
+    for mod_name, mod in [("routines", routines), ("vena", vena)]:
+        mod_path = Path(mod.__file__).resolve()
+        try:
+            mod_path.relative_to(repo_root)
+        except ValueError as exc:
+            raise AssertionError(
+                f"Module '{mod_name}' is imported from {mod_path}, which is "
+                f"outside the expected repo root {repo_root}. Check PYTHONPATH "
+                f"(needs '<repo>/src:<repo>' — see MEMORY: PYTHONPATH routines leak)."
+            ) from exc
+
+
+def _assert_run_invariants(cfg: FMTrainRoutineConfig) -> None:
+    """Hard guards that have each already cost this project a run.
+
+    Called at the very top of :meth:`FMTrainRoutineEngine.run` before any
+    side effect.  Every check raises (not warns) — these are all survivable-
+    looking conditions at WARNING level, which is exactly why they went
+    undetected until a full run surfaced them.
+    """
+    # N2 provenance — encoder percentile must be 99.95 (MEMORY entry
+    # "Encoder percentile 99.95"); mismatched percentile biases all
+    # intensity metrics (worst on ET).
+    from vena.common import ENCODER_PERCENTILE_UPPER
+
+    if ENCODER_PERCENTILE_UPPER != 99.95:
+        raise AssertionError(
+            f"ENCODER_PERCENTILE_UPPER={ENCODER_PERCENTILE_UPPER} != 99.95. "
+            "The 99.95 percentile normalisation is load-bearing for intensity "
+            "metrics — decoded predictions and real T1c must be normalised "
+            "identically. Rebuild the vena package from the current source."
+        )
+
+    # §15 — brain mask source must not be the real_box>0 fallback, which is
+    # derived from the real T1c and leaks target information into metrics.
+    brain_key = getattr(cfg.data, "brain_mask_key", None)
+    if brain_key != "masks/brain_latent":
+        raise AssertionError(
+            f"data.brain_mask_key={brain_key!r}; must be 'masks/brain_latent'. "
+            "The real_box>0 fallback is derived from the real T1c and leaks "
+            "target information into brain-masked PSNR/SSIM metrics."
+        )
+
+    # §17 / B2 — no test_only cohort must appear in the cv monitor set.
+    # A test_only cohort in aggregate_cv.csv would leak held-out data into
+    # early-stopping and checkpoint selection.
+    _reg = load_registry(cfg.data.corpus_registry, require_latents=False)
+    cv_names = {c.name for c in _reg.cv_cohorts()}
+    test_only_names = {c.name for c in _reg.test_cohorts()}
+    overlap = cv_names & test_only_names
+    if overlap:
+        raise AssertionError(
+            f"test_only cohorts found in cv monitor set: {sorted(overlap)}. "
+            "This leaks held-out test data into early stopping and checkpoint "
+            "selection. Fix the corpus registry role assignments."
+        )
+
+    # §9 / B11 — resolved module paths (CWD-independent).
+    _assert_module_paths_in_repo_root()
+
+
 def _run_post_train(run_dir: Path, *, formats: tuple[str, ...]) -> None:
     """Render the post-training plot bundle for ``run_dir``.
 
@@ -873,6 +955,156 @@ def _run_post_train(run_dir: Path, *, formats: tuple[str, ...]) -> None:
             exc,
             exc_info=True,
         )
+
+
+def _assert_grad_clip_validity(run_dir: Path, cfg: FMTrainRoutineConfig) -> None:
+    """§18 validity criterion: grad_clip_active mean must be < 5 % past step 5 000.
+
+    An arm that clips more than 5 % of its optimiser steps past the warm-up
+    window is invalid for the §18 norm comparison: the gradient-clip confound
+    is not controlled and the loss-norm effect is uninterpretable.  This fires
+    *post-training* so the full evidence is in hand; it does not abort a run
+    mid-flight if clipping is heavy in the first 5 000 steps.
+
+    ``train/grad_clip_active`` is 1.0 when the gradient norm exceeds
+    ``gradient_clip_val``, else 0.0.  It is logged every optimiser step by
+    :meth:`FMLightningModule.configure_gradient_clipping`.
+    """
+    import csv as _csv
+
+    step_csv = run_dir / "metrics" / "train_step.csv"
+    if not step_csv.exists():
+        logger.warning("§18 grad_clip validity: %s not found — check skipped", step_csv)
+        return
+
+    clip_vals: list[float] = []
+    try:
+        with step_csv.open(newline="") as f:
+            for row in _csv.DictReader(f):
+                step_raw = row.get("global_step", "")
+                clip_raw = row.get("train/grad_clip_active", "")
+                if step_raw in ("", None) or clip_raw in ("", None):
+                    continue
+                try:
+                    if int(float(step_raw)) <= 5000:
+                        continue
+                    clip_vals.append(float(clip_raw))
+                except ValueError:
+                    continue
+    except OSError as exc:
+        logger.warning("§18 grad_clip validity: cannot read %s: %s", step_csv, exc)
+        return
+
+    if not clip_vals:
+        logger.warning(
+            "§18 grad_clip validity: no step-CSV rows past step 5 000 in %s "
+            "— check skipped (run too short?)",
+            step_csv,
+        )
+        return
+
+    mean_clip = sum(clip_vals) / len(clip_vals)
+    logger.info(
+        "§18 grad_clip_active: mean=%.4f over %d steps past step 5 000 "
+        "(threshold < 0.05; gradient_clip_val=%s)",
+        mean_clip,
+        len(clip_vals),
+        cfg.training.gradient_clip_val,
+    )
+    if mean_clip >= 0.05:
+        raise AssertionError(
+            f"§18 validity criterion FAILED: grad_clip_active mean={mean_clip:.4f} "
+            f">= 0.05 over {len(clip_vals)} steps past step 5 000. "
+            f"This arm clips too frequently for the loss-norm comparison to be "
+            f"interpretable. Current gradient_clip_val={cfg.training.gradient_clip_val}. "
+            f"Investigate the norm distribution before reporting this arm's results. "
+            f"Do not raise gradient_clip_val beyond 10.0 without re-running the "
+            f"entire ablation at the new value."
+        )
+
+
+def _record_termination_reason(
+    run_dir: Path,
+    trainer: pl.Trainer,
+    cfg: FMTrainRoutineConfig,
+    decision_path: Path,
+) -> None:
+    """B17 (2026-07-29): Append termination metadata to decision.json (schema 0.12.0).
+
+    Resolves the termination reason from live trainer state, not from config,
+    so post-mortem audits are unambiguous.  Priority order:
+
+    1. ``early_stopping`` — EarlyStopping callback's ``stopped_epoch > 0``.
+       When patience fires it is a **divergence / plateau signal**, not
+       convergence; log at WARNING and flag for investigation.
+    2. ``total_steps`` — ``trainer.global_step >= cfg.training.total_steps``.
+       This is the canonical termination reason for all v3a arms.
+    3. ``max_epochs`` — ``trainer.current_epoch >= cfg.training.max_epochs``.
+       Triggers only if total_steps is higher than the epoch budget allows.
+    4. ``unknown`` — should not occur in a normal run.
+
+    This function permanently closes the class of audit error that produced
+    the wrong §3 claim in v3a_retraining.md (EarlyStopping vs. total_steps).
+    """
+    final_step = int(trainer.global_step)
+    final_epoch = int(trainer.current_epoch)
+
+    # Detect EarlyStopping callback; ``stopped_epoch > 0`` means it fired.
+    stopped_epoch: int | None = None
+    for cb in trainer.callbacks:
+        if hasattr(cb, "stopped_epoch"):
+            se = int(getattr(cb, "stopped_epoch", 0))
+            if se > 0:
+                stopped_epoch = se
+            break
+
+    if stopped_epoch is not None:
+        reason = "early_stopping"
+    elif cfg.training.total_steps is not None and final_step >= cfg.training.total_steps:
+        reason = "total_steps"
+    elif cfg.training.max_epochs is not None and final_epoch >= cfg.training.max_epochs - 1:
+        reason = "max_epochs"
+    else:
+        reason = "unknown"
+
+    logger.info(
+        "B17 termination: reason=%s  global_step=%d  epoch=%d",
+        reason,
+        final_step,
+        final_epoch,
+    )
+    if reason == "early_stopping":
+        logger.warning(
+            "B17: EarlyStopping (divergence guard) fired at epoch=%d — "
+            "this arm diverged or plateaued pathologically; investigate "
+            "before accepting its checkpoints. This does NOT mean converged.",
+            stopped_epoch,
+        )
+    if reason == "unknown":
+        logger.warning(
+            "B17: termination reason is 'unknown' (step=%d epoch=%d "
+            "total_steps=%s max_epochs=%s) — unexpected; investigate.",
+            final_step,
+            final_epoch,
+            cfg.training.total_steps,
+            cfg.training.max_epochs,
+        )
+
+    # Patch decision.json in-place: read existing payload → add termination
+    # fields → write back.  Bumps schema_version 0.11.0 → 0.12.0.
+    try:
+        payload = json.loads(decision_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("B17: cannot read %s to patch termination reason: %s", decision_path, exc)
+        return
+    payload["schema_version"] = "0.12.0"
+    payload["termination_reason"] = reason
+    payload["final_global_step"] = final_step
+    payload["final_epoch"] = final_epoch
+    if stopped_epoch is not None:
+        payload["early_stopping_stopped_epoch"] = stopped_epoch
+    decision_path.write_text(json.dumps(payload, indent=2) + "\n")
+    logger.info("B17: decision.json updated (schema 0.12.0) at %s", decision_path)
 
 
 class _WarmStartCallback(pl.Callback):
@@ -1010,7 +1242,7 @@ class FMTrainRoutineEngine:
         resume_source: str | None,
         resume_source_run_id: str | None,
     ) -> dict[str, Any]:
-        """Schema-0.8.0 decision JSON written once at run creation.
+        """Schema-0.11.0 decision JSON written once at run creation.
 
         Carries enough provenance for a downstream consumer to reproduce the
         run end-to-end: data registry, trunk + VAE SHA-256, loss stage,
@@ -1024,6 +1256,14 @@ class FMTrainRoutineEngine:
         auditor can tell at a glance whether a given run was a fresh
         baseline, a SIGTERM-resume continuation, or a warm-start from a
         prior run.
+
+        Schema changelog:
+        - 0.6.0: ``trunk_regime`` / ``trunk_peft_variant`` / ``trunk_peft_params``
+        - 0.7.0: ``conditioning_dropout_p`` / ``conditioning_dropout_keys``
+        - 0.8.0: ``tag`` / ``resume_mode`` / ``resume_source`` / ``resume_source_run_id``
+        - 0.9.0: ``decoder_lpl_decision_path`` / ``decoder_lpl_decision_sha256``
+        - 0.10.0: ``controlnet_enabled`` / ``controlnet_conditioning_inputs`` / ``input_concat`` / ``loss_cfm_*`` / ``region_weights`` / ``mask_source``
+        - 0.11.0: ``loss_cfm_delta`` / ``gradient_clip_val`` / ``latent_preds_every_n`` / ``exhaustive_val_aggregation``
         """
         cfg = self.cfg
         registry = load_registry(cfg.data.corpus_registry)
@@ -1121,6 +1361,11 @@ class FMTrainRoutineEngine:
             # ``normalization_variant_id`` attr cross-checked at engine init.
             "normalization_audit_decision_path": None,
             "normalization_variant_id": "V0",
+            # Schema 0.11.0 — §18 ablation arm tracking + aggregation contract.
+            "loss_cfm_delta": float(cfm_block.get("delta", 0.90)),
+            "gradient_clip_val": cfg.training.gradient_clip_val,
+            "latent_preds_every_n": cfg.exhaustive_val.latent_preds_every_n,
+            "exhaustive_val_aggregation": "patient_mean_then_cohort_mean",
         }
 
     def _build_exhaustive_job_base(self, cfg: FMTrainRoutineConfig) -> dict[str, Any]:
@@ -1175,6 +1420,9 @@ class FMTrainRoutineEngine:
             "integrator": ev.integrator,
             "n_patients": ev.n_patients,
             "figure_top_k": ev.figure_top_k,
+            # B12 — H5 write gate; pass_count is injected per-launch by
+            # ExhaustiveValLauncher._launch (dynamic counter).
+            "latent_preds_every_n": ev.latent_preds_every_n,
         }
         # S3 — per-block real-vs-synth feature-map render. Active only when the
         # YAML sets ``exhaustive_val.export_per_block_figures=true`` and the
@@ -1303,6 +1551,9 @@ class FMTrainRoutineEngine:
         # has been done so the failure message names exactly which artifact is
         # missing or non-conformant. See ``.claude/rules/preflight-pattern.md``.
         _assert_preflight_gates(cfg)
+        # Hard invariants — each has already cost this project a run.  Raises
+        # ``AssertionError`` (not warns) so misconfiguration is un-swallowable.
+        _assert_run_invariants(cfg)
 
         # TF32 matmul: ~10% speed-up on A100/RTX-4090 at no measured cost to
         # FM training numerics. Set before any model is built; ignored on CPU
@@ -1517,6 +1768,7 @@ class FMTrainRoutineEngine:
                     python_executable=cfg.exhaustive_val.python_executable,
                     block_until_complete=cfg.exhaustive_val.block_until_complete,
                     prune_snapshots_keep=cfg.exhaustive_val.prune_snapshots_keep,
+                    latent_preds_every_n=cfg.exhaustive_val.latent_preds_every_n,
                 )
             )
         if cfg.training.patience is not None:
@@ -1533,9 +1785,20 @@ class FMTrainRoutineEngine:
                 )
             )
             logger.info(
-                "EarlyStopping ENABLED: monitor=%s mode=min patience=%d epochs",
+                "EarlyStopping DIVERGENCE GUARD ONLY: monitor=%s patience=%d epochs. "
+                "Under normal monotone-loss convergence this will never fire. "
+                "If it fires, the arm diverged or plateaued pathologically — "
+                "investigate before treating it as converged. "
+                "Checkpoint selection is always post-hoc via select_checkpoint.py / ssim_brain.",
                 ckpt_monitor,
                 int(cfg.training.patience),
+            )
+        else:
+            logger.info(
+                "EarlyStopping DISABLED (patience=null): training runs until "
+                "total_steps=%s or max_epochs=%s; post-hoc selection via select_checkpoint.py.",
+                cfg.training.total_steps,
+                cfg.training.max_epochs,
             )
 
         # Trainer. We write our own clean metric CSVs, so Lightning's logger is
@@ -1585,6 +1848,24 @@ class FMTrainRoutineEngine:
         # and is the resume anchor, so a separate ``ema_final.ckpt`` would be
         # redundant. ``ema_final.ckpt`` is reserved for the SigtermHandler's
         # preemption save (captures mid-epoch state at signal time).
+
+        # B17 (2026-07-29): Record why training stopped so post-mortem audits
+        # never have to guess. Resolves from live trainer state, not from config.
+        # This permanently closes the class of error that produced the wrong §3
+        # claim in v3a_retraining.md (EarlyStopping vs. total_steps confusion).
+        _record_termination_reason(
+            run_dir=run_dir,
+            trainer=trainer,
+            cfg=cfg,
+            decision_path=decision_path,
+        )
+
+        # §18 validity criterion (BLOCKER 2 Assertion 2): grad_clip_active mean
+        # must be < 5 % over all steps past step 5 000.  Hard raise — an arm that
+        # violates this is invalid for the loss-norm comparison and must NOT be
+        # reported without investigation.
+        _assert_grad_clip_validity(run_dir=run_dir, cfg=cfg)
+
         if cfg.post_train.enabled:
             _run_post_train(run_dir, formats=cfg.post_train.formats)
         logger.info("FM-train completed; artifact dir: %s", run_dir)
