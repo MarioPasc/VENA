@@ -1,0 +1,161 @@
+# Loginexa 2-epoch smoke — B19 verification (git_sha + git_dirty in decision.json).
+#
+# Minimal smoke: 2 epochs on loginexa to confirm:
+#   1. decision.json written at run start contains git_sha (== current HEAD SHA)
+#      and git_dirty (== false on a clean Picasso checkout).
+#   2. _record_termination_reason patches schema_version 0.12.0 → 0.13.0 and
+#      writes termination_reason / final_global_step / final_epoch.
+#   3. FM training completes without error.
+#
+# Architecture: IDENTICAL to loginexa_s1_v4_4ep_l1.yaml (concat-only v4, L1 loss).
+# Differences from the 4-ep smoke:
+#   * max_epochs=2 (B19 verification only; full correctness already exercised by 4-ep)
+#   * total_steps=300 (max_epochs binds; kept above 2-epoch step count)
+#   * retention_n_checkpoints=2
+#
+# Pass criteria:
+#   * 2 epochs complete ("FM-train completed" in logs)
+#   * decision.json: git_sha == current HEAD SHA, git_dirty == false,
+#     schema_version == "0.13.0", termination_reason present, final_global_step present
+#   * git_commit.txt in run dir contains the same HEAD SHA
+#
+# Run (on loginexa via SSH ProxyJump):
+#   /mnt2/fscratch/users/tic_163_uma/mpascual/conda_envs/vena-v100/bin/python \
+#     -m routines.fm.train.cli \
+#     routines/fm/train/configs/smoke/loginexa_s1_v4_2ep_l1_b19.yaml
+
+run:
+  stage: s1
+  tag: fft_cfm_l1
+  resume_from: null
+  seed: 1337
+  device: cuda
+  precision: bf16-mixed
+  full_determinism: false
+
+data:
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  fold: 0
+  batch_size: 2
+  num_workers: 4
+  pin_memory: true
+  tau: 0.5
+  max_train_patients_per_cohort: 10
+  augmentation_config_path: null
+  preflight_decision_path: null
+  dedup_decisions_path: /mnt/home/users/tic_163_uma/mpascual/fscratch/artifacts/preflights/cohort_dedup/LATEST/decision.json
+  use_offline_augmented_data: true
+  variant_weights:
+    v0: 0.2
+    v1: 0.2
+    v2: 0.2
+    v3: 0.2
+    v4: 0.2
+
+model:
+  trunk:
+    checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/diff_unet_3d_rflow-mr.pt
+    arch_json: null
+    arch_overrides:
+      in_channels: 16
+    class_token: 9
+    spacing_mm: [1.0, 1.0, 1.0]
+    trainable: true
+    regime: fft
+    input_concat:
+      enabled: true
+      cond_latents: [t1pre, t2, flair]
+      cond_masks: []
+      zero_init_new_channels: true
+      ramp_steps: 0
+      ramp_steepness: 10.0
+  controlnet:
+    enabled: false
+    init_from_trunk: true
+    conditioning_inputs: []
+    arch_overrides: {}
+    perturb_keys: []
+    output_scale_ramp: null
+  vae_checkpoint: /mnt/home/users/tic_163_uma/mpascual/fscratch/checkpoints/NV-Generate-MR/models/autoencoder_v2.pt
+
+loss:
+  cfm:
+    weight: 1.0
+    reduction: mean
+    norm: l1
+
+rflow:
+  num_train_timesteps: 1000
+  use_discrete_timesteps: true
+  sample_method: logit-normal
+  use_timestep_transform: true
+  base_img_size_numel: 129024
+
+optim:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  warmup_steps: 40
+  scheduler: cosine
+
+ema:
+  decay: 0.9999
+  update_after_step: 0
+  update_every: 1
+  inv_gamma: 10.0
+  power: 1.0
+  min_value: 0.0
+
+training:
+  total_steps: 300
+  max_epochs: 2
+  batch_size: 2
+  grad_accum: 1
+  checkpoint_every_epochs: 1
+  log_train_every_steps: 10
+  gradient_clip_val: 5.0
+  patience: null
+  conditioning_dropout_p: 0.1
+  conditioning_dropout_keys: ["wt"]
+
+validation:
+  every_epochs: 0
+  per_epoch_nfe: 5
+  full_sweep_every_epochs: 999999
+  sweep_nfes: [1, 2, 5, 10, 20]
+  qualitative_every_epochs: 999999
+  image_metrics: false
+
+exhaustive_val:
+  enabled: true
+  every_epochs: 1
+  n_patients: 3
+  nfe_levels: [1, 5]
+  integrator: euler
+  corpus_registry: routines/fm/train/configs/corpus/corpus_picasso.json
+  device: cuda:0
+  block_until_complete: true
+  figure_top_k: 2
+  # B12: every_n=2 → epoch_001 writes latent_preds.h5 (first-pass rule),
+  # epoch_002 skips. One write + one skip demonstrated.
+  latent_preds_every_n: 2
+
+output:
+  experiments_root: /mnt/home/users/tic_163_uma/mpascual/execs/VENA
+  retention_n_checkpoints: 2
+  tensorboard: false
+  wandb: false
+
+regions:
+  brain:
+    source: latents_h5
+  wt:
+    source: derived_from_tumor_latent
+    threshold: 0.5
+  wt_dilated:
+    source: derived_via_scipy_binary_dilation
+    structure: ones_3x3x3
+  bg:
+    source: derived
+  vessel:
+    source: skipped
