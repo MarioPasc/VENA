@@ -1,4 +1,11 @@
-"""Conditional flow-matching loss (rectified flow, MSE on velocity).
+"""Conditional flow-matching loss (rectified flow, velocity regression).
+
+Production default is ``norm='l1'`` (all runs since S1 v2, 2026-06-20).
+Constructor default remains ``norm='l2'`` for backward compatibility with
+unit tests that do not set it explicitly; every production YAML sets norm
+explicitly. The ``'huber'`` option (pseudo-Huber, Song & Dhariwal ICLR
+2024) is available for the §18 ablation arm C; δ is set from the L1 arm's
+median absolute velocity residual (≈ 0.90).
 
 S1 v3 (2026-06-22) adds optional region-weighted reduction.  Two modes:
 
@@ -21,7 +28,7 @@ legacy mean-reduction path.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812 — standard PyTorch alias
 
 from .base import AbstractFMLoss, LossInputs
 from .region_weights import (
@@ -32,15 +39,35 @@ from .region_weights import (
 )
 
 
+def _pseudo_huber(pred: torch.Tensor, target: torch.Tensor, delta: float) -> torch.Tensor:
+    """Pseudo-Huber loss, elementwise (Song & Dhariwal ICLR 2024).
+
+    Quadratic for ``|r| < delta``, approximately linear beyond.  Numerically
+    stable via the sqrt form: ``δ²(√(1+(r/δ)²) - 1)``.
+
+    Parameters
+    ----------
+    pred : torch.Tensor
+        Network output (velocity).
+    target : torch.Tensor
+        Ground-truth velocity (same shape as ``pred``).
+    delta : float
+        Transition point; ≈ median absolute residual of the L1 arm (≈ 0.90).
+
+    Returns
+    -------
+    torch.Tensor
+        Element-wise loss, same shape as ``pred``.
+    """
+    r = pred - target
+    return delta**2 * (torch.sqrt(1.0 + (r / delta) ** 2) - 1.0)
+
+
 class CFMLoss(AbstractFMLoss):
     r"""Rectified-flow regression loss on the velocity field.
 
     :math:`\mathcal{L}_\text{CFM} = \mathbb{E}\left[ \| G_\theta(x_t, t, c) -
-    (x_1 - x_0) \|_2^2 \right]`
-
-    Per the MAISI-v2 reference implementation we keep the MSE formulation
-    (proposal §5.2). The MAISI training script actually uses an L1 default;
-    we follow the proposal's text rather than the upstream script.
+    (x_1 - x_0) \|_p^p \right]`
 
     Parameters
     ----------
@@ -50,9 +77,15 @@ class CFMLoss(AbstractFMLoss):
         ``"none"`` is required when any region-weights mode is enabled — the
         per-voxel loss is multiplied by the region-weight tensor and reduced
         as ``(loss * w).sum() / w.sum()``.
-    norm : {"l2", "l1"}
+    norm : {"l2", "l1", "huber"}
         ``"l1"`` matches T1C-RFlow and the S1 v2 baseline; ``"l2"`` is the
-        proposal default and is kept for back-compat.
+        constructor default (kept for backward compatibility with tests that
+        do not set the field); ``"huber"`` is pseudo-Huber (Song & Dhariwal
+        ICLR 2024), used for arm C of the §18 ablation.
+    delta : float
+        Transition point for the pseudo-Huber loss.  Pre-registered from the
+        L1 arm's median absolute velocity residual (≈ 0.90).  Ignored when
+        ``norm`` is ``"l2"`` or ``"l1"``.
     region_weights : RegionWeights | None
         Sub-region mode (S1 v3b_rw).  When non-None and ``enabled=True``,
         requires ``reduction="none"``.  Byte-identical to legacy path when
@@ -74,14 +107,15 @@ class CFMLoss(AbstractFMLoss):
         self,
         reduction: str = "mean",
         norm: str = "l2",
+        delta: float = 0.90,
         region_weights: RegionWeights | None = None,
         brain_tc_weights: BrainTCWeights | None = None,
     ) -> None:
         super().__init__()
         if reduction not in ("none", "mean", "sum"):
             raise ValueError(f"reduction must be 'none', 'mean', or 'sum'; got {reduction!r}")
-        if norm not in ("l2", "l1"):
-            raise ValueError(f"norm must be 'l2' or 'l1'; got {norm!r}")
+        if norm not in ("l2", "l1", "huber"):
+            raise ValueError(f"norm must be 'l2', 'l1', or 'huber'; got {norm!r}")
         rw_active = region_weights is not None and region_weights.enabled
         btc_active = brain_tc_weights is not None and brain_tc_weights.enabled
         if (rw_active or btc_active) and reduction != "none":
@@ -96,6 +130,7 @@ class CFMLoss(AbstractFMLoss):
             )
         self.reduction = reduction
         self.norm = norm
+        self.delta = delta
         self.region_weights = region_weights
         self.brain_tc_weights = brain_tc_weights
 
@@ -107,6 +142,8 @@ class CFMLoss(AbstractFMLoss):
             # Compute per-voxel loss tensor — same for both region modes.
             if self.norm == "l2":
                 voxel = F.mse_loss(inputs.v_orig, inputs.u_target, reduction="none")
+            elif self.norm == "huber":
+                voxel = _pseudo_huber(inputs.v_orig, inputs.u_target, self.delta)
             else:
                 voxel = F.l1_loss(inputs.v_orig, inputs.u_target, reduction="none")
 
@@ -138,4 +175,11 @@ class CFMLoss(AbstractFMLoss):
         # Legacy mean/sum path — no region weighting.
         if self.norm == "l2":
             return F.mse_loss(inputs.v_orig, inputs.u_target, reduction=self.reduction)
+        if self.norm == "huber":
+            loss = _pseudo_huber(inputs.v_orig, inputs.u_target, self.delta)
+            if self.reduction == "mean":
+                return loss.mean()
+            if self.reduction == "sum":
+                return loss.sum()
+            return loss  # "none"
         return F.l1_loss(inputs.v_orig, inputs.u_target, reduction=self.reduction)
