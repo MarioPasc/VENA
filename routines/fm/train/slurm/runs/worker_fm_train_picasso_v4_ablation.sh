@@ -38,11 +38,15 @@
 #SBATCH --output=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/%x_%j.out
 #SBATCH --error=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/%x_%j.err
 
-# set -u is intentionally absent: the vena conda env contains gxx_linux-64
-# whose activation script dereferences SYS_SYSROOT while it is unbound.
-# Under -u the job dies at "conda activate" before any training code runs.
-# This is a project-specific trap; use -eo pipefail only (see memory note
-# feedback_conda_activate_set_u.md).
+# set -u is intentionally absent as a precaution: CONDA_ENV_NAME is
+# overridable (default: vena), and a future invocation pointing this worker
+# at a dedicated compiler-toolchain env (e.g. vena-comp, which carries
+# gxx_linux-64) would die at conda-activate under -u because activate.d/
+# activate-gcc_linux-64.sh dereferences SYS_SYSROOT while it is unbound.
+# The main vena env activates safely under -u (tested 2026-07-29, Picasso).
+# -eo pipefail removes the footgun for free; revert only after confirming
+# CONDA_ENV_NAME will never point at a compiler-toolchain env.
+# (See memory note: feedback_conda_activate_set_u.md.)
 set -eo pipefail
 START_TIME=$(date +%s)
 
