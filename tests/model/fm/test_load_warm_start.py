@@ -28,9 +28,7 @@ pytestmark = pytest.mark.unit
 
 def _stub_module(monkeypatch: pytest.MonkeyPatch) -> FMLightningModule:
     """Build a minimal FMLightningModule without touching the real MAISI trunk."""
-    monkeypatch.setattr(
-        FMLightningModule, "_setup_trunk_and_controlnet", lambda self: None
-    )
+    monkeypatch.setattr(FMLightningModule, "_setup_trunk_and_controlnet", lambda self: None)
     monkeypatch.setattr(FMLightningModule, "setup", lambda self, stage=None: None)
     return FMLightningModule(
         trunk_config=TrunkConfig(checkpoint="/nonexistent.pt", class_token=9),
@@ -44,9 +42,7 @@ def _save_lightning_like_ckpt(path: Path, state_dict: dict[str, torch.Tensor]) -
     torch.save({"state_dict": state_dict, "epoch": 0, "global_step": 0}, path)
 
 
-def test_load_warm_start_overlapping_keys(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_load_warm_start_overlapping_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     module = _stub_module(monkeypatch)
     own = module.state_dict()
     # Pick a real key from the destination so the overlap is non-empty.
@@ -70,13 +66,13 @@ def test_load_warm_start_overlapping_keys(
     assert torch.allclose(module.state_dict()[target_key], src[target_key])
 
 
-def test_load_warm_start_shape_mismatch_is_skipped(
+def test_load_warm_start_all_shape_mismatch_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """B10: when ALL source keys have wrong shapes (zero loadable), RuntimeError fires."""
     module = _stub_module(monkeypatch)
     own = module.state_dict()
     target_key = next(iter(own.keys()))
-    orig = own[target_key].clone()
 
     # Pick a deliberately wrong shape so the filter rejects this key.
     wrong_shape = tuple(s + 1 for s in own[target_key].shape)
@@ -84,11 +80,34 @@ def test_load_warm_start_shape_mismatch_is_skipped(
     ckpt_path = tmp_path / "src.ckpt"
     _save_lightning_like_ckpt(ckpt_path, src)
 
+    with pytest.raises(RuntimeError, match="loaded 0 keys"):
+        module.load_warm_start(ckpt_path)
+
+
+def test_load_warm_start_partial_shape_mismatch_loads_good_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shape-mismatched keys are skipped when at least one key loads cleanly."""
+    module = _stub_module(monkeypatch)
+    own = module.state_dict()
+    keys = list(own.keys())
+    # Need at least two keys to split into good + bad.
+    if len(keys) < 2:
+        pytest.skip("state_dict has fewer than 2 keys — cannot test partial mismatch")
+
+    good_key = keys[0]
+    bad_key = keys[1]
+    good_val = torch.randn(*own[good_key].shape)
+    bad_shape = tuple(s + 1 for s in own[bad_key].shape)
+    src = {good_key: good_val, bad_key: torch.randn(*bad_shape)}
+    ckpt_path = tmp_path / "src.ckpt"
+    _save_lightning_like_ckpt(ckpt_path, src)
+
     counts = module.load_warm_start(ckpt_path)
-    assert counts["loaded"] == 0
-    assert counts["unexpected"] == 1
-    # Destination weight untouched.
-    assert torch.allclose(module.state_dict()[target_key], orig)
+    # Good key loaded; bad key skipped.
+    assert counts["loaded"] == 1
+    assert counts["unexpected"] >= 1
+    assert torch.allclose(module.state_dict()[good_key], good_val)
 
 
 def test_load_warm_start_missing_file_raises(

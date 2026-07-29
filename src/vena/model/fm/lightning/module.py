@@ -1546,6 +1546,13 @@ class FMLightningModule(pl.LightningModule):
             len(missing),
             len(unexpected),
         )
+        if len(loadable) == 0:
+            raise RuntimeError(
+                f"load_warm_start: loaded 0 keys from {p}. "
+                "Most likely cause: 'trainable: false' run warm-started from a 'trainable: true' "
+                "checkpoint (trunk keys only exist in state_dict when trainable=True). "
+                "Check trunk_config.trainable."
+            )
         if missing:
             logger.info("  first missing (cn-only / new heads): %s", missing[:5])
         if unexpected:
