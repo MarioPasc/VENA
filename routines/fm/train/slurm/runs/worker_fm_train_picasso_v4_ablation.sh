@@ -38,7 +38,12 @@
 #SBATCH --output=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/%x_%j.out
 #SBATCH --error=/mnt/home/users/tic_163_uma/mpascual/execs/vena/logs/%x_%j.err
 
-set -euo pipefail
+# set -u is intentionally absent: the vena conda env contains gxx_linux-64
+# whose activation script dereferences SYS_SYSROOT while it is unbound.
+# Under -u the job dies at "conda activate" before any training code runs.
+# This is a project-specific trap; use -eo pipefail only (see memory note
+# feedback_conda_activate_set_u.md).
+set -eo pipefail
 START_TIME=$(date +%s)
 
 # ============================================================================

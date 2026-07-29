@@ -35,7 +35,25 @@ if ${DRY_RUN}; then
     exit 0
 fi
 
-JOB_ID=$(eval "${SBATCH_CMD}" | sed 's/\x1b\[[0-9;]*m//g')
+# _clean_job_id: tail -n 1 discards any multi-line Lua warnings that Picasso's
+# sbatch wrapper prints on stdout before the numeric ID. ANSI pattern uses
+# [a-zA-Z] terminator (not just m) to cover all escape sequences. All
+# non-numeric chars are then stripped so the result is a bare integer.
+# CRITICAL: if the assert fires after the sbatch command ran, the job may
+# already be live — squeue immediately before exiting.
+_clean_job_id() {
+    tail -n 1 <<<"$1" \
+        | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/[^0-9]//g'
+}
+
+RAW=$(eval "${SBATCH_CMD}")
+JOB_ID=$(_clean_job_id "${RAW}")
+[[ "${JOB_ID}" =~ ^[0-9]+$ ]] || {
+    printf 'FATAL: could not parse job ID from sbatch output:\n%s\n' "${RAW}" >&2
+    echo "(squeue below — assume job was submitted until proven otherwise)" >&2
+    squeue -u "${USER}"
+    exit 1
+}
 echo "Submitted ${JOB_NAME} → job ${JOB_ID}"
 echo "Logs:     ${LOGS_DIR}/${JOB_NAME}_${JOB_ID}.{out,err}"
 echo "Monitor:  squeue -j ${JOB_ID}"
