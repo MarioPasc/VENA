@@ -128,7 +128,10 @@ Phase-3 routines also emit `decision.json` so external-validation and reader-stu
   "schema_version": "0.11.0 → patched to 0.12.0 post-training",
   "produced_at": "<ISO-8601-UTC>",
   "producer": "routines.fm.train:0.12.0",
-  "run_id": "<UTC>_<stage>_<tag>_<short-sha>",
+  "run_id": "<UTC>_<stage>_<tag>_<process-token>",
+  // <process-token> = sha256(timestamp + pid + hostname)[:8]  — a per-process
+  // uniqueness token, NOT a git short-SHA. Source: runner/run_id.py:73.
+  // Git provenance is in the separate "git_sha" field below.
   "run_dir": "/abs/path/to/experiments/<run_id>",
   "stage": "s1|s2|s3",
   "tag": "fft_cfm|lora_r16_cfm|fft_contrastive|lora_r16_contrastive|lora_r16_contrastive_cfg|...",
