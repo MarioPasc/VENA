@@ -134,9 +134,6 @@ training:
   # ET trajectory is the load-bearing signal, read from
   # exhaustive_val/.../aggregate.csv by hand. The auto-rewire is deferred
   # (see plan §"Scope decisions").
-  best_metric_name: mse_latent
-  best_metric_region: bg
-  best_metric_nfe: 5
   gradient_clip_val: 1.0
   patience: 250
 

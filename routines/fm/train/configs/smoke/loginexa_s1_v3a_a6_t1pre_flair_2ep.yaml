@@ -108,9 +108,6 @@ training:
   grad_accum: 1
   checkpoint_every_epochs: 1
   log_train_every_steps: 10
-  best_metric_name: mse_latent
-  best_metric_region: bg
-  best_metric_nfe: 5
   gradient_clip_val: 1.0
   patience: 100
 
